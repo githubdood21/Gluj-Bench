@@ -28,7 +28,7 @@ jobs:
       - name: Verify, build, and package
         shell: pwsh
         run: |
-          .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
           .\scripts\cargo.ps1 test --workspace --locked
           $version = $env:GITHUB_REF_NAME.TrimStart("v")
           .\scripts\package-release.ps1 -Version $version

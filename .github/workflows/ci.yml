@@ -42,7 +42,7 @@ jobs:
 
       - name: Run strict Clippy
         shell: pwsh
-        run: .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
 
       - name: Run workspace tests
         shell: pwsh
