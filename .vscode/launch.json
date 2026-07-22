@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Gluj-Bench UI (Debug)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/x86_64-pc-windows-gnullvm/debug/gluj-bench-ui.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Gluj-Bench: Build Debug",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "name": "Gluj-Bench Worker: Devices (Debug)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/x86_64-pc-windows-gnullvm/debug/gluj-bench-worker.exe",
+      "args": ["devices"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Gluj-Bench: Build Debug",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      }
+    }
+  ]
+}

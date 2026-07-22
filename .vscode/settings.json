@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.allTargets": true,
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "debug.onTaskErrors": "showErrors"
+}

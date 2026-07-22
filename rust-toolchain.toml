@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"
+profile = "default"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-gnullvm"]

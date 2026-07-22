@@ -1,0 +1,11 @@
+[package]
+name = "gluj-bench-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gluj-bench-core = { path = "../gluj-bench-core" }
+gluj-bench-cpu = { path = "../gluj-bench-cpu" }
+gluj-bench-gpu = { path = "../gluj-bench-gpu" }
+serde_json.workspace = true

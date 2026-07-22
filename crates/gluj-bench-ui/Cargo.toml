@@ -1,0 +1,10 @@
+[package]
+name = "gluj-bench-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe.workspace = true
+gluj-bench-core = { path = "../gluj-bench-core" }
+serde_json.workspace = true
