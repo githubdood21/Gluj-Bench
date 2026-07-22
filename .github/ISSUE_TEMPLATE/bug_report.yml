@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a crash, incorrect result, unavailable benchmark, or UI problem.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Gluj-Bench. Do not include serial numbers, usernames, or other private machine data.
+  - type: input
+    id: version
+    attributes:
+      label: Gluj-Bench version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - CPU bandwidth
+        - CPU performance
+        - GPU bandwidth
+        - GPU performance
+        - Worker or protocol
+        - User interface
+        - Build or installation
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Relevant hardware and driver
+      description: CPU, RAM configuration, GPU, Windows version, and GPU driver version as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the benchmark ID, expected behavior, actual behavior, and reproduction steps.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or JSON output
+      description: Paste relevant worker stderr or JSON. Remove private machine information first.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reproduced this with unnecessary background applications closed.
+          required: true
+        - label: I checked that this issue has not already been reported.
+          required: true
+

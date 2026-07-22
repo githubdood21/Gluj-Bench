@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a benchmark, device capability, workflow, or interface improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What measurement or workflow is currently missing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the operation, data type, unit, hardware capability, and expected presentation where applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: portability
+    attributes:
+      label: Portability considerations
+      description: Explain whether the proposal depends on a vendor API, ISA, operating system, or optional capability.
+

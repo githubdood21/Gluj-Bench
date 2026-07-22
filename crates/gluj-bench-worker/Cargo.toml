@@ -3,6 +3,10 @@ name = "gluj-bench-worker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
 gluj-bench-core = { path = "../gluj-bench-core" }

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install LLVM-MinGW
+        shell: pwsh
+        run: >-
+          winget install --id MartinStorsjo.LLVM-MinGW.MSVCRT --exact
+          --accept-package-agreements --accept-source-agreements
+          --disable-interactivity --silent
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version
+
+      - name: Check formatting
+        shell: pwsh
+        run: .\scripts\cargo.ps1 fmt --all -- --check
+
+      - name: Run strict Clippy
+        shell: pwsh
+        run: .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        shell: pwsh
+        run: .\scripts\cargo.ps1 test --workspace --locked
+
+      - name: Build release binaries
+        shell: pwsh
+        run: .\scripts\cargo.ps1 build --workspace --release --locked
+

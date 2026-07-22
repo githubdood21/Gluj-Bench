@@ -1,10 +1,44 @@
 # Gluj-Bench
 
+[![CI](https://github.com/githubdood21/Gluj-Bench/actions/workflows/ci.yml/badge.svg)](https://github.com/githubdood21/Gluj-Bench/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/githubdood21/Gluj-Bench?display_name=tag)](https://github.com/githubdood21/Gluj-Bench/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-5d91ff)](#system-requirements)
+[![License](https://img.shields.io/badge/license-MIT-3dd6c6)](LICENSE)
+
 Gluj-Bench is a free, vendor-neutral, AIDA64-like hardware benchmarking tool for Windows. It is designed to test CPU and GPU compute performance together with CPU cache, system RAM, GPU cache, VRAM, and host-to-GPU link bandwidth.
 
 Gluj-Bench provides transparent, reproducible measurements rather than a single unexplained score. GPU performance separates portable vector-shader throughput from capability-gated cooperative-matrix throughput, while GPU bandwidth measures empirically inferred effective L2/L3 regions, cache-separated GPU-local memory, and bidirectional host-device transfers. CPU suites measure aggregate L0-L3 data-cache and system-RAM bandwidth plus pinned integer, floating-point, string, prime-search, codec, POPCNT, AES, and AVX2/FMA workloads. Unsupported capabilities remain visibly disabled rather than producing synthetic results.
 
 Gluj-Bench is independently developed and is not affiliated with or endorsed by FinalWire or AIDA64.
+
+> **Release status:** Gluj-Bench 0.1.0 is an initial public preview. Benchmark definitions and result metadata are expected to evolve before 1.0.
+
+## Download and run
+
+1. Download the Windows x64 ZIP and its `.sha256` file from the [latest GitHub release](https://github.com/githubdood21/Gluj-Bench/releases/latest).
+2. Verify the archive in PowerShell:
+
+   ```powershell
+   Get-FileHash .\Gluj-Bench-0.1.0-windows-x64.zip -Algorithm SHA256
+   Get-Content .\Gluj-Bench-0.1.0-windows-x64.zip.sha256
+   ```
+
+3. Extract the entire ZIP and run `gluj-bench-ui.exe`. Keep `gluj-bench-worker.exe` beside it.
+
+Release binaries are currently unsigned, so Windows may display a SmartScreen warning. Only download releases from this repository and verify the published SHA-256 checksum.
+
+## System requirements
+
+- Windows 10 or Windows 11, x64
+- A supported x64 CPU for CPU and memory suites
+- Current graphics drivers with a compatible Vulkan backend for GPU suites
+- Sufficient free RAM and VRAM for the selected bandwidth workloads
+
+GPU support is optional. CPU and RAM benchmarks remain usable when no compatible GPU backend is available.
+
+## Benchmarking safety and repeatability
+
+Gluj-Bench intentionally places sustained load on the CPU, memory, and GPU. Ensure cooling is functioning correctly, avoid unstable overclocks, and stop a run if the system behaves abnormally. Close unnecessary background applications, use a consistent Windows power plan, and allow temperatures to stabilize before comparing results. Scores from different workload versions or metadata should not be treated as directly equivalent.
 
 ## Technology
 
@@ -83,6 +117,14 @@ target/x86_64-pc-windows-gnullvm/debug/
 
 The first build downloads and compiles the dependency graph. Later builds are incremental and substantially faster.
 
+To create the same Windows x64 archive used by GitHub Releases:
+
+```powershell
+.\scripts\package-release.ps1 -Version 0.1.0
+```
+
+The archive and SHA-256 checksum are written to `dist/`. Maintainer instructions are in [RELEASING.md](RELEASING.md), notable changes in [CHANGELOG.md](CHANGELOG.md), and private vulnerability reporting guidance in [SECURITY.md](SECURITY.md).
+
 ## Worker CLI
 
 The worker can be used independently:
@@ -130,3 +172,7 @@ Human-readable commands write normal output to stdout. With `--json`, stdout con
 ## Planned benchmark work
 
 Future milestones include additional portable codec and cryptographic workloads, broader safely exposed matrix formats, result export, and historical comparison views. Results always identify the operation, numeric data type, workload configuration, sample statistics, elapsed time, unit, and tested device; a generic operation-rate value without that context will not be reported.
+
+## License
+
+Gluj-Bench is available under the [MIT License](LICENSE).

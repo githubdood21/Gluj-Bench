@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    name: Build Windows x64 release
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Install LLVM-MinGW
+        shell: pwsh
+        run: >-
+          winget install --id MartinStorsjo.LLVM-MinGW.MSVCRT --exact
+          --accept-package-agreements --accept-source-agreements
+          --disable-interactivity --silent
+
+      - name: Verify, build, and package
+        shell: pwsh
+        run: |
+          .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
+          .\scripts\cargo.ps1 test --workspace --locked
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          .\scripts\package-release.ps1 -Version $version
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: Gluj-Bench ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/Gluj-Bench-*-windows-x64.zip
+            dist/Gluj-Bench-*-windows-x64.zip.sha256
+

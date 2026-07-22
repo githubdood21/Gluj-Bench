@@ -12,6 +12,9 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+repository = "https://github.com/githubdood21/Gluj-Bench"
+homepage = "https://github.com/githubdood21/Gluj-Bench"
+license = "MIT"
 
 [workspace.dependencies]
 ash = "0.38"
@@ -45,3 +48,4 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+panic = "abort"

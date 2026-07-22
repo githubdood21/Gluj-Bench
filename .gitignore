@@ -1,8 +1,11 @@
 /target/
 /build/
+/dist/
 /.vs/
 /.idea/
 *.user
 *.suo
 *.VC.db
 *.VC.VC.opendb
+*.pdb
+VP_VULKANINFO_*.json
