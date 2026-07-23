@@ -5,13 +5,46 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-5d91ff)](#system-requirements)
 [![License](https://img.shields.io/badge/license-MIT-3dd6c6)](LICENSE)
 
+<p align="center">
+  <strong>A free, vendor-neutral CPU, GPU, cache, and memory benchmark for Windows.</strong>
+</p>
+
+<p align="center">
+  <img src="App-Home.png" alt="Gluj-Bench overview showing detected CPU, memory, and GPU hardware" width="900">
+</p>
+
+## TL;DR
+
+Download the latest Windows x64 release, extract it, and run `gluj-bench-ui.exe`. Gluj-Bench measures CPU and GPU compute performance plus cache, RAM, VRAM, and host-to-GPU bandwidth without requiring manufacturer-specific SDKs. It is an early work in progress, so expect bugs and treat every result as an informative measured value—not an exact statement of theoretical hardware capability.
+
+> [!WARNING]
+> **Work in progress:** Gluj-Bench is an initial public preview and is not finalized. Bugs, incorrect readings, hangs, and crashes are possible. Benchmark definitions, kernels, metadata, and scores may change before 1.0.
+
+> [!IMPORTANT]
+> **Results disclaimer:** This software is provided **as is**, without warranty. Results should be taken with a grain of salt: they reflect what Gluj-Bench measured under a particular workload, software stack, driver, power state, and system configuration. They are not 1:1 replicas of a device's complete capabilities, guaranteed theoretical peaks, or directly interchangeable with results from other benchmark tools.
+
+## About Gluj-Bench
+
 Gluj-Bench is a free, vendor-neutral, AIDA64-like hardware benchmarking tool for Windows. It is designed to test CPU and GPU compute performance together with CPU cache, system RAM, GPU cache, VRAM, and host-to-GPU link bandwidth.
 
 Gluj-Bench provides transparent, reproducible measurements rather than a single unexplained score. GPU performance separates portable vector-shader throughput from capability-gated cooperative-matrix throughput, while GPU bandwidth measures empirically inferred effective L2/L3 regions, cache-separated GPU-local memory, and bidirectional host-device transfers. CPU suites measure aggregate L0-L3 data-cache and system-RAM bandwidth plus pinned integer, floating-point, string, prime-search, codec, POPCNT, AES, and AVX2/FMA workloads. Unsupported capabilities remain visibly disabled rather than producing synthetic results.
 
 Gluj-Bench is independently developed and is not affiliated with or endorsed by FinalWire or AIDA64.
 
-> **Release status:** Gluj-Bench 0.1.0 is an initial public preview. Benchmark definitions and result metadata are expected to evolve before 1.0.
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="App-CPU-Benchmark-Options.png" alt="CPU benchmark selection and configuration options" width="520"><br>
+      <sub><strong>CPU benchmark selection and configuration</strong></sub>
+    </td>
+    <td align="center">
+      <img src="App-GPU-results.png" alt="GPU bandwidth and compute benchmark results" width="520"><br>
+      <sub><strong>Detailed GPU benchmark results</strong></sub>
+    </td>
+  </tr>
+</table>
 
 ## Download and run
 
