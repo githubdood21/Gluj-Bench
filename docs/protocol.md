@@ -11,24 +11,24 @@ Protocol version 2 requests contain a non-empty request ID:
 Supported commands are `devices`, `benchmarks`, `run`, and `cancel`. A run includes its benchmark configuration:
 
 ```json
-{"protocol":2,"id":"run-1","command":"run","arguments":{"benchmark_id":"cpu.bandwidth.cache.l1","target_duration_ms":5000,"samples":5}}
+{"protocol":2,"id":"run-1","command":"run","arguments":{"benchmark_id":"cpu.bandwidth.cache.l1","target_duration_ms":2000,"samples":5}}
 ```
 
 For controlled SMT comparisons, `run` accepts a string-valued `options` object. The default is `physical_cores`; `logical_processors` pins one worker to every discovered logical processor while preserving the same aggregate cache-instance working-set size:
 
 ```json
-{"protocol":2,"id":"run-smt","command":"run","arguments":{"benchmark_id":"cpu.bandwidth.cache.l3","target_duration_ms":5000,"samples":5,"options":{"thread_mode":"logical_processors"}}}
+{"protocol":2,"id":"run-smt","command":"run","arguments":{"benchmark_id":"cpu.bandwidth.cache.l3","target_duration_ms":2000,"samples":5,"options":{"thread_mode":"logical_processors"}}}
 ```
 
 GPU runs use the same string-valued options object to select an adapter returned by `devices`:
 
 ```json
-{"protocol":2,"id":"run-gpu","command":"run","arguments":{"benchmark_id":"gpu.bandwidth.vram","target_duration_ms":5000,"samples":5,"options":{"device_id":"gpu:wgpu:0"}}}
+{"protocol":2,"id":"run-gpu","command":"run","arguments":{"benchmark_id":"gpu.bandwidth.vram","target_duration_ms":2000,"samples":5,"options":{"device_id":"gpu:vulkan:<device-uuid>"}}}
 ```
 
-GPU bandwidth IDs are `gpu.bandwidth.cache`, `gpu.bandwidth.vram`, and `gpu.bandwidth.host_link`. Cache metric names use `estimated_effective_l2.*` and `estimated_effective_l3.*` only when stable empirical tiers are detected; result metadata always marks those identities as inferred.
+GPU bandwidth IDs are `gpu.bandwidth.cache`, `gpu.bandwidth.vram`, and `gpu.bandwidth.host_link`. Cache and GPU-local memory traffic execute through raw Vulkan with embedded SPIR-V, while host-link measurements use raw Vulkan transfer commands and mapped staging buffers. Cache metric names use `estimated_effective_l2.*` and `estimated_effective_l3.*` only when stable empirical tiers are detected; result metadata always marks those identities as inferred.
 
-GPU compute IDs include the vector-shader workloads `gpu.performance.fp32`, `gpu.performance.fp16`, `gpu.performance.fp64`, `gpu.performance.int32`, and `gpu.performance.int8_packed`, plus `gpu.performance.matrix.fp16` and `gpu.performance.matrix.int8`. Vector and matrix scores are labeled separately. FP16 cooperative-matrix execution requires an exact, capability-reported 16x16x16 FP16-input/FP32-accumulator configuration. INT8 matrix remains visible but disabled when the portable shader frontend cannot safely express the driver-reported 8-bit operands. Results use `operations/s`; vector FMA and matrix multiply-accumulate both count multiplication and addition as separate operations.
+GPU performance IDs include the vector-shader workloads `gpu.performance.fp16`, `gpu.performance.fp32`, and `gpu.performance.fp64`. These execute through raw Vulkan using embedded SPIR-V; FP16 uses explicit `f16vec2` packed-pair operands. Matrix families include dense FP16, INT8, and FP8 plus their `gpu.performance.matrix.sparse.*` variants. Dense FP16 and signed or unsigned INT8 execute through raw Vulkan `VK_KHR_cooperative_matrix` pipelines when the driver advertises a compatible MxNxK/type configuration. FP8 and structured-sparse rows remain visible but disabled unless a capability-verified implementation exists; dense KHR support is never treated as evidence of sparse acceleration. Results use `operations/s`; vector FMA and matrix multiply-accumulate both count multiplication and addition as separate operations.
 
 The worker accepts one active run, emits an acceptance response, zero or more progress responses, and one terminal result or error using the run request ID:
 

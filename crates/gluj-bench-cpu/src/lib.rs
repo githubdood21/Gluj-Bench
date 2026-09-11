@@ -591,7 +591,7 @@ impl BenchmarkProvider for CpuBandwidthProvider {
         vec![self.cpu_device.clone(), self.memory_device.clone()]
     }
     fn benchmarks(&self) -> Vec<BenchmarkDescriptor> {
-        let mut items: Vec<_> = (0..=3).map(|level| self.cache_descriptor(level)).collect();
+        let mut items: Vec<_> = (1..=3).map(|level| self.cache_descriptor(level)).collect();
         items.push(self.memory_descriptor());
         items.extend(compute::descriptors(
             &self.cpu_device,
@@ -625,7 +625,7 @@ impl BenchmarkProvider for CpuBandwidthProvider {
         if let Some(level) = benchmark_id
             .strip_prefix("cpu.bandwidth.cache.l")
             .and_then(|value| value.parse::<u8>().ok())
-            .filter(|level| *level <= 3)
+            .filter(|level| (1..=3).contains(level))
         {
             return self.run_cache(level, config, cancellation, progress);
         }
@@ -713,7 +713,8 @@ mod tests {
             .into_iter()
             .map(|item| item.id)
             .collect();
-        assert!(ids.contains(&"cpu.bandwidth.cache.l0".into()));
+        assert!(!ids.contains(&"cpu.bandwidth.cache.l0".into()));
+        assert!(ids.contains(&"cpu.bandwidth.cache.l1".into()));
         assert!(ids.contains(&"cpu.bandwidth.cache.l3".into()));
         assert!(ids.contains(&"cpu.bandwidth.memory".into()));
     }

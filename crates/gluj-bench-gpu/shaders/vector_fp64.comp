@@ -1,0 +1,22 @@
+#version 460
+#extension GL_ARB_gpu_shader_fp64 : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) writeonly buffer Output { vec4 values[]; } output_data;
+layout(push_constant) uniform Params { uint loop_count; uint seed; uint invocation_count; uint padding; } params;
+
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if(index>=params.invocation_count){return;}
+    double base=double((index^params.seed)&1023u)*0.0001+0.25;
+    dvec4 a0=dvec4(base)+dvec4(0.01,0.02,0.03,0.04); dvec4 a1=a0+dvec4(0.05);
+    dvec4 a2=a0+dvec4(0.10); dvec4 a3=a0+dvec4(0.15); dvec4 a4=a0+dvec4(0.20);
+    dvec4 a5=a0+dvec4(0.25); dvec4 a6=a0+dvec4(0.30); dvec4 a7=a0+dvec4(0.35);
+    for(uint i=0;i<params.loop_count;++i){
+        a0=fma(a0,dvec4(1.000000001),dvec4(0.000000001)); a1=fma(a1,dvec4(0.999999999),dvec4(0.000000002));
+        a2=fma(a2,dvec4(1.000000002),dvec4(0.000000003)); a3=fma(a3,dvec4(0.999999998),dvec4(0.000000004));
+        a4=fma(a4,dvec4(1.000000003),dvec4(0.000000005)); a5=fma(a5,dvec4(0.999999997),dvec4(0.000000006));
+        a6=fma(a6,dvec4(1.000000004),dvec4(0.000000007)); a7=fma(a7,dvec4(0.999999996),dvec4(0.000000008));
+    }
+    dvec4 sum=a0+a1+a2+a3+a4+a5+a6+a7;
+    output_data.values[index]=vec4(sum);
+}

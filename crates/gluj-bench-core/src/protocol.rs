@@ -3,6 +3,7 @@ use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProtocolCommand {
+    Fingerprint,
     Devices,
     Benchmarks,
     Run {
@@ -87,6 +88,7 @@ pub fn parse_request(value: &Value) -> Result<ProtocolRequest, Value> {
         ));
     };
     let command = match command {
+        "fingerprint" => ProtocolCommand::Fingerprint,
         "devices" => ProtocolCommand::Devices,
         "benchmarks" => ProtocolCommand::Benchmarks,
         "run" => {
@@ -180,6 +182,17 @@ mod tests {
             config.options.get("thread_mode").map(String::as_str),
             Some("logical_processors")
         );
+    }
+
+    #[test]
+    fn parses_a_lightweight_fingerprint_request() {
+        let request = parse_request(&json!({
+            "protocol": 2,
+            "id": "fingerprint-1",
+            "command": "fingerprint"
+        }))
+        .unwrap();
+        assert_eq!(request.command, ProtocolCommand::Fingerprint);
     }
 
     #[test]

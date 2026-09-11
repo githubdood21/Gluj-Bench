@@ -287,6 +287,12 @@ mod tests {
         assert_eq!(cache_working_set(tier, None), Some(8 * MIB));
         assert_eq!(vram_working_set(Some(tier), 512 * MIB), Some(256 * MIB));
         assert_eq!(vram_working_set(Some(tier), 128 * MIB), None);
+        assert_eq!(
+            vram_working_set(None, 512 * MIB),
+            Some(256 * MIB),
+            "missing cache tiers use a conservative direct-memory fallback"
+        );
+        assert_eq!(vram_working_set(None, 128 * MIB), None);
     }
 
     #[test]

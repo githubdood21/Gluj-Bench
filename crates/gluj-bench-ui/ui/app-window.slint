@@ -1,0 +1,193 @@
+import { Button, ComboBox, ProgressIndicator, ScrollView } from "std-widgets.slint";
+
+export struct DeviceRow {
+    id: string, name: string, category: string, availability: string, status: string,
+    details: string, cache-details: string, accent: color, available: bool,
+}
+export struct BenchmarkRow {
+    id: string, name: string, workload: string, availability: string, data-type: string,
+    unit: string, enabled: bool, selected: bool, hardware-ready: bool,
+}
+export struct ResultRow {
+    title: string, device: string, elapsed: string, primary-name: string,
+    primary-value: string, statistics: string, secondary-metrics: string,
+    diagnosis: string, details: string,
+}
+
+component SectionTitle inherits Text { color: #f4f7fb; font-size: 25px; font-weight: 700; }
+component Surface inherits Rectangle { background: #151b26; border-color: #293448; border-width: 1px; border-radius: 14px; }
+component Label inherits Text { color: #8f9caf; font-size: 11px; font-weight: 700; }
+
+export component MainWindow inherits Window {
+    title: "Gluj-Bench";
+    min-width: 980px; min-height: 680px;
+    preferred-width: 1280px; preferred-height: 820px;
+    background: #0b0f16;
+
+    in-out property <int> page: 0;
+    in-out property <string> status: "Starting benchmark worker...";
+    in-out property <bool> worker-online: false;
+    in-out property <string> suite-description: "";
+    in-out property <[string]> gpu-adapters: [];
+    in-out property <int> selected-gpu: -1;
+    in-out property <string> selected-gpu-name: "No compatible GPU selected";
+    in-out property <bool> show-gpu-selector: false;
+    in-out property <string> target-hardware-name: "Discovering hardware...";
+    in-out property <string> target-hardware-description: "";
+    in-out property <string> selected-benchmark-name: "No workload selected";
+    in-out property <string> selected-benchmark-description: "Select an available workload to inspect and run it.";
+    in-out property <string> selected-benchmark-availability: "";
+    in-out property <bool> selected-benchmark-enabled: false;
+    in-out property <[DeviceRow]> devices: [];
+    in-out property <[BenchmarkRow]> benchmarks: [];
+    in-out property <[ResultRow]> results: [];
+    in-out property <string> expanded-device-id: "";
+    in-out property <bool> result-details-expanded: false;
+    in-out property <int> device-count: 0;
+    in-out property <int> available-device-count: 0;
+    in-out property <int> benchmark-count: 0;
+    in-out property <bool> running: false;
+    in-out property <int> queued-count: 0;
+    in-out property <float> progress: 0;
+    in-out property <string> progress-message: "";
+
+    callback select-page(int); callback select-suite(string); callback select-gpu(int);
+    callback select-benchmark(string); callback toggle-device-details(string); callback toggle-result-details();
+    callback run-selected(); callback run-all(); callback cancel(); callback clear-results(); callback rescan-hardware();
+
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle {
+            width: 242px; background: #101620; border-color: #263148; border-width: 1px;
+            VerticalLayout {
+                padding: 22px; spacing: 10px;
+                HorizontalLayout { height: 40px; spacing: 10px;
+                    Rectangle { width: 38px; height: 38px; background: #16394a; border-color: #39d7c1; border-width: 1px; border-radius: 10px; Text { text: "G"; color: #63e5d1; font-size: 20px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; } }
+                    VerticalLayout { spacing: 1px; Text { text: "GLUJ-BENCH"; color: #f4f7fb; font-size: 18px; font-weight: 800; } Text { text: "PERFORMANCE LAB"; color: #71809a; font-size: 9px; font-weight: 700; } }
+                }
+                Rectangle { height: 18px; }
+                Button { text: "Overview"; primary: root.page == 0; clicked => { root.select-page(0); } }
+                Button { text: "Test Lab"; primary: root.page == 1; clicked => { root.select-page(1); } }
+                Button { text: "Results"; primary: root.page == 2; clicked => { root.select-page(2); } }
+                Rectangle { vertical-stretch: 1; }
+                Surface {
+                    height: 76px; background: root.worker-online ? #10251f : #291a20; border-color: root.worker-online ? #235f4e : #65323c;
+                    VerticalLayout { padding: 12px; spacing: 5px;
+                        Label { text: root.worker-online ? "WORKER READY" : "WORKER OFFLINE"; color: root.worker-online ? #62dfad : #ff8795; }
+                        Text { text: root.worker-online ? "Background service connected" : "Benchmarks are unavailable"; color: #c2cad7; font-size: 10px; wrap: word-wrap; }
+                    }
+                }
+                Text { text: "GLUJ-BENCH  v0.1"; color: #536178; font-size: 10px; }
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1; background: #0b0f16;
+            VerticalLayout {
+                padding: 28px; spacing: 16px;
+                if root.page == 0: overview-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    viewport-width: self.width;
+                    VerticalLayout {
+                            width: overview-scroll.visible-width - 16px; spacing: 16px; alignment: start;
+                            HorizontalLayout {
+                                height: 58px; vertical-stretch: 0;
+                                VerticalLayout { spacing: 4px; SectionTitle { text: "Hardware overview"; } Text { text: "Detected components, capability coverage, and scan health."; color: #8f9caf; font-size: 13px; } }
+                                Rectangle { horizontal-stretch: 1; }
+                                Button { width: 150px; height: 36px; vertical-stretch: 0; text: "Refresh hardware"; enabled: !root.running; clicked => { root.rescan-hardware(); } }
+                            }
+                            Surface {
+                                height: 96px; vertical-stretch: 0; background: #112632; border-color: #28546a;
+                                HorizontalLayout { padding: 18px; spacing: 18px;
+                                    Rectangle { width: 8px; background: root.worker-online ? #42d8b5 : #ef6d7d; border-radius: 4px; }
+                                    VerticalLayout { spacing: 5px; Label { text: root.worker-online ? "READY TO BENCHMARK" : "WORKER ATTENTION REQUIRED"; color: root.worker-online ? #60e4c1 : #ff9eaa; } Text { text: root.status; color: #f4f7fb; font-size: 16px; font-weight: 600; wrap: word-wrap; } Text { text: "Hardware metadata is kept locally and only fully rescanned when needed."; color: #9fafc2; font-size: 11px; } }
+                                }
+                            }
+                            HorizontalLayout { spacing: 12px;
+                                height: 90px; vertical-stretch: 0;
+                                Surface { horizontal-stretch: 1; VerticalLayout { padding: 14px; spacing: 4px; Label { text: "HARDWARE ENDPOINTS"; } Text { text: root.device-count; color: #6c9eff; font-size: 30px; font-weight: 700; } Text { text: "CPU, memory, and graphics"; color: #68788e; font-size: 10px; } } }
+                                Surface { horizontal-stretch: 1; VerticalLayout { padding: 14px; spacing: 4px; Label { text: "READY NOW"; } Text { text: root.available-device-count; color: #55dcae; font-size: 30px; font-weight: 700; } Text { text: "Available measurement targets"; color: #68788e; font-size: 10px; } } }
+                                Surface { horizontal-stretch: 1; VerticalLayout { padding: 14px; spacing: 4px; Label { text: "SUPPORTED TESTS"; } Text { text: root.benchmark-count; color: #d19bff; font-size: 30px; font-weight: 700; } Text { text: "Capability-gated workloads"; color: #68788e; font-size: 10px; } } }
+                            }
+                            Text { height: 18px; vertical-stretch: 0; text: "SYSTEM INVENTORY"; color: #71809a; font-size: 11px; font-weight: 700; }
+                            for device in root.devices: Surface {
+                                height: root.expanded-device-id == device.id ? 180px : 110px; vertical-stretch: 0; opacity: device.available ? 1 : 0.72;
+                                VerticalLayout { padding: 15px; spacing: 7px;
+                                    HorizontalLayout { height: 42px; vertical-stretch: 0; spacing: 12px;
+                                        Rectangle { width: 5px; height: 42px; background: device.accent; border-radius: 3px; }
+                                        VerticalLayout { spacing: 2px; Text { text: device.name; color: #f4f7fb; font-size: 16px; font-weight: 700; } Text { text: device.category + "  /  " + device.status; color: #99a8bc; font-size: 11px; wrap: word-wrap; } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text { text: device.availability; color: device.available ? #60e4c1 : #f3ba67; font-size: 10px; font-weight: 800; vertical-alignment: center; }
+                                        Button { width: 82px; height: 30px; horizontal-stretch: 0; vertical-stretch: 0; text: root.expanded-device-id == device.id ? "Close" : "Details"; clicked => { root.toggle-device-details(device.id); } }
+                                    }
+                                    Text { text: device.details; color: #b3bfce; font-size: 11px; wrap: word-wrap; }
+                                    if root.expanded-device-id == device.id: VerticalLayout { spacing: 5px; Text { text: device.cache-details; color: #73dcca; font-size: 11px; wrap: word-wrap; } Text { text: "Capabilities: " + device.details; color: #9eacbf; font-size: 10px; wrap: word-wrap; } }
+                                }
+                            }
+                    }
+                }
+                if root.page == 1: HorizontalLayout {
+                    spacing: 18px;
+                    Rectangle { horizontal-stretch: 3; min-width: 380px; VerticalLayout { spacing: 14px;
+                        SectionTitle { text: "Test Lab"; }
+                        Text { text: "Choose a suite and workload. Availability is checked against the selected hardware."; color: #8f9caf; font-size: 12px; wrap: word-wrap; }
+                        Surface { height: 122px; vertical-stretch: 0; VerticalLayout { padding: 14px; spacing: 8px;
+                            Label { text: "BENCHMARK SUITE"; }
+                            HorizontalLayout { spacing: 7px; Button { text: "CPU bandwidth"; primary: root.suite-description == "Read, write, and copy bandwidth with per-operation sample statistics."; clicked => { root.select-suite("cpu.bandwidth"); } } Button { text: "CPU performance"; primary: root.suite-description == "Aggregate processor throughput, single-thread INT64, and compute-vs-memory diagnosis."; clicked => { root.select-suite("cpu.performance"); } } }
+                            HorizontalLayout { spacing: 7px; Button { text: "GPU bandwidth"; primary: root.suite-description == "Estimated cache, GPU-local memory, and host-device bandwidth."; clicked => { root.select-suite("gpu.bandwidth"); } } Button { text: "GPU performance"; primary: root.suite-description == "Vector shader and cooperative-matrix throughput, capability-gated per format."; clicked => { root.select-suite("gpu.performance"); } } }
+                        } }
+                        Text { text: root.suite-description; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        benchmarks-scroll := ScrollView { vertical-stretch: 1; viewport-width: self.width; VerticalLayout { width: benchmarks-scroll.visible-width - 16px; spacing: 9px; alignment: start;
+                            for benchmark in root.benchmarks: Surface {
+                                height: 104px; vertical-stretch: 0;
+                                background: benchmark.selected ? #172e3b : workload-click.has-hover && benchmark.enabled ? #1a2330 : #151b26;
+                                border-color: benchmark.selected ? #4d91df : #293448;
+                                opacity: benchmark.enabled ? 1 : 0.62;
+                                HorizontalLayout { padding: 14px; spacing: 14px;
+                                    Rectangle { width: 4px; background: benchmark.selected ? #65d9ba : #40506a; border-radius: 2px; }
+                                    VerticalLayout { spacing: 5px;
+                                        HorizontalLayout { Text { text: benchmark.name; color: #f4f7fb; font-size: 15px; font-weight: 700; } Rectangle { horizontal-stretch: 1; } Label { text: benchmark.data-type; color: #78a9ff; } }
+                                        Text { text: benchmark.workload; color: #adbacb; font-size: 11px; wrap: word-wrap; }
+                                        Text { text: benchmark.enabled ? benchmark.unit : (benchmark.hardware-ready ? benchmark.availability : "Unavailable: " + benchmark.availability); color: benchmark.enabled ? #65d9ba : #f3ba67; font-size: 10px; wrap: word-wrap; }
+                                    }
+                                }
+                                workload-click := TouchArea { width: parent.width; height: parent.height; enabled: benchmark.enabled && !root.running; mouse-cursor: pointer; clicked => { root.select-benchmark(benchmark.id); } }
+                            }
+                        } }
+                    } }
+                    Surface { horizontal-stretch: 2; min-width: 260px; VerticalLayout { padding: 18px; spacing: 14px;
+                        Label { text: "RUN INSPECTOR"; } Text { text: root.selected-benchmark-name; color: #f4f7fb; font-size: 21px; font-weight: 700; wrap: word-wrap; }
+                        Text { text: root.selected-benchmark-description; color: #9fabbd; font-size: 12px; wrap: word-wrap; }
+                        Text { text: root.selected-benchmark-availability; color: root.selected-benchmark-enabled ? #65d9ba : #f3ba67; font-size: 11px; wrap: word-wrap; }
+                        Rectangle { height: 1px; background: #293448; } Label { text: "TARGET HARDWARE"; }
+                        if root.show-gpu-selector && root.gpu-adapters.length > 0: ComboBox { model: root.gpu-adapters; current-value: root.selected-gpu-name; selected(value) => { root.select-gpu(self.current-index); } }
+                        if !root.show-gpu-selector: Text { text: root.target-hardware-name; color: #f4f7fb; font-size: 14px; font-weight: 600; wrap: word-wrap; }
+                        Text { text: root.target-hardware-description; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                        Rectangle { vertical-stretch: 1; }
+                        if root.running: VerticalLayout { spacing: 10px; Label { text: "BENCHMARK IN PROGRESS"; color: #60e4c1; } Text { text: root.progress-message; color: #f4f7fb; font-size: 13px; wrap: word-wrap; } ProgressIndicator { progress: root.progress; } Text { text: root.queued-count > 0 ? "Queue: " + root.queued-count + " workload(s) remaining" : "Final workload in progress"; color: #9facbd; font-size: 11px; } Button { text: "Cancel benchmark"; clicked => { root.cancel(); } } }
+                        if !root.running: VerticalLayout { spacing: 10px; Text { text: "5 samples  |  approximately 2 seconds of timed measurement"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run selected workload"; primary: true; enabled: root.selected-benchmark-enabled; clicked => { root.run-selected(); } } Button { text: "Run all available in suite"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
+                    } }
+                }
+                if root.page == 2: results-scroll := ScrollView { vertical-stretch: 1; viewport-width: self.width;
+                    VerticalLayout { width: results-scroll.visible-width - 16px; spacing: 16px; alignment: start;
+                        HorizontalLayout { height: 58px; vertical-stretch: 0; VerticalLayout { spacing: 4px; SectionTitle { text: "Results workspace"; } Text { text: "Session measurements with performance context and confidence."; color: #8f9caf; font-size: 13px; } } Rectangle { horizontal-stretch: 1; } Button { width: 126px; height: 36px; vertical-stretch: 0; text: "Clear session"; enabled: root.results.length > 0; clicked => { root.clear-results(); } } }
+                        if root.results.length == 0: Surface { height: 205px; vertical-stretch: 0; VerticalLayout { padding: 26px; spacing: 10px; Text { text: "No measurements yet"; color: #f4f7fb; font-size: 22px; font-weight: 700; } Text { text: "Run a workload from Test Lab and its featured score, variability, and measurement context will appear here."; color: #9facbd; font-size: 13px; wrap: word-wrap; } Button { width: 150px; height: 36px; vertical-stretch: 0; text: "Open Test Lab"; primary: true; clicked => { root.select-page(1); } } } }
+                        if root.results.length > 0: Surface { height: root.result-details-expanded ? 274px : 220px; vertical-stretch: 0; background: #142331; border-color: #315d7a; VerticalLayout { padding: 20px; spacing: 7px;
+                            Label { text: "LATEST MEASUREMENT"; color: #73dcca; }
+                            HorizontalLayout { VerticalLayout { spacing: 3px; Text { text: root.results[0].title; color: #f4f7fb; font-size: 18px; font-weight: 700; } Text { text: root.results[0].device + "  |  " + root.results[0].elapsed; color: #a5b4c7; font-size: 11px; } } Rectangle { horizontal-stretch: 1; } Text { text: root.results[0].primary-value; color: #70e4cc; font-size: 30px; font-weight: 800; } }
+                            Text { text: root.results[0].primary-name; color: #92a3b9; font-size: 11px; } Rectangle { height: 1px; background: #315069; }
+                            Text { text: root.results[0].statistics; color: #d1d9e4; font-size: 11px; wrap: word-wrap; } Text { text: root.results[0].diagnosis; color: #9caec2; font-size: 11px; wrap: word-wrap; }
+                            if root.result-details-expanded: Text { text: "Measurement details: " + root.results[0].details; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
+                            Button { text: root.result-details-expanded ? "Hide measurement details" : "Show measurement details"; clicked => { root.toggle-result-details(); } }
+                        } }
+                        if root.results.length > 0: Text { height: 18px; vertical-stretch: 0; text: "RECENT RUNS"; color: #71809a; font-size: 11px; font-weight: 700; }
+                        for result in root.results: Surface { height: 146px; vertical-stretch: 0; VerticalLayout { padding: 14px; spacing: 5px;
+                            HorizontalLayout { Text { text: result.title; color: #f4f7fb; font-size: 15px; font-weight: 700; } Rectangle { horizontal-stretch: 1; } Text { text: result.primary-value; color: #70e4cc; font-size: 16px; font-weight: 700; } }
+                            Text { text: result.device + "  |  " + result.elapsed + "  |  " + result.statistics; color: #9eacc0; font-size: 10px; wrap: word-wrap; }
+                            Text { text: result.secondary-metrics; color: #79a9ff; font-size: 11px; wrap: word-wrap; } Text { text: "Select the latest measurement above to inspect its recorded metadata."; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
+                        } }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -14,7 +14,7 @@ use std::{
     thread,
 };
 
-fn registry() -> BenchmarkRegistry {
+fn build_registry() -> BenchmarkRegistry {
     let mut registry = BenchmarkRegistry::default();
     registry.add(Box::new(CpuBandwidthProvider::discover()));
     registry.add(Box::new(GpuBandwidthProvider::discover()));
@@ -33,10 +33,20 @@ struct ActiveRun {
     cancellation: CancellationToken,
 }
 
-fn stdio_host(registry: BenchmarkRegistry) -> io::Result<()> {
-    let devices = registry.devices();
-    let benchmarks = registry.benchmarks();
-    let registry = Arc::new(Mutex::new(registry));
+fn platform_fingerprint() -> String {
+    [
+        std::env::consts::OS.to_owned(),
+        std::env::consts::ARCH.to_owned(),
+        std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default(),
+        std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_default(),
+    ]
+    .join("|")
+}
+
+fn stdio_host() -> io::Result<()> {
+    // Creating providers probes topology and GPU capabilities. Keep that work lazy so a cached
+    // profile can be shown after only the inexpensive platform fingerprint request.
+    let registry: Arc<Mutex<Option<BenchmarkRegistry>>> = Arc::new(Mutex::new(None));
     let active: Arc<Mutex<Option<ActiveRun>>> = Arc::new(Mutex::new(None));
     let (output, receiver) = mpsc::channel::<Value>();
     let writer = thread::spawn(move || -> io::Result<()> {
@@ -72,13 +82,26 @@ fn stdio_host(registry: BenchmarkRegistry) -> io::Result<()> {
             }
         };
         match request.command {
-            ProtocolCommand::Devices => {
-                let _ = output.send(success_response(&request.id, json!({ "devices": devices })));
-            }
-            ProtocolCommand::Benchmarks => {
+            ProtocolCommand::Fingerprint => {
                 let _ = output.send(success_response(
                     &request.id,
-                    json!({ "benchmarks": benchmarks }),
+                    json!({ "fingerprint": platform_fingerprint() }),
+                ));
+            }
+            ProtocolCommand::Devices => {
+                let mut registry = registry.lock().expect("registry lock");
+                let registry = registry.get_or_insert_with(build_registry);
+                let _ = output.send(success_response(
+                    &request.id,
+                    json!({ "devices": registry.devices() }),
+                ));
+            }
+            ProtocolCommand::Benchmarks => {
+                let mut registry = registry.lock().expect("registry lock");
+                let registry = registry.get_or_insert_with(build_registry);
+                let _ = output.send(success_response(
+                    &request.id,
+                    json!({ "benchmarks": registry.benchmarks() }),
                 ));
             }
             ProtocolCommand::Cancel { request_id } => {
@@ -104,6 +127,9 @@ fn stdio_host(registry: BenchmarkRegistry) -> io::Result<()> {
                 benchmark_id,
                 config,
             } => {
+                let mut registry_guard = registry.lock().expect("registry lock");
+                registry_guard.get_or_insert_with(build_registry);
+                drop(registry_guard);
                 let mut current = active.lock().expect("active lock");
                 if current.is_some() {
                     let _ = output.send(error_response(
@@ -131,12 +157,12 @@ fn stdio_host(registry: BenchmarkRegistry) -> io::Result<()> {
                     let mut progress = |update| {
                         let _ = output.send(progress_response(&request_id, &update));
                     };
-                    let result = registry.lock().expect("registry lock").run(
-                        &benchmark_id,
-                        &config,
-                        &cancellation,
-                        &mut progress,
-                    );
+                    let result = registry
+                        .lock()
+                        .expect("registry lock")
+                        .as_mut()
+                        .expect("registry initialized")
+                        .run(&benchmark_id, &config, &cancellation, &mut progress);
                     let response = match result {
                         Ok(result) => result_response(&request_id, &result),
                         Err(error) => benchmark_error_response(&request_id, error),
@@ -256,10 +282,9 @@ fn format_grouped_2(value: f64) -> String {
 }
 
 fn main() -> ExitCode {
-    let mut registry = registry();
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments == ["--stdio"] {
-        return stdio_host(registry)
+        return stdio_host()
             .map(|_| ExitCode::SUCCESS)
             .unwrap_or_else(|problem| {
                 eprintln!("Worker I/O failed: {problem}");
@@ -270,6 +295,7 @@ fn main() -> ExitCode {
         usage();
         return ExitCode::from(2);
     }
+    let mut registry = build_registry();
     let json_output = arguments.iter().any(|argument| argument == "--json");
     match arguments[0].as_str() {
         "devices" if arguments.len() == 1 + usize::from(json_output) => {
@@ -345,7 +371,7 @@ mod tests {
             GpuBandwidthProvider::discover()
                 .devices()
                 .iter()
-                .all(|device| device.id.starts_with("gpu:wgpu:"))
+                .all(|device| device.id.starts_with("gpu:vulkan:"))
         );
     }
 }

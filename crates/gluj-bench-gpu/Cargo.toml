@@ -10,8 +10,5 @@ publish = false
 
 [dependencies]
 ash.workspace = true
-naga.workspace = true
 gluj-bench-core = { path = "../gluj-bench-core" }
-pollster.workspace = true
 sysinfo.workspace = true
-wgpu.workspace = true

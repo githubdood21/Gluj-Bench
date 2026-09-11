@@ -1,8 +1,9 @@
 mod analysis;
 mod compute;
-mod compute_shader;
 mod cooperative_matrix;
-mod shader;
+mod vulkan;
+mod vulkan_bandwidth;
+mod vulkan_vector;
 
 pub use analysis::{EffectiveCacheTier, SweepPoint, detect_effective_cache_tiers};
 
@@ -10,6 +11,7 @@ use analysis::{
     CACHE_SWEEP_MAX, MIB, cache_working_set, coefficient_of_variation, statistics, sweep_sizes,
     vram_working_set,
 };
+use ash::vk;
 use gluj_bench_core::{
     BenchmarkCategory, BenchmarkConfig, BenchmarkDescriptor, BenchmarkError, BenchmarkProvider,
     BenchmarkResult, CancellationToken, DeviceCategory, DeviceDescriptor, Metric, ProgressCallback,
@@ -17,10 +19,8 @@ use gluj_bench_core::{
 };
 use std::{
     collections::BTreeMap,
-    sync::mpsc,
     time::{Duration, Instant},
 };
-use wgpu::util::DeviceExt;
 
 const CACHE_ID: &str = "gpu.bandwidth.cache";
 const VRAM_ID: &str = "gpu.bandwidth.vram";
@@ -29,14 +29,14 @@ const WORKGROUP_SIZE: u64 = 256;
 const GPU_PRECONDITION_MS: f64 = 750.0;
 const HOST_STAGING_BUFFER_COUNT: usize = 3;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelOperation {
     Read,
     Write,
     Copy,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelFlavor {
     Cache,
     Stream,
@@ -54,17 +54,6 @@ struct DispatchMeasurement {
 }
 
 impl KernelOperation {
-    fn entry_point(self, flavor: KernelFlavor) -> &'static str {
-        match (self, flavor) {
-            (Self::Read, KernelFlavor::Cache) => "read_cache",
-            (Self::Write, KernelFlavor::Cache) => "write_cache",
-            (Self::Copy, KernelFlavor::Cache) => "copy_cache",
-            (Self::Read, KernelFlavor::Stream) => "read_stream",
-            (Self::Write, KernelFlavor::Stream) => "write_stream",
-            (Self::Copy, KernelFlavor::Stream) => "copy_stream",
-        }
-    }
-
     fn accesses_per_invocation(self, flavor: KernelFlavor) -> u64 {
         match (self, flavor) {
             (Self::Read, KernelFlavor::Cache) => 4,
@@ -89,12 +78,14 @@ impl KernelOperation {
 
 struct AdapterRecord {
     id: String,
-    adapter: wgpu::Adapter,
-    info: wgpu::AdapterInfo,
-    features: wgpu::Features,
-    limits: wgpu::Limits,
+    vulkan: vulkan::VulkanAdapterInfo,
     cooperative: cooperative_matrix::CooperativeSupport,
-    cooperative_matrix_properties: Vec<wgpu::CooperativeMatrixProperties>,
+}
+
+impl AdapterRecord {
+    fn supports_vulkan_timestamps(&self) -> bool {
+        self.vulkan.timestamp_queries()
+    }
 }
 
 pub struct GpuBandwidthProvider {
@@ -106,62 +97,57 @@ pub struct GpuBandwidthProvider {
 
 impl GpuBandwidthProvider {
     pub fn discover() -> Self {
-        let mut cooperative_support = cooperative_matrix::discover();
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let enumerated = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        let mut adapters: Vec<wgpu::Adapter> = Vec::new();
-        for adapter in enumerated {
-            let info = adapter.get_info();
-            if info.device_type == wgpu::DeviceType::Cpu {
-                continue;
-            }
-            if let Some(existing_index) = adapters
-                .iter()
-                .position(|existing| existing.get_info().name.eq_ignore_ascii_case(&info.name))
-            {
-                let existing = &adapters[existing_index];
-                let candidate_score = adapter_score(&adapter);
-                if candidate_score > adapter_score(existing) {
-                    adapters[existing_index] = adapter;
-                }
-            } else {
-                adapters.push(adapter);
-            }
-        }
+        let (vulkan_adapters, vulkan_problem) = match vulkan::discover() {
+            Ok(adapters) => (adapters, None),
+            Err(problem) => (Vec::new(), Some(problem)),
+        };
         let mut records = Vec::new();
         let mut devices = Vec::new();
-        for (index, adapter) in adapters.into_iter().enumerate() {
-            let info = adapter.get_info();
-            let features = adapter.features();
-            let limits = adapter.limits();
-            let cooperative_matrix_properties = adapter.cooperative_matrix_properties();
-            let id = format!("gpu:wgpu:{index}");
-            let cooperative = cooperative_support
-                .remove(&info.name.to_ascii_lowercase())
-                .unwrap_or_else(|| cooperative_matrix::CooperativeSupport {
-                    reason: "vulkan_adapter_match_unavailable".into(),
-                    ..Default::default()
-                });
-            let timestamp_queries = features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        for vulkan in vulkan_adapters {
+            let id = vulkan.id.clone();
+            let cooperative = vulkan.cooperative.clone();
+            let timestamp_queries = vulkan.timestamp_queries();
             let mut properties = BTreeMap::new();
-            properties.insert("backend".into(), format!("{:?}", info.backend));
-            properties.insert("device_type".into(), format!("{:?}", info.device_type));
+            properties.insert("backend".into(), "Vulkan".into());
+            properties.insert("execution_backend".into(), "raw-vulkan".into());
+            properties.insert("device_type".into(), vulkan.device_type_label().into());
+            properties.insert("vulkan_device_uuid".into(), vulkan.device_uuid.clone());
+            properties.insert(
+                "vulkan_vendor_id".into(),
+                format!("0x{:04x}", vulkan.vendor_id),
+            );
+            properties.insert(
+                "vulkan_device_id".into(),
+                format!("0x{:04x}", vulkan.device_id),
+            );
+            properties.insert(
+                "vulkan_api_version".into(),
+                vulkan::format_api_version(vulkan.api_version),
+            );
+            properties.insert(
+                "vulkan_driver_version".into(),
+                vulkan.driver_version.to_string(),
+            );
+            properties.insert(
+                "vulkan_compute_queue_family".into(),
+                vulkan.compute_queue_family.to_string(),
+            );
+            properties.insert(
+                "vulkan_timestamp_valid_bits".into(),
+                vulkan.timestamp_valid_bits.to_string(),
+            );
+            properties.insert(
+                "vulkan_timestamp_period_ns".into(),
+                vulkan.timestamp_period_ns.to_string(),
+            );
+            properties.insert(
+                "vulkan_subgroup_size".into(),
+                vulkan.subgroup_size.to_string(),
+            );
             properties.insert("timestamp_queries".into(), timestamp_queries.to_string());
-            properties.insert(
-                "timestamp_queries_inside_encoders".into(),
-                features
-                    .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-                    .to_string(),
-            );
-            properties.insert(
-                "shader_f16".into(),
-                features.contains(wgpu::Features::SHADER_F16).to_string(),
-            );
-            properties.insert(
-                "shader_f64".into(),
-                features.contains(wgpu::Features::SHADER_F64).to_string(),
-            );
+            properties.insert("shader_f16".into(), vulkan.shader_float16.to_string());
+            properties.insert("shader_f64".into(), vulkan.shader_float64.to_string());
+            properties.insert("shader_int8".into(), vulkan.shader_int8.to_string());
             properties.insert(
                 "cooperative_matrix_fp16".into(),
                 cooperative.fp16.is_some().to_string(),
@@ -170,45 +156,59 @@ impl GpuBandwidthProvider {
                 "cooperative_matrix_int8".into(),
                 cooperative.int8.is_some().to_string(),
             );
+            if let Some(shape) = cooperative.fp16 {
+                properties.insert(
+                    "cooperative_matrix_fp16_shape".into(),
+                    format!("{}x{}x{}", shape.m, shape.n, shape.k),
+                );
+            }
+            if let Some(shape) = cooperative.int8 {
+                properties.insert(
+                    "cooperative_matrix_int8_shape".into(),
+                    format!("{}x{}x{}", shape.m, shape.n, shape.k),
+                );
+            }
             properties.insert(
-                "wgpu_cooperative_matrix_configurations".into(),
-                cooperative_matrix_properties.len().to_string(),
+                "vulkan_device_extension_count".into(),
+                vulkan.extensions.len().to_string(),
             );
-            properties.insert("max_buffer_size".into(), limits.max_buffer_size.to_string());
+            properties.insert(
+                "max_buffer_size".into(),
+                vulkan.max_storage_buffer_range.to_string(),
+            );
             properties.insert(
                 "max_storage_buffer_binding_size".into(),
-                limits.max_storage_buffer_binding_size.to_string(),
+                vulkan.max_storage_buffer_range.to_string(),
             );
             devices.push(DeviceDescriptor {
                 id: id.clone(),
-                name: info.name.clone(),
+                name: vulkan.name.clone(),
                 category: DeviceCategory::Gpu,
                 available: true,
                 status: if timestamp_queries {
-                    "GPU-local bandwidth, compute, and host-device tests are available through wgpu; optional numeric formats remain capability-gated.".into()
+                    "Raw Vulkan compute device ready; numeric and matrix workloads are capability-gated.".into()
                 } else {
-                    "Host-device bandwidth is available; GPU-local bandwidth and compute timing are unavailable because timestamp queries are unsupported.".into()
+                    "Vulkan device discovered, but GPU-local timestamp queries are unavailable.".into()
                 },
                 properties,
                 caches: Vec::new(),
             });
             records.push(AdapterRecord {
                 id,
-                adapter,
-                info,
-                features,
-                limits,
+                vulkan,
                 cooperative,
-                cooperative_matrix_properties,
             });
         }
         if devices.is_empty() {
             devices.push(DeviceDescriptor {
-                id: "gpu:wgpu:unavailable".into(),
-                name: "GPU compute".into(),
+                id: "gpu:vulkan:unavailable".into(),
+                name: "Vulkan GPU compute".into(),
                 category: DeviceCategory::Gpu,
                 available: false,
-                status: "No graphics adapter was discovered through wgpu.".into(),
+                status: vulkan_problem.map_or_else(
+                    || "No compatible Vulkan compute adapter was discovered.".into(),
+                    |problem| format!("Vulkan discovery failed: {}", problem.message),
+                ),
                 properties: BTreeMap::new(),
                 caches: Vec::new(),
             });
@@ -225,7 +225,7 @@ impl GpuBandwidthProvider {
         let local_devices: Vec<_> = self
             .adapters
             .iter()
-            .filter(|record| record.features.contains(wgpu::Features::TIMESTAMP_QUERY))
+            .filter(|record| record.supports_vulkan_timestamps())
             .map(|record| record.id.clone())
             .collect();
         let host_devices: Vec<_> = self
@@ -238,8 +238,8 @@ impl GpuBandwidthProvider {
         let mut descriptors = vec![
             descriptor(
                 CACHE_ID,
-                "Estimated effective L2 / L3 cache bandwidth",
-                "Empirical hot-working-set cache plateau discovery and bandwidth",
+                "Estimated effective GPU cache bandwidth",
+                "Empirical hot-working-set cache plateau discovery; some unified-memory GPUs have no isolatable tier",
                 local_devices.clone(),
                 local_available,
                 if local_available {
@@ -251,8 +251,8 @@ impl GpuBandwidthProvider {
             ),
             descriptor(
                 VRAM_ID,
-                "GPU-local memory bandwidth",
-                "Cache-separated GPU-local read, write, and copy bandwidth",
+                "GPU-accessible memory bandwidth",
+                "Streaming read, write, and copy bandwidth outside an inferred cache tier when one is available",
                 local_devices,
                 local_available,
                 if local_available {
@@ -297,7 +297,7 @@ impl GpuBandwidthProvider {
         self.adapters.first().ok_or_else(|| {
             BenchmarkError::new(
                 "adapter_not_found",
-                "No GPU adapter was discovered through wgpu.",
+                "No compatible Vulkan GPU adapter was discovered.",
             )
         })
     }
@@ -312,7 +312,7 @@ impl GpuBandwidthProvider {
         if let Some(tiers) = self.inferred_tiers.get(&adapter_id) {
             return Ok(tiers.clone());
         }
-        let context = GpuContext::request(&self.adapters[adapter_index], true)?;
+        let context = vulkan_bandwidth::VulkanBandwidthContext::new(&self.adapters[adapter_index])?;
         let limit = local_buffer_limit(&self.adapters[adapter_index]);
         let sizes = sweep_sizes(limit);
         if sizes.len() < 4 {
@@ -333,7 +333,7 @@ impl GpuBandwidthProvider {
                     format!("Probing effective cache behavior at {} MiB", size / MIB)
                 },
             });
-            let samples = measure_gpu_operation_with_dispatch(
+            let samples = vulkan_bandwidth::measure_gpu_operation(
                 &context,
                 DispatchMeasurement {
                     size,
@@ -366,16 +366,28 @@ impl GpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let started = Instant::now();
-        let tiers = self.discover_tiers(adapter_index, cancellation, progress)?;
+        let tiers = match self.discover_tiers(adapter_index, cancellation, progress) {
+            Ok(tiers) => tiers,
+            Err(problem) if problem.code == "cancelled" => return Err(problem),
+            Err(problem) => {
+                progress(done("GPU cache tier is not measurable on this adapter."));
+                return Ok(self.cache_discovery_result(
+                    adapter_index,
+                    started,
+                    "unavailable",
+                    Some(&problem.code),
+                ));
+            }
+        };
         if tiers.is_empty() {
-            return Err(BenchmarkError::new(
-                "cache_tier_not_detected",
-                "No stable effective cache bandwidth plateau was detected on this adapter.",
+            progress(done(
+                "No isolatable GPU cache tier was detected on this adapter.",
             ));
+            return Ok(self.cache_discovery_result(adapter_index, started, "not_detected", None));
         }
-        let context = GpuContext::request(&self.adapters[adapter_index], true)?;
+        let context = vulkan_bandwidth::VulkanBandwidthContext::new(&self.adapters[adapter_index])?;
         let mut metrics = Vec::new();
-        let mut metadata = common_metadata(&self.adapters[adapter_index], "gpu_timestamp");
+        let mut metadata = bandwidth_metadata(&self.adapters[adapter_index], "gpu_timestamp");
         insert_clock_policy(&mut metadata);
         metadata.insert("classification".into(), "inferred".into());
         metadata.insert("physical_cache_identity_confirmed".into(), "false".into());
@@ -460,7 +472,7 @@ impl GpuBandwidthProvider {
                         operation.name()
                     ),
                 });
-                let values = measure_gpu_operation_with_dispatch(
+                let values = vulkan_bandwidth::measure_gpu_operation(
                     &context,
                     DispatchMeasurement {
                         size: working_set,
@@ -497,7 +509,7 @@ impl GpuBandwidthProvider {
             elapsed_ns: duration_ns(started.elapsed()),
             metrics,
             workload_metadata: metadata,
-            device_metadata: device_metadata(&self.adapters[adapter_index]),
+            device_metadata: bandwidth_device_metadata(&self.adapters[adapter_index]),
         })
     }
 
@@ -509,7 +521,13 @@ impl GpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let started = Instant::now();
-        let tiers = self.discover_tiers(adapter_index, cancellation, progress)?;
+        let (tiers, cache_discovery_status) =
+            match self.discover_tiers(adapter_index, cancellation, progress) {
+                Ok(tiers) if !tiers.is_empty() => (tiers, "detected"),
+                Ok(_) => (Vec::new(), "not_detected"),
+                Err(problem) if problem.code == "cancelled" => return Err(problem),
+                Err(_) => (Vec::new(), "unavailable"),
+            };
         let outer = tiers.last().copied();
         let limit = local_buffer_limit(&self.adapters[adapter_index]);
         let Some(working_set) = vram_working_set(outer, limit) else {
@@ -518,7 +536,7 @@ impl GpuBandwidthProvider {
                 "A GPU-local working set four times larger than the outer inferred cache tier cannot fit within adapter limits.",
             ));
         };
-        let context = GpuContext::request(&self.adapters[adapter_index], true)?;
+        let context = vulkan_bandwidth::VulkanBandwidthContext::new(&self.adapters[adapter_index])?;
         let mut metrics = Vec::new();
         for (index, operation) in [
             KernelOperation::Read,
@@ -534,19 +552,37 @@ impl GpuBandwidthProvider {
                 phase: "gpu_local_memory".into(),
                 message: format!("Measuring GPU-local {} bandwidth", operation.name()),
             });
-            let values = measure_gpu_operation(
+            let values = vulkan_bandwidth::measure_gpu_operation(
                 &context,
-                working_set,
-                operation,
-                config.samples.max(1),
-                per_sample_duration(config),
+                DispatchMeasurement {
+                    size: working_set,
+                    dispatch_bytes: working_set,
+                    operation,
+                    flavor: KernelFlavor::Stream,
+                    precondition: true,
+                    sample_count: config.samples.max(1),
+                    target_per_sample: per_sample_duration(config),
+                },
                 cancellation,
             )?;
             metrics.push(metric(operation.name().into(), values));
         }
-        let mut metadata = common_metadata(&self.adapters[adapter_index], "gpu_timestamp");
+        let mut metadata = bandwidth_metadata(&self.adapters[adapter_index], "gpu_timestamp");
         insert_clock_policy(&mut metadata);
         metadata.insert("working_set_bytes".into(), working_set.to_string());
+        metadata.insert(
+            "cache_discovery_status".into(),
+            cache_discovery_status.into(),
+        );
+        metadata.insert(
+            "working_set_policy".into(),
+            if outer.is_some() {
+                "four_times_outer_inferred_cache_tier"
+            } else {
+                "conservative_direct_memory_fallback_without_cache_tier"
+            }
+            .into(),
+        );
         metadata.insert("cache_separation_multiplier".into(), "4".into());
         metadata.insert("minimum_working_set_bytes".into(), (256 * MIB).to_string());
         metadata.insert(
@@ -566,19 +602,7 @@ impl GpuBandwidthProvider {
             "read_checksum_policy".into(),
             "one_store_per_invocation".into(),
         );
-        metadata.insert(
-            "copy_path".into(),
-            if context
-                .device
-                .features()
-                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-            {
-                "native_copy_command"
-            } else {
-                "wgsl_compute_fallback"
-            }
-            .into(),
-        );
+        metadata.insert("copy_path".into(), "raw_vulkan_copy_command".into());
         progress(done("GPU-local memory benchmark completed."));
         Ok(BenchmarkResult {
             benchmark_id: VRAM_ID.into(),
@@ -586,8 +610,35 @@ impl GpuBandwidthProvider {
             elapsed_ns: duration_ns(started.elapsed()),
             metrics,
             workload_metadata: metadata,
-            device_metadata: device_metadata(&self.adapters[adapter_index]),
+            device_metadata: bandwidth_device_metadata(&self.adapters[adapter_index]),
         })
+    }
+
+    fn cache_discovery_result(
+        &self,
+        adapter_index: usize,
+        started: Instant,
+        status: &str,
+        reason: Option<&str>,
+    ) -> BenchmarkResult {
+        let mut metadata = bandwidth_metadata(&self.adapters[adapter_index], "gpu_timestamp");
+        metadata.insert("cache_discovery_status".into(), status.into());
+        metadata.insert("physical_cache_identity_confirmed".into(), "false".into());
+        metadata.insert(
+            "cache_discovery_note".into(),
+            "No isolatable effective cache tier was required or observed; this is expected on some unified-memory and integrated GPUs.".into(),
+        );
+        if let Some(reason) = reason {
+            metadata.insert("cache_discovery_reason".into(), reason.into());
+        }
+        BenchmarkResult {
+            benchmark_id: CACHE_ID.into(),
+            device_id: self.adapters[adapter_index].id.clone(),
+            elapsed_ns: duration_ns(started.elapsed()),
+            metrics: vec![metric("effective_cache_tiers_detected".into(), vec![0.0])],
+            workload_metadata: metadata,
+            device_metadata: bandwidth_device_metadata(&self.adapters[adapter_index]),
+        }
     }
 
     fn run_host_link(
@@ -599,12 +650,12 @@ impl GpuBandwidthProvider {
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let started = Instant::now();
         let record = &self.adapters[adapter_index];
-        let context = GpuContext::request(record, false)?;
+        let context = vulkan_bandwidth::VulkanBandwidthContext::new(record)?;
         let system = sysinfo::System::new_all();
         let Some(size) = host_transfer_size(
-            record.limits.max_buffer_size,
+            record.vulkan.max_storage_buffer_range,
             system.available_memory(),
-            record.info.device_type == wgpu::DeviceType::IntegratedGpu,
+            record.vulkan.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
         ) else {
             return Err(BenchmarkError::new(
                 "insufficient_gpu_memory",
@@ -616,7 +667,7 @@ impl GpuBandwidthProvider {
             phase: "host_to_device".into(),
             message: "Measuring Host to Device transfer bandwidth".into(),
         });
-        let host_to_device = measure_host_to_device(
+        let host_to_device = vulkan_bandwidth::measure_host_to_device(
             &context,
             size,
             config.samples.max(1),
@@ -628,14 +679,14 @@ impl GpuBandwidthProvider {
             phase: "device_to_host".into(),
             message: "Measuring Device to Host transfer bandwidth".into(),
         });
-        let device_to_host = measure_device_to_host(
+        let device_to_host = vulkan_bandwidth::measure_device_to_host(
             &context,
             size,
             config.samples.max(1),
             per_sample_duration(config),
             cancellation,
         )?;
-        let mut metadata = common_metadata(record, "cpu_wall_clock_end_to_end");
+        let mut metadata = bandwidth_metadata(record, "cpu_wall_clock_end_to_end");
         metadata.insert("transfer_buffer_bytes".into(), size.to_string());
         metadata.insert(
             "host_buffers_first_touched_before_timing".into(),
@@ -652,7 +703,7 @@ impl GpuBandwidthProvider {
         );
         metadata.insert(
             "link_classification".into(),
-            link_classification(record.info.device_type).into(),
+            link_classification(record.vulkan.device_type).into(),
         );
         metadata.insert("link_classification_is_inference".into(), "true".into());
         progress(done("Host-device transfer benchmark completed."));
@@ -665,7 +716,7 @@ impl GpuBandwidthProvider {
                 metric("device_to_host".into(), device_to_host),
             ],
             workload_metadata: metadata,
-            device_metadata: device_metadata(record),
+            device_metadata: bandwidth_device_metadata(record),
         })
     }
 }
@@ -698,16 +749,12 @@ impl BenchmarkProvider for GpuBandwidthProvider {
             .iter()
             .position(|record| record.id == selected_id)
             .expect("selected adapter must still exist");
-        if (matches!(benchmark_id, CACHE_ID | VRAM_ID)
-            || compute::kind(benchmark_id).is_some()
-            || cooperative_matrix::is_matrix_benchmark(benchmark_id))
-            && !self.adapters[adapter_index]
-                .features
-                .contains(wgpu::Features::TIMESTAMP_QUERY)
+        if benchmark_id != HOST_LINK_ID
+            && !self.adapters[adapter_index].supports_vulkan_timestamps()
         {
             return Err(BenchmarkError::new(
                 "timestamp_query_unsupported",
-                "This GPU does not expose timestamp queries required for GPU-local timing.",
+                "This GPU does not expose Vulkan timestamps required for GPU-local timing.",
             ));
         }
         match benchmark_id {
@@ -734,810 +781,6 @@ impl BenchmarkProvider for GpuBandwidthProvider {
             )),
         }
     }
-}
-
-struct GpuContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
-
-impl GpuContext {
-    fn request(record: &AdapterRecord, timestamps: bool) -> Result<Self, BenchmarkError> {
-        Self::request_with_features(record, timestamps, wgpu::Features::empty())
-    }
-
-    fn request_with_features(
-        record: &AdapterRecord,
-        timestamps: bool,
-        extra_features: wgpu::Features,
-    ) -> Result<Self, BenchmarkError> {
-        if !record.features.contains(extra_features) {
-            return Err(BenchmarkError::new(
-                "shader_feature_unsupported",
-                "The selected GPU does not expose the shader feature required by this benchmark.",
-            ));
-        }
-        let required_features = if timestamps {
-            let mut features = wgpu::Features::TIMESTAMP_QUERY;
-            if record
-                .features
-                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-            {
-                features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-            }
-            features | extra_features
-        } else {
-            extra_features
-        };
-        let experimental_features =
-            if extra_features.intersects(wgpu::Features::all_experimental_mask()) {
-                // SAFETY: callers capability-gate experimental workloads before requesting a
-                // device. Cooperative-matrix shaders use initialized, bounds-checked buffers,
-                // an adapter-reported shape/type tuple, and are validation-error scoped before
-                // any command is submitted.
-                unsafe { wgpu::ExperimentalFeatures::enabled() }
-            } else {
-                wgpu::ExperimentalFeatures::disabled()
-            };
-        let descriptor = wgpu::DeviceDescriptor {
-            label: Some("Gluj-Bench GPU bandwidth device"),
-            required_features,
-            required_limits: record.limits.clone(),
-            experimental_features,
-            ..Default::default()
-        };
-        let (device, queue) = pollster::block_on(record.adapter.request_device(&descriptor))
-            .map_err(|problem| BenchmarkError::new("device_lost", problem.to_string()))?;
-        Ok(Self { device, queue })
-    }
-}
-
-fn measure_gpu_operation(
-    context: &GpuContext,
-    size: u64,
-    operation: KernelOperation,
-    sample_count: u32,
-    target_per_sample: Duration,
-    cancellation: &CancellationToken,
-) -> Result<Vec<f64>, BenchmarkError> {
-    if matches!(operation, KernelOperation::Copy)
-        && context
-            .device
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-    {
-        return measure_native_gpu_copy(
-            context,
-            size,
-            sample_count,
-            target_per_sample,
-            cancellation,
-        );
-    }
-    measure_gpu_operation_with_dispatch(
-        context,
-        DispatchMeasurement {
-            size,
-            dispatch_bytes: size,
-            operation,
-            flavor: KernelFlavor::Stream,
-            precondition: true,
-            sample_count,
-            target_per_sample,
-        },
-        cancellation,
-    )
-}
-
-fn measure_gpu_operation_with_dispatch(
-    context: &GpuContext,
-    measurement: DispatchMeasurement,
-    cancellation: &CancellationToken,
-) -> Result<Vec<f64>, BenchmarkError> {
-    let DispatchMeasurement {
-        size,
-        dispatch_bytes,
-        operation,
-        flavor,
-        precondition,
-        sample_count,
-        target_per_sample,
-    } = measurement;
-    let harness = KernelHarness::new(context, size, dispatch_bytes, operation, flavor)?;
-    let calibration_iterations = 64;
-    let calibration_elapsed = harness.measure(context, calibration_iterations)?;
-    let mut per_dispatch_ns = calibration_elapsed / calibration_iterations as f64;
-    if per_dispatch_ns <= 0.0 || !per_dispatch_ns.is_finite() {
-        return Err(BenchmarkError::new(
-            "device_lost",
-            "GPU timestamp calibration remained invalid after a 64-dispatch batch.",
-        ));
-    }
-    if precondition {
-        let warm_iterations = (GPU_PRECONDITION_MS * 1e6 / per_dispatch_ns)
-            .ceil()
-            .clamp(1.0, 4096.0) as u32;
-        let warm_elapsed = harness.measure(context, warm_iterations)?;
-        per_dispatch_ns = warm_elapsed / warm_iterations as f64;
-    }
-    let target_ns = target_per_sample.as_secs_f64() * 1e9;
-    let iterations = (target_ns / per_dispatch_ns).ceil().clamp(1.0, 4096.0) as u32;
-    let mut values = Vec::with_capacity(sample_count as usize);
-    for _ in 0..sample_count {
-        ensure_not_cancelled(cancellation)?;
-        let elapsed_ns = harness.measure(context, iterations)?;
-        let bytes = harness.traffic_bytes as f64
-            * operation.reported_byte_multiplier() as f64
-            * iterations as f64;
-        let bandwidth = bytes / (elapsed_ns / 1e9);
-        if !bandwidth.is_finite() || bandwidth <= 0.0 {
-            return Err(BenchmarkError::new(
-                "device_lost",
-                "GPU bandwidth sample was not finite and positive.",
-            ));
-        }
-        values.push(bandwidth);
-    }
-    Ok(values)
-}
-
-struct KernelHarness {
-    size: u64,
-    traffic_bytes: u64,
-    workgroups_x: u32,
-    workgroups_y: u32,
-    pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
-    query_set: wgpu::QuerySet,
-    query_resolve: wgpu::Buffer,
-    query_readback: wgpu::Buffer,
-}
-
-impl KernelHarness {
-    fn new(
-        context: &GpuContext,
-        size: u64,
-        dispatch_bytes: u64,
-        operation: KernelOperation,
-        flavor: KernelFlavor,
-    ) -> Result<Self, BenchmarkError> {
-        if size < 16 || !size.is_multiple_of(16) {
-            return Err(BenchmarkError::new(
-                "invalid_working_set",
-                "GPU working sets must be 16-byte aligned.",
-            ));
-        }
-        let source = create_buffer_checked(
-            context,
-            &wgpu::BufferDescriptor {
-                label: Some("Gluj-Bench source"),
-                size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        )?;
-        let destination = create_buffer_checked(
-            context,
-            &wgpu::BufferDescriptor {
-                label: Some("Gluj-Bench destination"),
-                size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        )?;
-        if dispatch_bytes < size || !dispatch_bytes.is_multiple_of(16) {
-            return Err(BenchmarkError::new(
-                "invalid_working_set",
-                "GPU dispatch traffic must cover the complete aligned working set.",
-            ));
-        }
-        let element_count = size / 16;
-        let access_count = dispatch_bytes / 16;
-        let accesses_per_invocation = operation.accesses_per_invocation(flavor);
-        if !access_count.is_multiple_of(accesses_per_invocation) {
-            return Err(BenchmarkError::new(
-                "invalid_working_set",
-                "GPU traffic must divide evenly across the selected vector kernel.",
-            ));
-        }
-        let total_invocations = access_count / accesses_per_invocation;
-        let total_workgroups = total_invocations.div_ceil(WORKGROUP_SIZE);
-        let workgroups_x = total_workgroups.min(65_535) as u32;
-        let workgroups_y = total_workgroups.div_ceil(workgroups_x as u64) as u32;
-        let params = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Gluj-Bench bandwidth parameters"),
-                contents: &parameters(
-                    element_count as u32,
-                    0x9e37_79b9,
-                    workgroups_x * WORKGROUP_SIZE as u32,
-                    access_count as u32,
-                ),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let checksum_size = (total_invocations * 4).max(4);
-        let checksums = create_buffer_checked(
-            context,
-            &wgpu::BufferDescriptor {
-                label: Some("Gluj-Bench read checksums"),
-                size: checksum_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            },
-        )?;
-        let module = context
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Gluj-Bench bandwidth shader"),
-                source: wgpu::ShaderSource::Wgsl(shader::BANDWIDTH_SHADER.into()),
-            });
-        let bind_group_layout =
-            context
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Gluj-Bench bandwidth bind group layout"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-        let pipeline_layout =
-            context
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Gluj-Bench bandwidth pipeline layout"),
-                    bind_group_layouts: &[Some(&bind_group_layout)],
-                    immediate_size: 0,
-                });
-        let pipeline = context
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Gluj-Bench bandwidth pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(operation.entry_point(flavor)),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Gluj-Bench bandwidth bind group"),
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: source.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: destination.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: params.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: checksums.as_entire_binding(),
-                    },
-                ],
-            });
-        let query_set = context.device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("Gluj-Bench timestamps"),
-            ty: wgpu::QueryType::Timestamp,
-            count: 2,
-        });
-        let query_resolve = context.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Gluj-Bench timestamp resolve"),
-            size: 16,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let query_readback = context.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Gluj-Bench timestamp readback"),
-            size: 16,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let harness = Self {
-            size,
-            traffic_bytes: dispatch_bytes,
-            workgroups_x,
-            workgroups_y,
-            pipeline,
-            bind_group,
-            query_set,
-            query_resolve,
-            query_readback,
-        };
-        harness.warm(context)?;
-        Ok(harness)
-    }
-
-    fn warm(&self, context: &GpuContext) -> Result<(), BenchmarkError> {
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Gluj-Bench warmup"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(self.workgroups_x, self.workgroups_y, 1);
-        }
-        context.queue.submit([encoder.finish()]);
-        wait_for_gpu(&context.device)
-    }
-
-    fn measure(&self, context: &GpuContext, iterations: u32) -> Result<f64, BenchmarkError> {
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Gluj-Bench timestamped bandwidth"),
-            });
-        {
-            let timestamp_writes = wgpu::ComputePassTimestampWrites {
-                query_set: &self.query_set,
-                beginning_of_pass_write_index: Some(0),
-                end_of_pass_write_index: Some(1),
-            };
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Gluj-Bench bandwidth pass"),
-                timestamp_writes: Some(timestamp_writes),
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            for _ in 0..iterations {
-                pass.dispatch_workgroups(self.workgroups_x, self.workgroups_y, 1);
-            }
-        }
-        context.queue.submit([encoder.finish()]);
-        wait_for_gpu(&context.device)?;
-        let mut resolve = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Gluj-Bench timestamp resolve"),
-            });
-        resolve.resolve_query_set(&self.query_set, 0..2, &self.query_resolve, 0);
-        resolve.copy_buffer_to_buffer(&self.query_resolve, 0, &self.query_readback, 0, 16);
-        context.queue.submit([resolve.finish()]);
-        let bytes = map_read(&context.device, &self.query_readback, 16)?;
-        let start = u64::from_le_bytes(bytes[0..8].try_into().expect("timestamp width"));
-        let end = u64::from_le_bytes(bytes[8..16].try_into().expect("timestamp width"));
-        drop(bytes);
-        self.query_readback.unmap();
-        let ticks = end.wrapping_sub(start);
-        let period = context.queue.get_timestamp_period() as f64;
-        let elapsed = ticks as f64 * period;
-        if elapsed <= 0.0 || !elapsed.is_finite() {
-            return Err(BenchmarkError::new(
-                "device_lost",
-                format!(
-                    "GPU timestamp query returned an invalid interval (start={start}, end={end}, period_ns={period})."
-                ),
-            ));
-        }
-        let _ = self.size;
-        Ok(elapsed)
-    }
-}
-
-fn measure_native_gpu_copy(
-    context: &GpuContext,
-    size: u64,
-    sample_count: u32,
-    target_per_sample: Duration,
-    cancellation: &CancellationToken,
-) -> Result<Vec<f64>, BenchmarkError> {
-    let harness = NativeCopyHarness::new(context, size)?;
-    let calibration_iterations = 16;
-    let calibration_elapsed = harness.measure(context, calibration_iterations)?;
-    let mut per_copy_ns = calibration_elapsed / calibration_iterations as f64;
-    let warm_iterations = (GPU_PRECONDITION_MS * 1e6 / per_copy_ns)
-        .ceil()
-        .clamp(1.0, 4096.0) as u32;
-    let warm_elapsed = harness.measure(context, warm_iterations)?;
-    per_copy_ns = warm_elapsed / warm_iterations as f64;
-    let target_ns = target_per_sample.as_secs_f64() * 1e9;
-    let iterations = (target_ns / per_copy_ns).ceil().clamp(1.0, 4096.0) as u32;
-    let mut values = Vec::with_capacity(sample_count as usize);
-    for _ in 0..sample_count {
-        ensure_not_cancelled(cancellation)?;
-        let elapsed_ns = harness.measure(context, iterations)?;
-        let traffic_bytes = size as f64 * 2.0 * iterations as f64;
-        values.push(traffic_bytes / (elapsed_ns / 1e9));
-    }
-    Ok(values)
-}
-
-struct NativeCopyHarness {
-    size: u64,
-    source: wgpu::Buffer,
-    destination: wgpu::Buffer,
-    query_set: wgpu::QuerySet,
-    query_resolve: wgpu::Buffer,
-    query_readback: wgpu::Buffer,
-}
-
-impl NativeCopyHarness {
-    fn new(context: &GpuContext, size: u64) -> Result<Self, BenchmarkError> {
-        let source = create_buffer_checked(
-            context,
-            &wgpu::BufferDescriptor {
-                label: Some("Gluj-Bench native-copy source"),
-                size,
-                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        )?;
-        let destination = create_buffer_checked(
-            context,
-            &wgpu::BufferDescriptor {
-                label: Some("Gluj-Bench native-copy destination"),
-                size,
-                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
-        )?;
-        let query_set = context.device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("Gluj-Bench native-copy timestamps"),
-            ty: wgpu::QueryType::Timestamp,
-            count: 2,
-        });
-        let query_resolve = context.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Gluj-Bench native-copy timestamp resolve"),
-            size: 16,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let query_readback = context.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Gluj-Bench native-copy timestamp readback"),
-            size: 16,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let harness = Self {
-            size,
-            source,
-            destination,
-            query_set,
-            query_resolve,
-            query_readback,
-        };
-        harness.submit_copies(context, 1, false)?;
-        Ok(harness)
-    }
-
-    fn submit_copies(
-        &self,
-        context: &GpuContext,
-        iterations: u32,
-        timestamped: bool,
-    ) -> Result<(), BenchmarkError> {
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Gluj-Bench native GPU copy"),
-            });
-        if timestamped {
-            encoder.write_timestamp(&self.query_set, 0);
-        }
-        for _ in 0..iterations {
-            encoder.copy_buffer_to_buffer(&self.source, 0, &self.destination, 0, self.size);
-        }
-        if timestamped {
-            encoder.write_timestamp(&self.query_set, 1);
-        }
-        context.queue.submit([encoder.finish()]);
-        wait_for_gpu(&context.device)
-    }
-
-    fn measure(&self, context: &GpuContext, iterations: u32) -> Result<f64, BenchmarkError> {
-        self.submit_copies(context, iterations, true)?;
-        let mut resolve = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Gluj-Bench native-copy timestamp resolve"),
-            });
-        resolve.resolve_query_set(&self.query_set, 0..2, &self.query_resolve, 0);
-        resolve.copy_buffer_to_buffer(&self.query_resolve, 0, &self.query_readback, 0, 16);
-        context.queue.submit([resolve.finish()]);
-        let bytes = map_read(&context.device, &self.query_readback, 16)?;
-        let start = u64::from_le_bytes(bytes[0..8].try_into().expect("timestamp width"));
-        let end = u64::from_le_bytes(bytes[8..16].try_into().expect("timestamp width"));
-        drop(bytes);
-        self.query_readback.unmap();
-        let elapsed = end.wrapping_sub(start) as f64 * context.queue.get_timestamp_period() as f64;
-        if elapsed <= 0.0 || !elapsed.is_finite() {
-            return Err(BenchmarkError::new(
-                "device_lost",
-                "Native GPU copy timestamp interval was invalid.",
-            ));
-        }
-        Ok(elapsed)
-    }
-}
-
-fn measure_host_to_device(
-    context: &GpuContext,
-    size: u64,
-    samples: u32,
-    target: Duration,
-    cancellation: &CancellationToken,
-) -> Result<Vec<f64>, BenchmarkError> {
-    let staging = (0..HOST_STAGING_BUFFER_COUNT)
-        .map(|index| {
-            create_initialized_host_buffer(
-                context,
-                &format!("Gluj-Bench upload staging {index}"),
-                size,
-                wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                0xa5,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let destination = create_buffer_checked(
-        context,
-        &wgpu::BufferDescriptor {
-            label: Some("Gluj-Bench host-to-device destination"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        },
-    )?;
-    let trial_started = Instant::now();
-    copy_from_upload_ring(context, &staging, &destination, size, 1)?;
-    let trial = trial_started.elapsed().as_secs_f64().max(1e-6);
-    let iterations = (target.as_secs_f64() / trial).ceil().clamp(1.0, 4096.0) as u32;
-    let mut values = Vec::with_capacity(samples as usize);
-    for _ in 0..samples {
-        ensure_not_cancelled(cancellation)?;
-        let started = Instant::now();
-        copy_from_upload_ring(context, &staging, &destination, size, iterations)?;
-        let elapsed = started.elapsed().as_secs_f64();
-        values.push(size as f64 * iterations as f64 / elapsed);
-    }
-    Ok(values)
-}
-
-fn measure_device_to_host(
-    context: &GpuContext,
-    size: u64,
-    samples: u32,
-    target: Duration,
-    cancellation: &CancellationToken,
-) -> Result<Vec<f64>, BenchmarkError> {
-    let source = create_buffer_checked(
-        context,
-        &wgpu::BufferDescriptor {
-            label: Some("Gluj-Bench device-to-host source"),
-            size,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        },
-    )?;
-    let readbacks = (0..HOST_STAGING_BUFFER_COUNT)
-        .map(|index| {
-            create_initialized_host_buffer(
-                context,
-                &format!("Gluj-Bench download staging {index}"),
-                size,
-                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                0,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let trial_started = Instant::now();
-    copy_to_readback_ring(context, &source, &readbacks, size, 1)?;
-    let trial = trial_started.elapsed().as_secs_f64().max(1e-6);
-    let target_seconds = target.as_secs_f64();
-    let iterations = (target_seconds / trial).ceil().clamp(1.0, 4096.0) as u32;
-    let mut values = Vec::new();
-    for _ in 0..samples {
-        ensure_not_cancelled(cancellation)?;
-        let started = Instant::now();
-        copy_to_readback_ring(context, &source, &readbacks, size, iterations)?;
-        let elapsed = started.elapsed().as_secs_f64();
-        values.push(size as f64 * iterations as f64 / elapsed);
-    }
-    Ok(values)
-}
-
-fn copy_from_upload_ring(
-    context: &GpuContext,
-    staging: &[wgpu::Buffer],
-    destination: &wgpu::Buffer,
-    size: u64,
-    iterations: u32,
-) -> Result<(), BenchmarkError> {
-    let mut encoder = context
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Gluj-Bench batched host-to-device copies"),
-        });
-    for iteration in 0..iterations as usize {
-        encoder.copy_buffer_to_buffer(&staging[iteration % staging.len()], 0, destination, 0, size);
-    }
-    context.queue.submit([encoder.finish()]);
-    wait_for_gpu(&context.device)
-}
-
-fn copy_to_readback_ring(
-    context: &GpuContext,
-    source: &wgpu::Buffer,
-    readbacks: &[wgpu::Buffer],
-    size: u64,
-    iterations: u32,
-) -> Result<(), BenchmarkError> {
-    let mut encoder = context
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Gluj-Bench device-to-host copies"),
-        });
-    for iteration in 0..iterations {
-        let destination = &readbacks[iteration as usize % readbacks.len()];
-        encoder.copy_buffer_to_buffer(source, 0, destination, 0, size);
-    }
-    context.queue.submit([encoder.finish()]);
-    map_readback_ring(&context.device, readbacks, size, iterations)
-}
-
-fn create_initialized_host_buffer(
-    context: &GpuContext,
-    label: &str,
-    size: u64,
-    usage: wgpu::BufferUsages,
-    pattern: u8,
-) -> Result<wgpu::Buffer, BenchmarkError> {
-    let buffer = create_buffer_checked(
-        context,
-        &wgpu::BufferDescriptor {
-            label: Some(label),
-            size,
-            usage,
-            mapped_at_creation: true,
-        },
-    )?;
-    {
-        let mut mapped = buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .map_err(|problem| BenchmarkError::new("mapping_failed", problem.to_string()))?;
-        let chunk = [pattern; 4096];
-        for offset in (0..mapped.len()).step_by(chunk.len()) {
-            let end = (offset + chunk.len()).min(mapped.len());
-            mapped
-                .slice(offset..end)
-                .copy_from_slice(&chunk[..end - offset]);
-        }
-    }
-    buffer.unmap();
-    Ok(buffer)
-}
-
-fn map_readback_ring(
-    device: &wgpu::Device,
-    readbacks: &[wgpu::Buffer],
-    size: u64,
-    iterations: u32,
-) -> Result<(), BenchmarkError> {
-    let used = (iterations as usize).min(readbacks.len());
-    let mut receivers = Vec::with_capacity(used);
-    for buffer in &readbacks[..used] {
-        let (sender, receiver) = mpsc::channel();
-        buffer
-            .slice(0..size)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-        receivers.push(receiver);
-    }
-    wait_for_gpu(device)?;
-    for (buffer, receiver) in readbacks[..used].iter().zip(receivers) {
-        receiver
-            .recv()
-            .map_err(|_| {
-                BenchmarkError::new("mapping_failed", "GPU mapping callback was dropped.")
-            })?
-            .map_err(|problem| BenchmarkError::new("mapping_failed", problem.to_string()))?;
-        {
-            let mapped = buffer
-                .slice(0..size)
-                .get_mapped_range()
-                .map_err(|problem| BenchmarkError::new("mapping_failed", problem.to_string()))?;
-            std::hint::black_box(mapped.first().copied());
-        }
-        buffer.unmap();
-    }
-    Ok(())
-}
-
-fn create_buffer_checked(
-    context: &GpuContext,
-    descriptor: &wgpu::BufferDescriptor<'_>,
-) -> Result<wgpu::Buffer, BenchmarkError> {
-    let error_scope = context
-        .device
-        .push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let buffer = context.device.create_buffer(descriptor);
-    if let Some(problem) = pollster::block_on(error_scope.pop()) {
-        return Err(BenchmarkError::new(
-            "insufficient_gpu_memory",
-            format!("GPU buffer allocation failed: {problem}"),
-        ));
-    }
-    Ok(buffer)
-}
-
-fn map_read(
-    device: &wgpu::Device,
-    buffer: &wgpu::Buffer,
-    size: u64,
-) -> Result<wgpu::BufferView, BenchmarkError> {
-    let (sender, receiver) = mpsc::channel();
-    buffer.map_async(wgpu::MapMode::Read, 0..size, move |result| {
-        let _ = sender.send(result);
-    });
-    wait_for_gpu(device)?;
-    receiver
-        .recv()
-        .map_err(|_| BenchmarkError::new("mapping_failed", "GPU mapping callback was dropped."))?
-        .map_err(|problem| BenchmarkError::new("mapping_failed", problem.to_string()))?;
-    buffer
-        .get_mapped_range(0..size)
-        .map_err(|problem| BenchmarkError::new("mapping_failed", problem.to_string()))
-}
-
-fn wait_for_gpu(device: &wgpu::Device) -> Result<(), BenchmarkError> {
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map(|_| ())
-        .map_err(|problem| BenchmarkError::new("device_lost", problem.to_string()))
 }
 
 fn descriptor(
@@ -1571,11 +814,7 @@ fn descriptor(
 }
 
 fn local_buffer_limit(record: &AdapterRecord) -> u64 {
-    record
-        .limits
-        .max_buffer_size
-        .min(record.limits.max_storage_buffer_binding_size)
-        .min(CACHE_SWEEP_MAX)
+    record.vulkan.max_storage_buffer_range.min(CACHE_SWEEP_MAX)
 }
 
 fn host_transfer_size(adapter_limit: u64, available_memory: u64, integrated: bool) -> Option<u64> {
@@ -1585,15 +824,6 @@ fn host_transfer_size(adapter_limit: u64, available_memory: u64, integrated: boo
     }
     let size = limit / 256 * 256;
     (size >= 4 * MIB).then_some(size)
-}
-
-fn parameters(element_count: u32, seed: u32, row_width: u32, access_count: u32) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[0..4].copy_from_slice(&element_count.to_le_bytes());
-    bytes[4..8].copy_from_slice(&seed.to_le_bytes());
-    bytes[8..12].copy_from_slice(&row_width.to_le_bytes());
-    bytes[12..16].copy_from_slice(&access_count.to_le_bytes());
-    bytes
 }
 
 fn per_sample_duration(config: &BenchmarkConfig) -> Duration {
@@ -1614,37 +844,42 @@ fn tier_label(index: usize) -> &'static str {
     if index == 0 { "l2" } else { "l3" }
 }
 
-fn link_classification(device_type: wgpu::DeviceType) -> &'static str {
+fn link_classification(device_type: vk::PhysicalDeviceType) -> &'static str {
     match device_type {
-        wgpu::DeviceType::DiscreteGpu => "probable_pcie",
-        wgpu::DeviceType::IntegratedGpu => "shared_memory_or_uma",
+        vk::PhysicalDeviceType::DISCRETE_GPU => "probable_pcie",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "shared_memory_or_uma",
         _ => "host_device_path_unknown",
     }
 }
 
-fn adapter_score(adapter: &wgpu::Adapter) -> u8 {
-    let timestamp = u8::from(adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)) * 10;
-    let backend = match adapter.get_info().backend {
-        wgpu::Backend::Vulkan => 5,
-        wgpu::Backend::Dx12 => 4,
-        wgpu::Backend::Metal => 3,
-        wgpu::Backend::Gl => 2,
-        _ => 1,
-    };
-    timestamp + backend
-}
-
 fn common_metadata(record: &AdapterRecord, timing_domain: &str) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
-    metadata.insert("adapter_name".into(), record.info.name.clone());
-    metadata.insert("backend".into(), format!("{:?}", record.info.backend));
+    metadata.insert("adapter_name".into(), record.vulkan.name.clone());
+    metadata.insert("backend".into(), "Vulkan".into());
+    metadata.insert("execution_backend".into(), "raw-vulkan".into());
+    metadata.insert(
+        "vulkan_device_uuid".into(),
+        record.vulkan.device_uuid.clone(),
+    );
     metadata.insert(
         "device_type".into(),
-        format!("{:?}", record.info.device_type),
+        record.vulkan.device_type_label().into(),
     );
     metadata.insert("timing_domain".into(), timing_domain.into());
     metadata.insert("shader_access_width_bytes".into(), "16".into());
     metadata.insert("workgroup_size".into(), WORKGROUP_SIZE.to_string());
+    metadata
+}
+
+fn bandwidth_metadata(record: &AdapterRecord, timing_domain: &str) -> BTreeMap<String, String> {
+    let mut metadata = common_metadata(record, timing_domain);
+    metadata.insert("execution_backend".into(), "raw-vulkan".into());
+    metadata.insert("shader_format".into(), "embedded_spirv".into());
+    metadata.insert("shader_source_language".into(), "GLSL".into());
+    metadata.insert(
+        "bandwidth_kernel_revision".into(),
+        "vulkan-storage-vector-1".into(),
+    );
     metadata
 }
 
@@ -1663,12 +898,23 @@ fn insert_clock_policy(metadata: &mut BTreeMap<String, String>) {
 fn device_metadata(record: &AdapterRecord) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("device_id".into(), record.id.clone());
-    metadata.insert("name".into(), record.info.name.clone());
-    metadata.insert("backend".into(), format!("{:?}", record.info.backend));
+    metadata.insert("name".into(), record.vulkan.name.clone());
+    metadata.insert("backend".into(), "Vulkan".into());
+    metadata.insert("execution_backend".into(), "raw-vulkan".into());
+    metadata.insert(
+        "vulkan_device_uuid".into(),
+        record.vulkan.device_uuid.clone(),
+    );
     metadata.insert(
         "device_type".into(),
-        format!("{:?}", record.info.device_type),
+        record.vulkan.device_type_label().into(),
     );
+    metadata
+}
+
+fn bandwidth_device_metadata(record: &AdapterRecord) -> BTreeMap<String, String> {
+    let mut metadata = device_metadata(record);
+    metadata.insert("execution_backend".into(), "raw-vulkan".into());
     metadata
 }
 
@@ -1712,43 +958,35 @@ mod tests {
                 CACHE_ID,
                 VRAM_ID,
                 HOST_LINK_ID,
-                "gpu.performance.fp32",
                 "gpu.performance.fp16",
+                "gpu.performance.fp32",
                 "gpu.performance.fp64",
-                "gpu.performance.int32",
-                "gpu.performance.int8_packed",
                 cooperative_matrix::FP16_MATRIX_ID,
                 cooperative_matrix::INT8_MATRIX_ID,
+                cooperative_matrix::FP8_MATRIX_ID,
+                cooperative_matrix::SPARSE_FP16_MATRIX_ID,
+                cooperative_matrix::SPARSE_INT8_MATRIX_ID,
+                cooperative_matrix::SPARSE_FP8_MATRIX_ID,
             ]
         );
         assert!(
             provider
                 .devices
                 .iter()
-                .all(|device| device.id.starts_with("gpu:wgpu:"))
+                .all(|device| device.id.starts_with("gpu:vulkan:"))
         );
     }
 
     #[test]
     fn link_labels_do_not_claim_pcie_for_integrated_devices() {
         assert_eq!(
-            link_classification(wgpu::DeviceType::DiscreteGpu),
+            link_classification(vk::PhysicalDeviceType::DISCRETE_GPU),
             "probable_pcie"
         );
         assert_eq!(
-            link_classification(wgpu::DeviceType::IntegratedGpu),
+            link_classification(vk::PhysicalDeviceType::INTEGRATED_GPU),
             "shared_memory_or_uma"
         );
-    }
-
-    #[test]
-    fn parameter_buffer_matches_wgsl_uniform_layout() {
-        let bytes = parameters(123, 456, 65_280, 4096);
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 123);
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 456);
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 65_280);
-        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 4096);
-        assert_eq!(bytes.len(), 16);
     }
 
     #[test]

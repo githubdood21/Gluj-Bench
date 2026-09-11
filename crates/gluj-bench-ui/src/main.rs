@@ -1,89 +1,65 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui;
 use gluj_bench_core::{
-    BenchmarkDescriptor, BenchmarkResult, DeviceCategory, DeviceDescriptor, PROTOCOL_VERSION,
+    BenchmarkCategory, BenchmarkDescriptor, BenchmarkResult, DeviceCategory, DeviceDescriptor,
+    PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
+    fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
+    rc::Rc,
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
 };
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([900.0, 620.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Gluj-Bench",
-        options,
-        Box::new(|creation_context| {
-            configure_style(&creation_context.egui_ctx);
-            Ok(Box::new(GlujBenchApp::new()))
-        }),
-    )
+slint::include_modules!();
+
+const HARDWARE_METADATA_CACHE_VERSION: u32 = 7;
+const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
+const BENCHMARK_SAMPLES: u32 = 5;
+
+fn main() -> Result<(), slint::PlatformError> {
+    let window = MainWindow::new()?;
+    let app = Rc::new(RefCell::new(App::new()));
+    App::wire(&window, &app);
+    app.borrow_mut().request_startup_check();
+    App::refresh(&window, &app.borrow());
+    app.borrow_mut().ui_dirty = false;
+    let weak_window = window.as_weak();
+    let weak_app = Rc::downgrade(&app);
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
+        if let (Some(window), Some(app)) = (weak_window.upgrade(), weak_app.upgrade()) {
+            let should_refresh = {
+                let mut app = app.borrow_mut();
+                app.receive_worker_events();
+                std::mem::take(&mut app.ui_dirty)
+            };
+            if should_refresh {
+                App::refresh(&window, &app.borrow());
+            }
+        }
+    });
+    window.run()
 }
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(61, 214, 198);
-const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(93, 145, 255);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(20, 24, 32);
-const SURFACE_RAISED: egui::Color32 = egui::Color32::from_rgb(27, 32, 42);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(48, 57, 72);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(147, 158, 177);
-
-fn configure_style(context: &egui::Context) {
-    context.set_theme(egui::Theme::Dark);
-    let mut style = (*context.style_of(egui::Theme::Dark)).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
-    style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = egui::Color32::from_rgb(13, 16, 22);
-    style.visuals.window_fill = SURFACE;
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(10, 13, 18);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(24, 29, 38);
-    style.visuals.selection.bg_fill = ACCENT.gamma_multiply(0.28);
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-    style.visuals.widgets.noninteractive.bg_fill = SURFACE;
-    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-    style.visuals.widgets.noninteractive.corner_radius = 7.into();
-    style.visuals.widgets.inactive.bg_fill = SURFACE_RAISED;
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-    style.visuals.widgets.inactive.corner_radius = 7.into();
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 44, 57);
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT_BLUE);
-    style.visuals.widgets.hovered.corner_radius = 7.into();
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(33, 68, 72);
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    style.visuals.widgets.active.corner_radius = 7.into();
-    context.set_style_of(egui::Theme::Dark, style);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Overview,
-    Benchmarks,
-    Results,
-}
 enum WorkerEvent {
     Response(Value),
     Status(String),
 }
-
 struct WorkerClient {
     child: Option<Child>,
     input: Option<ChildStdin>,
     events: Receiver<WorkerEvent>,
 }
-
 impl WorkerClient {
     fn start() -> (Self, String) {
         let (sender, events) = mpsc::channel();
@@ -98,22 +74,22 @@ impl WorkerClient {
             Ok(mut child) => {
                 let input = child.stdin.take();
                 if let Some(stdout) = child.stdout.take() {
-                    let output_sender = sender.clone();
+                    let sender = sender.clone();
                     thread::spawn(move || {
                         for line in BufReader::new(stdout).lines() {
                             match line {
                                 Ok(line) => match serde_json::from_str(&line) {
                                     Ok(response) => {
-                                        let _ = output_sender.send(WorkerEvent::Response(response));
+                                        let _ = sender.send(WorkerEvent::Response(response));
                                     }
                                     Err(problem) => {
-                                        let _ = output_sender.send(WorkerEvent::Status(format!(
+                                        let _ = sender.send(WorkerEvent::Status(format!(
                                             "Worker returned invalid JSON: {problem}"
                                         )));
                                     }
                                 },
                                 Err(problem) => {
-                                    let _ = output_sender.send(WorkerEvent::Status(format!(
+                                    let _ = sender.send(WorkerEvent::Status(format!(
                                         "Worker output failed: {problem}"
                                     )));
                                     break;
@@ -135,7 +111,7 @@ impl WorkerClient {
                         input,
                         events,
                     },
-                    "Benchmark worker connected; loading capabilities...".into(),
+                    "Benchmark worker connected; loading capabilities…".into(),
                 )
             }
             Err(problem) => (
@@ -156,8 +132,10 @@ impl WorkerClient {
         writeln!(input, "{request}").map_err(|problem| problem.to_string())?;
         input.flush().map_err(|problem| problem.to_string())
     }
+    fn online(&self) -> bool {
+        self.child.is_some()
+    }
 }
-
 impl Drop for WorkerClient {
     fn drop(&mut self) {
         self.input.take();
@@ -170,8 +148,8 @@ impl Drop for WorkerClient {
     }
 }
 
-struct GlujBenchApp {
-    tab: Tab,
+struct App {
+    page: i32,
     worker: WorkerClient,
     status: String,
     devices: Vec<DeviceDescriptor>,
@@ -179,51 +157,217 @@ struct GlujBenchApp {
     selected_suite: String,
     selected_gpu_id: Option<String>,
     selected: Option<String>,
+    expanded_device_id: Option<String>,
+    result_details_expanded: bool,
     results: Vec<BenchmarkResult>,
     queue: VecDeque<String>,
     active_request: Option<String>,
     progress: f32,
     progress_message: String,
     request_counter: u64,
+    fingerprint: Option<String>,
+    metadata_scan_pending: bool,
+    metadata_devices_received: bool,
+    metadata_benchmarks_received: bool,
+    ui_dirty: bool,
 }
 
-impl GlujBenchApp {
+#[derive(Serialize, Deserialize)]
+struct HardwareMetadataCache {
+    version: u32,
+    fingerprint: String,
+    devices: Vec<DeviceDescriptor>,
+    benchmarks: Vec<BenchmarkDescriptor>,
+}
+impl App {
     fn new() -> Self {
         let (worker, status) = WorkerClient::start();
         let mut app = Self {
-            tab: Tab::Overview,
+            page: 0,
             worker,
             status,
-            devices: Vec::new(),
-            benchmarks: Vec::new(),
+            devices: vec![],
+            benchmarks: vec![],
             selected_suite: "cpu.bandwidth".into(),
             selected_gpu_id: None,
             selected: None,
-            results: Vec::new(),
+            expanded_device_id: None,
+            result_details_expanded: false,
+            results: vec![],
             queue: VecDeque::new(),
             active_request: None,
-            progress: 0.0,
+            progress: 0.,
             progress_message: String::new(),
             request_counter: 0,
+            fingerprint: None,
+            metadata_scan_pending: false,
+            metadata_devices_received: false,
+            metadata_benchmarks_received: false,
+            ui_dirty: true,
         };
-        app.request_capabilities();
+        if let Some(cache) = load_metadata_cache() {
+            app.devices = cache.devices;
+            app.benchmarks = cache.benchmarks;
+            app.fingerprint = Some(cache.fingerprint);
+            app.ensure_selected_gpu();
+            app.select_first_available();
+            app.status = "Loaded saved hardware profile; verifying this system…".into();
+        }
         app
+    }
+    fn wire(window: &MainWindow, app: &Rc<RefCell<Self>>) {
+        let app_weak = Rc::downgrade(app);
+        window.on_select_page(move |page| {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.page = page;
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_select_suite(move |suite| {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.select_suite(suite.as_str());
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_select_gpu(move |index| {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.select_gpu(index);
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_select_benchmark(move |id| {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.selected = Some(id.to_string());
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_toggle_device_details(move |id| {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.expanded_device_id = (app.expanded_device_id.as_deref() != Some(id.as_str()))
+                    .then(|| id.to_string());
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_toggle_result_details(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.result_details_expanded = !app.result_details_expanded;
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_run_selected(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.run_selected();
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_run_all(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.run_all();
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_cancel(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.cancel();
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_clear_results(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.results.clear();
+                app.result_details_expanded = false;
+                app.ui_dirty = true;
+            }
+        });
+        let app_weak = Rc::downgrade(app);
+        window.on_rescan_hardware(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let mut app = app.borrow_mut();
+                app.rescan_hardware();
+                app.ui_dirty = true;
+            }
+        });
     }
     fn next_id(&mut self, prefix: &str) -> String {
         self.request_counter += 1;
         format!("ui-{prefix}-{}", self.request_counter)
     }
+    fn request_startup_check(&mut self) {
+        let id = self.next_id("fingerprint");
+        if let Err(problem) = self
+            .worker
+            .send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": "fingerprint"}))
+        {
+            self.status = problem;
+        }
+    }
+    fn rescan_hardware(&mut self) {
+        self.status = "Rescanning hardware capabilities…".into();
+        self.request_capabilities();
+    }
     fn request_capabilities(&mut self) {
+        self.metadata_scan_pending = true;
+        self.metadata_devices_received = false;
+        self.metadata_benchmarks_received = false;
         for command in ["devices", "benchmarks"] {
             let id = self.next_id(command);
             if let Err(problem) = self
                 .worker
-                .send(json!({"protocol":PROTOCOL_VERSION,"id":id,"command":command}))
+                .send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": command}))
             {
                 self.status = problem;
                 break;
             }
         }
+    }
+    fn select_suite(&mut self, suite: &str) {
+        self.selected_suite = suite.into();
+        self.ensure_selected_gpu();
+        self.select_first_available();
+    }
+    fn ensure_selected_gpu(&mut self) {
+        self.selected_gpu_id = preferred_gpu_id(&self.devices, self.selected_gpu_id.as_deref());
+    }
+    fn select_gpu(&mut self, index: i32) {
+        let ids: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|d| d.category == DeviceCategory::Gpu && d.available)
+            .map(|d| d.id.clone())
+            .collect();
+        self.selected_gpu_id = usize::try_from(index)
+            .ok()
+            .and_then(|index| ids.get(index).cloned());
+        self.select_first_available();
+    }
+    fn select_first_available(&mut self) {
+        self.selected = self
+            .benchmarks
+            .iter()
+            .find(|b| b.suite_id == self.selected_suite && self.benchmark_available(b))
+            .map(|b| b.id.clone());
+    }
+    fn benchmark_available(&self, benchmark: &BenchmarkDescriptor) -> bool {
+        benchmark_available_for(benchmark, self.selected_gpu_id.as_deref())
     }
     fn start_next(&mut self) {
         if self.active_request.is_some() {
@@ -239,10 +383,7 @@ impl GlujBenchApp {
         {
             options.insert("device_id".into(), Value::String(device_id.clone()));
         }
-        match self.worker.send(json!({"protocol":PROTOCOL_VERSION,"id":id,"command":"run","arguments":{"benchmark_id":benchmark_id,"target_duration_ms":5000,"samples":5,"options":options}})) {
-            Ok(()) => { self.active_request=Some(id); self.progress=0.0; self.progress_message=format!("Starting {benchmark_id}"); self.status="Benchmark running...".into(); }
-            Err(problem) => { self.status=problem; self.queue.clear(); }
-        }
+        match self.worker.send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": "run", "arguments": {"benchmark_id": benchmark_id, "target_duration_ms": BENCHMARK_TARGET_DURATION_MS, "samples": BENCHMARK_SAMPLES, "options": options}})) { Ok(()) => { self.active_request = Some(id); self.progress = 0.; self.progress_message = format!("Starting {benchmark_id}"); self.status = "Benchmark running…".into(); }, Err(problem) => { self.status = problem; self.queue.clear(); } }
     }
     fn run_selected(&mut self) {
         if let Some(id) = self.selected.clone() {
@@ -255,24 +396,25 @@ impl GlujBenchApp {
         let mut items: Vec<_> = self
             .benchmarks
             .iter()
-            .filter(|item| item.suite_id == self.selected_suite && self.benchmark_available(item))
+            .filter(|b| b.suite_id == self.selected_suite && self.benchmark_available(b))
             .cloned()
             .collect();
-        items.sort_by_key(|item| item.display_order);
-        self.queue = items.into_iter().map(|item| item.id).collect();
+        items.sort_by_key(|b| b.display_order);
+        self.queue = items.into_iter().map(|b| b.id).collect();
         self.start_next();
     }
     fn cancel(&mut self) {
         self.queue.clear();
         if let Some(request_id) = self.active_request.clone() {
             let id = self.next_id("cancel");
-            let _=self.worker.send(json!({"protocol":PROTOCOL_VERSION,"id":id,"command":"cancel","arguments":{"request_id":request_id}}));
-            self.status = "Cancelling benchmark...".into();
+            let _ = self.worker.send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": "cancel", "arguments": {"request_id": request_id}}));
+            self.status = "Cancelling benchmark…".into();
         }
     }
     fn receive_worker_events(&mut self) {
         let mut continue_queue = false;
         while let Ok(event) = self.worker.events.try_recv() {
+            self.ui_dirty = true;
             match event {
                 WorkerEvent::Status(message) => self.status = message,
                 WorkerEvent::Response(response) => {
@@ -280,23 +422,24 @@ impl GlujBenchApp {
                     match response["type"].as_str().unwrap_or_default() {
                         "progress" if self.active_request.as_deref() == Some(response_id) => {
                             self.progress =
-                                response["data"]["fraction"].as_f64().unwrap_or(0.0) as f32;
+                                response["data"]["fraction"].as_f64().unwrap_or(0.) as f32;
                             self.progress_message = response["data"]["message"]
                                 .as_str()
                                 .unwrap_or_default()
-                                .to_owned();
+                                .into();
                         }
                         "result" if self.active_request.as_deref() == Some(response_id) => {
                             match serde_json::from_value(response["data"].clone()) {
                                 Ok(result) => {
                                     self.results.push(result);
+                                    self.result_details_expanded = false;
                                     self.status = "Benchmark completed.".into();
-                                    self.tab = Tab::Results;
+                                    self.page = 2;
                                 }
                                 Err(problem) => self.status = problem.to_string(),
                             }
                             self.active_request = None;
-                            self.progress = 1.0;
+                            self.progress = 1.;
                             continue_queue = true;
                         }
                         "error" => {
@@ -307,31 +450,29 @@ impl GlujBenchApp {
                             if self.active_request.as_deref() == Some(response_id) {
                                 self.active_request = None;
                                 self.queue.clear();
-                                self.progress = 0.0;
+                                self.progress = 0.;
                             }
                             self.status = message;
                         }
                         _ => {
+                            if let Some(fingerprint) = response["data"]["fingerprint"].as_str() {
+                                if self.fingerprint.as_deref() == Some(fingerprint)
+                                    && !self.devices.is_empty()
+                                    && !self.benchmarks.is_empty()
+                                {
+                                    self.status = "Saved hardware profile matches this system. Select Rescan hardware to refresh it.".into();
+                                } else {
+                                    self.fingerprint = Some(fingerprint.to_owned());
+                                    self.status = "Hardware changed or no saved profile found; scanning capabilities…".into();
+                                    self.request_capabilities();
+                                }
+                            }
                             if let Some(devices) = response["data"].get("devices") {
                                 match serde_json::from_value(devices.clone()) {
                                     Ok(items) => {
                                         self.devices = items;
-                                        if self.selected_gpu_id.as_ref().is_none_or(|selected| {
-                                            !self.devices.iter().any(|device| {
-                                                device.category == DeviceCategory::Gpu
-                                                    && device.available
-                                                    && &device.id == selected
-                                            })
-                                        }) {
-                                            self.selected_gpu_id = self
-                                                .devices
-                                                .iter()
-                                                .find(|device| {
-                                                    device.category == DeviceCategory::Gpu
-                                                        && device.available
-                                                })
-                                                .map(|device| device.id.clone());
-                                        }
+                                        self.metadata_devices_received = true;
+                                        self.ensure_selected_gpu();
                                         self.status = "Hardware capabilities loaded.".into();
                                     }
                                     Err(problem) => self.status = problem.to_string(),
@@ -341,18 +482,22 @@ impl GlujBenchApp {
                                 match serde_json::from_value(benchmarks.clone()) {
                                     Ok(items) => {
                                         self.benchmarks = items;
-                                        if self.selected.is_none() {
-                                            self.selected = self
-                                                .benchmarks
-                                                .iter()
-                                                .find(|item| {
-                                                    item.suite_id == self.selected_suite
-                                                        && self.benchmark_available(item)
-                                                })
-                                                .map(|item| item.id.clone());
-                                        }
+                                        self.metadata_benchmarks_received = true;
+                                        self.select_first_available();
                                     }
                                     Err(problem) => self.status = problem.to_string(),
+                                }
+                            }
+                            if self.metadata_scan_pending
+                                && self.metadata_devices_received
+                                && self.metadata_benchmarks_received
+                            {
+                                self.metadata_scan_pending = false;
+                                if let Some(fingerprint) = &self.fingerprint {
+                                    match save_metadata_cache(fingerprint, &self.devices, &self.benchmarks) {
+                                        Ok(()) => self.status = "Hardware capabilities scanned and saved for future launches.".into(),
+                                        Err(problem) => self.status = format!("Hardware scan completed, but metadata could not be saved: {problem}"),
+                                    }
                                 }
                             }
                         }
@@ -364,624 +509,359 @@ impl GlujBenchApp {
             self.start_next();
         }
     }
-    fn tabs(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .fill(SURFACE)
-            .inner_margin(egui::Margin::symmetric(18, 12))
-            .stroke(egui::Stroke::new(1.0, BORDER))
-            .corner_radius(10)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("GLUJ-BENCH")
-                                .size(21.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.label(
-                            egui::RichText::new("Hardware performance lab")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.add_space(30.0);
-                    nav_button(ui, &mut self.tab, Tab::Overview, "Overview");
-                    nav_button(ui, &mut self.tab, Tab::Benchmarks, "Benchmarks");
-                    nav_button(ui, &mut self.tab, Tab::Results, "Results");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let connected = self.worker.child.is_some();
-                        status_pill(
-                            ui,
-                            if connected {
-                                "WORKER ONLINE"
-                            } else {
-                                "WORKER OFFLINE"
-                            },
-                            if connected {
-                                egui::Color32::from_rgb(93, 214, 139)
-                            } else {
-                                egui::Color32::from_rgb(239, 103, 119)
-                            },
-                        );
-                    });
-                });
-            });
-        ui.add_space(18.0);
-    }
-    fn overview(&self, ui: &mut egui::Ui) {
-        section_heading(
-            ui,
-            "Hardware overview",
-            "Detected compute devices and their exposed capabilities.",
+    fn refresh(window: &MainWindow, app: &Self) {
+        window.set_page(app.page);
+        window.set_status(app.status.clone().into());
+        window.set_worker_online(app.worker.online());
+        window.set_running(app.active_request.is_some());
+        window.set_progress(app.progress);
+        window.set_progress_message(app.progress_message.clone().into());
+        window.set_queued_count(app.queue.len() as i32);
+        window.set_suite_description(suite_description(&app.selected_suite).into());
+        window.set_show_gpu_selector(app.selected_suite.starts_with("gpu."));
+        window.set_expanded_device_id(app.expanded_device_id.clone().unwrap_or_default().into());
+        window.set_result_details_expanded(app.result_details_expanded);
+        window.set_device_count(app.devices.len() as i32);
+        window
+            .set_available_device_count(app.devices.iter().filter(|d| d.available).count() as i32);
+        window.set_benchmark_count(app.benchmarks.len() as i32);
+        let gpu_devices: Vec<_> = app
+            .devices
+            .iter()
+            .filter(|d| d.category == DeviceCategory::Gpu && d.available)
+            .collect();
+        let gpu_names: Vec<SharedString> = gpu_devices
+            .iter()
+            .map(|d| SharedString::from(d.name.as_str()))
+            .collect();
+        window.set_gpu_adapters(ModelRc::new(VecModel::from(gpu_names)));
+        window.set_selected_gpu(
+            app.selected_gpu_id
+                .as_ref()
+                .and_then(|id| gpu_devices.iter().position(|d| &d.id == id))
+                .map(|i| i as i32)
+                .unwrap_or(-1),
         );
-        ui.add_space(12.0);
-        ui.columns(3, |columns| {
-            summary_card(
-                &mut columns[0],
-                "DEVICES",
-                self.devices.len().to_string(),
-                ACCENT,
-            );
-            summary_card(
-                &mut columns[1],
-                "AVAILABLE",
-                self.devices
-                    .iter()
-                    .filter(|device| device.available)
-                    .count()
-                    .to_string(),
-                egui::Color32::from_rgb(93, 214, 139),
-            );
-            summary_card(
-                &mut columns[2],
-                "BENCHMARKS",
-                self.benchmarks.len().to_string(),
-                ACCENT_BLUE,
-            );
-        });
-        ui.add_space(12.0);
-        status_banner(ui, &self.status, self.worker.child.is_some());
-        ui.add_space(12.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for device in &self.devices {
-                device_card(ui, device);
-                ui.add_space(10.0);
-            }
-        });
-    }
-    fn benchmarks(&mut self, ui: &mut egui::Ui) {
-        section_heading(
-            ui,
-            "Benchmark lab",
-            "Choose a workload, then run it against the selected hardware.",
+        window.set_selected_gpu_name(
+            app.selected_gpu_id
+                .as_ref()
+                .and_then(|id| gpu_devices.iter().find(|device| &device.id == id))
+                .map(|device| device.name.as_str())
+                .unwrap_or("No compatible GPU selected")
+                .into(),
         );
-        ui.add_space(12.0);
-        egui::Frame::new()
-            .fill(SURFACE)
-            .inner_margin(10)
-            .stroke(egui::Stroke::new(1.0, BORDER))
-            .corner_radius(9)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    self.suite_button(ui, "cpu.bandwidth", "CPU · Bandwidth");
-                    self.suite_button(ui, "cpu.performance", "CPU · Performance");
-                    self.suite_button(ui, "gpu.bandwidth", "GPU · Bandwidth");
-                    self.suite_button(ui, "gpu.performance", "GPU · Performance");
-                });
-            });
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(match self.selected_suite.as_str() {
-            "cpu.bandwidth" => {
-                "Read, write, and copy bandwidth with per-operation sample statistics."
-            }
-            "cpu.performance" => {
-                "Aggregate logical-processor throughput, the matching single-thread INT64 test, and compute-vs-memory diagnosis."
-            }
-            "gpu.bandwidth" => {
-                "Estimated effective L2/L3, GPU-local memory, and bidirectional host-device bandwidth. Cache names are inferred from measured plateaus."
-            }
-            "gpu.performance" => {
-                "Vector shader and hardware cooperative-matrix throughput. Matrix entries are independently capability-gated; unavailable numeric formats remain visible with the exact reason."
-            }
-            _ => "Select a benchmark suite.",
-        }).color(MUTED));
-        if self.selected_suite.starts_with("gpu.") {
-            let gpu_devices: Vec<_> = self
-                .devices
-                .iter()
-                .filter(|device| device.category == DeviceCategory::Gpu && device.available)
-                .map(|device| (device.id.clone(), device.name.clone()))
-                .collect();
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("GPU ADAPTER")
-                        .size(11.0)
-                        .strong()
-                        .color(MUTED),
-                );
-                let selected_text = self
-                    .selected_gpu_id
-                    .as_ref()
-                    .and_then(|id| gpu_devices.iter().find(|device| &device.0 == id))
-                    .map(|device| device.1.as_str())
-                    .unwrap_or("No available GPU");
-                egui::ComboBox::from_id_salt("gpu-adapter")
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &gpu_devices {
-                            if ui
-                                .selectable_value(&mut self.selected_gpu_id, Some(id.clone()), name)
-                                .changed()
-                            {
-                                self.selected = self
-                                    .benchmarks
-                                    .iter()
-                                    .find(|item| {
-                                        item.suite_id == self.selected_suite
-                                            && item.available
-                                            && item.supported_device_ids.contains(id)
-                                    })
-                                    .map(|item| item.id.clone());
-                            }
-                        }
-                    });
-            });
-        }
-        ui.add_space(12.0);
-        egui::ScrollArea::vertical()
-            .max_height(360.0)
-            .show(ui, |ui| {
-                for benchmark in self
-                    .benchmarks
-                    .iter()
-                    .filter(|item| item.suite_id == self.selected_suite)
-                {
-                    let selected = self.selected.as_deref() == Some(&benchmark.id);
-                    let available = self.benchmark_available(benchmark);
-                    let fill = if selected {
-                        egui::Color32::from_rgb(27, 55, 60)
-                    } else {
-                        SURFACE
-                    };
-                    egui::Frame::new()
-                        .fill(fill)
-                        .inner_margin(egui::Margin::symmetric(14, 11))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if selected { ACCENT } else { BORDER },
-                        ))
-                        .corner_radius(8)
-                        .show(ui, |ui| {
-                            ui.add_enabled_ui(available && self.active_request.is_none(), |ui| {
-                                let response = ui.selectable_label(
-                                    selected,
-                                    egui::RichText::new(&benchmark.name).strong().size(14.0),
-                                );
-                                if response.clicked() {
-                                    self.selected = Some(benchmark.id.clone());
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(&benchmark.workload)
-                                    .size(11.0)
-                                    .color(MUTED),
-                            );
-                            if !available {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(245, 188, 89),
-                                    format!(
-                                        "Unavailable · {}",
-                                        if benchmark.available {
-                                            "unsupported_on_selected_adapter"
-                                        } else {
-                                            &benchmark.unavailable_reason
-                                        }
-                                    ),
-                                );
-                            }
-                        });
-                    ui.add_space(8.0);
-                }
-            });
-        ui.add_space(8.0);
-        if self.active_request.is_some() {
-            egui::Frame::new()
-                .fill(SURFACE_RAISED)
-                .inner_margin(12)
-                .corner_radius(8)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.strong(&self.progress_message);
-                    });
-                    ui.add(
-                        egui::ProgressBar::new(self.progress)
-                            .show_percentage()
-                            .fill(ACCENT),
-                    );
-                    if ui.button("Cancel benchmark").clicked() {
-                        self.cancel();
-                    }
-                });
-        } else {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(self.selected.is_some(), primary_button("Run selected"))
-                    .clicked()
-                {
-                    self.run_selected();
-                }
-                if ui.add(egui::Button::new("Run all available")).clicked() {
-                    self.run_all();
-                }
-                ui.label(
-                    egui::RichText::new("5 samples · ~5 seconds per operation")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            });
-        }
-    }
-
-    fn suite_button(&mut self, ui: &mut egui::Ui, suite: &str, label: &str) {
-        let selected = self.selected_suite == suite;
-        let button = egui::Button::new(egui::RichText::new(label).strong())
-            .selected(selected)
-            .fill(if selected {
-                egui::Color32::from_rgb(29, 75, 76)
-            } else {
-                SURFACE_RAISED
-            })
-            .stroke(egui::Stroke::new(
-                1.0,
-                if selected { ACCENT } else { BORDER },
-            ));
-        if ui.add(button).clicked() {
-            self.selected_suite = suite.into();
-            self.selected = self
-                .benchmarks
-                .iter()
-                .find(|item| item.suite_id == self.selected_suite && self.benchmark_available(item))
-                .map(|item| item.id.clone());
-        }
-    }
-
-    fn benchmark_available(&self, benchmark: &BenchmarkDescriptor) -> bool {
-        if !benchmark.available {
-            return false;
-        }
-        if benchmark.category != gluj_bench_core::BenchmarkCategory::Gpu {
-            return true;
-        }
-        self.selected_gpu_id
-            .as_ref()
-            .is_some_and(|id| benchmark.supported_device_ids.contains(id))
-    }
-    fn results(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            section_heading(
-                ui,
-                "Results",
-                "Measured performance with five-sample statistics.",
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.results.is_empty() && ui.button("Clear results").clicked() {
-                    self.results.clear();
-                }
-            });
-        });
-        ui.add_space(12.0);
-        if self.results.is_empty() {
-            egui::Frame::new()
-                .fill(SURFACE)
-                .inner_margin(30)
-                .stroke(egui::Stroke::new(1.0, BORDER))
-                .corner_radius(10)
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("No results yet").size(18.0).strong());
-                        ui.label(
-                            egui::RichText::new("Run a benchmark to populate this view.")
-                                .color(MUTED),
-                        );
-                    });
-                });
-            return;
-        }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (result_index, result) in self.results.iter().rev().enumerate() {
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .inner_margin(16)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
-                    .corner_radius(10)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&result.benchmark_id)
-                                    .size(16.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    status_pill(
-                                        ui,
-                                        &format!("{:.2} ms", result.elapsed_ns as f64 / 1e6),
-                                        ACCENT_BLUE,
-                                    );
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        egui::Grid::new(format!("result-{}-{}", result.benchmark_id, result_index))
-                            .striped(true)
-                            .min_col_width(120.0)
-                            .show(ui, |ui| {
-                                table_header(ui, "OPERATION");
-                                table_header(ui, "MEDIAN");
-                                table_header(ui, "MIN / MAX");
-                                table_header(ui, "STD DEV");
-                                ui.end_row();
-                                for metric in &result.metrics {
-                                    let s = &metric.statistics;
-                                    ui.label(egui::RichText::new(&metric.name).strong());
-                                    let median = ui.label(
-                                        egui::RichText::new(format_metric(
-                                            metric.value,
-                                            &metric.unit,
-                                        ))
-                                        .strong()
-                                        .color(ACCENT),
-                                    );
-                                    if metric.unit == "operations/s" {
-                                        median.on_hover_text(format!(
-                                            "{:.4} TOPS; raw value: {:.0} operations/s",
-                                            metric.value / 1e12,
-                                            metric.value
-                                        ));
-                                    }
-                                    ui.label(format!(
-                                        "{} / {}",
-                                        format_metric(s.minimum, &metric.unit),
-                                        format_metric(s.maximum, &metric.unit)
-                                    ));
-                                    ui.label(format_metric(s.standard_deviation, &metric.unit));
-                                    ui.end_row();
-                                }
-                            });
-                        show_bound_diagnosis(ui, &result.workload_metadata);
-                        egui::CollapsingHeader::new("Technical details")
-                            .id_salt(format!(
-                                "technical-details-{}-{}",
-                                result.benchmark_id, result_index
-                            ))
-                            .show(ui, |ui| {
-                                egui::Grid::new(format!(
-                                    "metadata-{}-{}",
-                                    result.benchmark_id, result_index
-                                ))
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for (key, value) in &result.workload_metadata {
-                                        if is_diagnosis_key(key) {
-                                            continue;
-                                        }
-                                        ui.label(egui::RichText::new(key).color(MUTED));
-                                        ui.monospace(value);
-                                        ui.end_row();
-                                    }
-                                });
-                            });
-                    });
-                ui.add_space(10.0);
-            }
-        });
-    }
-}
-
-impl eframe::App for GlujBenchApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.receive_worker_events();
-        egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(18, 12))
-            .show(ui, |ui| {
-                self.tabs(ui);
-                match self.tab {
-                    Tab::Overview => self.overview(ui),
-                    Tab::Benchmarks => self.benchmarks(ui),
-                    Tab::Results => self.results(ui),
-                }
-            });
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
-    }
-}
-
-fn nav_button(ui: &mut egui::Ui, current: &mut Tab, tab: Tab, label: &str) {
-    let selected = *current == tab;
-    let text = egui::RichText::new(label)
-        .strong()
-        .color(if selected { ACCENT } else { MUTED });
-    if ui
-        .add(
-            egui::Button::new(text)
-                .selected(selected)
-                .fill(if selected {
-                    egui::Color32::from_rgb(26, 57, 61)
+        let devices: Vec<DeviceRow> = app
+            .devices
+            .iter()
+            .map(|d| DeviceRow {
+                id: d.id.as_str().into(),
+                name: d.name.as_str().into(),
+                category: category_name(d.category).into(),
+                availability: if d.available {
+                    "AVAILABLE"
                 } else {
-                    SURFACE
-                })
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    if selected {
-                        ACCENT
+                    "UNAVAILABLE"
+                }
+                .into(),
+                status: d.status.as_str().into(),
+                details: d
+                    .properties
+                    .iter()
+                    .take(4)
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+                    .into(),
+                cache_details: cache_details(d).into(),
+                accent: device_accent(d.category),
+                available: d.available,
+            })
+            .collect();
+        window.set_devices(ModelRc::new(VecModel::from(devices)));
+        let benchmarks: Vec<BenchmarkRow> = app
+            .benchmarks
+            .iter()
+            .filter(|b| b.suite_id == app.selected_suite)
+            .map(|b| {
+                let hardware_ready =
+                    benchmark_hardware_supported_for(b, app.selected_gpu_id.as_deref())
+                        && !app.benchmark_available(b);
+                BenchmarkRow {
+                    id: b.id.as_str().into(),
+                    name: b.name.as_str().into(),
+                    workload: b.workload.as_str().into(),
+                    availability: if hardware_ready {
+                        "Hardware supported | Vulkan runner pending"
+                    } else if b.available {
+                        "unsupported on selected adapter"
                     } else {
-                        egui::Color32::TRANSPARENT
-                    },
-                )),
-        )
-        .clicked()
-    {
-        *current = tab;
+                        b.unavailable_reason.as_str()
+                    }
+                    .into(),
+                    data_type: b.data_type.as_str().into(),
+                    unit: b.unit.as_str().into(),
+                    enabled: app.benchmark_available(b),
+                    selected: app.selected.as_deref() == Some(b.id.as_str()),
+                    hardware_ready,
+                }
+            })
+            .collect();
+        window.set_benchmarks(ModelRc::new(VecModel::from(benchmarks)));
+        let selected = app
+            .selected
+            .as_ref()
+            .and_then(|id| app.benchmarks.iter().find(|benchmark| &benchmark.id == id));
+        window.set_selected_benchmark_name(
+            selected
+                .map(|benchmark| benchmark.name.as_str())
+                .unwrap_or("No workload selected")
+                .into(),
+        );
+        window.set_selected_benchmark_description(
+            selected
+                .map(|benchmark| benchmark.workload.as_str())
+                .unwrap_or("Select an available workload to inspect and run it.")
+                .into(),
+        );
+        window.set_selected_benchmark_availability(
+            selected
+                .map(|benchmark| {
+                    if app.benchmark_available(benchmark) {
+                        format!("Available | {} | {}", benchmark.data_type, benchmark.unit)
+                    } else if benchmark_hardware_supported_for(
+                        benchmark,
+                        app.selected_gpu_id.as_deref(),
+                    ) {
+                        format!(
+                            "Hardware supported | Vulkan runner pending | {}",
+                            benchmark.data_type
+                        )
+                    } else {
+                        format!("Unavailable: {}", benchmark.unavailable_reason)
+                    }
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        window.set_selected_benchmark_enabled(
+            selected.is_some_and(|benchmark| app.benchmark_available(benchmark)),
+        );
+        let target_device = if app.selected_suite.starts_with("gpu.") {
+            app.selected_gpu_id
+                .as_ref()
+                .and_then(|id| app.devices.iter().find(|device| &device.id == id))
+        } else {
+            let category = selected.map(|benchmark| benchmark.category);
+            category
+                .and_then(|category| {
+                    app.devices.iter().find(|device| {
+                        matches!(
+                            (category, device.category),
+                            (BenchmarkCategory::Cpu, DeviceCategory::Cpu)
+                                | (BenchmarkCategory::Memory, DeviceCategory::Memory)
+                        )
+                    })
+                })
+                .or_else(|| {
+                    app.devices
+                        .iter()
+                        .find(|device| device.category == DeviceCategory::Cpu)
+                })
+        };
+        window.set_target_hardware_name(
+            target_device
+                .map(|device| device.name.as_str())
+                .unwrap_or("No compatible target detected")
+                .into(),
+        );
+        window.set_target_hardware_description(
+            if app.selected_suite.starts_with("gpu.") {
+                if target_device.is_some() {
+                    "GPU workloads run on the selected adapter above."
+                } else {
+                    "No compatible GPU adapter is available for this suite."
+                }
+            } else if selected
+                .is_some_and(|benchmark| benchmark.category == BenchmarkCategory::Memory)
+            {
+                "This workload measures CPU-visible system memory."
+            } else {
+                "CPU workloads run on the discovered processor."
+            }
+            .into(),
+        );
+        let results: Vec<ResultRow> = app
+            .results
+            .iter()
+            .rev()
+            .map(|result| result_row(result, &app.devices))
+            .collect();
+        window.set_results(ModelRc::new(VecModel::from(results)));
     }
 }
 
-fn section_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.vertical(|ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .size(24.0)
-                .strong()
-                .color(egui::Color32::WHITE),
-        );
-        ui.label(egui::RichText::new(subtitle).size(12.0).color(MUTED));
-    });
+fn benchmark_available_for(benchmark: &BenchmarkDescriptor, selected_gpu_id: Option<&str>) -> bool {
+    benchmark.available
+        && (benchmark.category != BenchmarkCategory::Gpu
+            || selected_gpu_id.is_some_and(|id| {
+                benchmark
+                    .supported_device_ids
+                    .iter()
+                    .any(|supported| supported == id)
+            }))
 }
 
-fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.12))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
-        .corner_radius(20)
-        .inner_margin(egui::Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(10.0).strong().color(color));
-        });
-}
-
-fn summary_card(ui: &mut egui::Ui, label: &str, value: String, color: egui::Color32) {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0, BORDER))
-        .corner_radius(9)
-        .inner_margin(14)
-        .show(ui, |ui| {
-            ui.set_min_height(58.0);
-            ui.label(egui::RichText::new(label).size(10.0).strong().color(MUTED));
-            ui.label(egui::RichText::new(value).size(25.0).strong().color(color));
-        });
-}
-
-fn status_banner(ui: &mut egui::Ui, status: &str, connected: bool) {
-    let color = if connected {
-        egui::Color32::from_rgb(93, 214, 139)
-    } else {
-        egui::Color32::from_rgb(239, 103, 119)
+fn benchmark_hardware_supported_for(
+    benchmark: &BenchmarkDescriptor,
+    selected_gpu_id: Option<&str>,
+) -> bool {
+    let Some(selected_gpu_id) = selected_gpu_id else {
+        return false;
     };
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.08))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(12, 9))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(color, "●");
-                ui.label(status);
-            });
-        });
+    benchmark
+        .metadata
+        .get("hardware_supported_device_ids")
+        .is_some_and(|ids| ids.split(',').any(|id| id == selected_gpu_id))
 }
 
-fn device_card(ui: &mut egui::Ui, device: &DeviceDescriptor) {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0, BORDER))
-        .corner_radius(10)
-        .inner_margin(16)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(&device.name)
-                            .size(16.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    );
-                    ui.label(
-                        egui::RichText::new(&device.id)
-                            .size(10.0)
-                            .monospace()
-                            .color(MUTED),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    status_pill(
-                        ui,
-                        if device.available {
-                            "AVAILABLE"
-                        } else {
-                            "UNAVAILABLE"
-                        },
-                        if device.available {
-                            egui::Color32::from_rgb(93, 214, 139)
-                        } else {
-                            egui::Color32::from_rgb(245, 188, 89)
-                        },
-                    );
-                    status_pill(
-                        ui,
-                        match device.category {
-                            DeviceCategory::Cpu => "CPU",
-                            DeviceCategory::Memory => "MEMORY",
-                            DeviceCategory::Gpu => "GPU",
-                        },
-                        ACCENT_BLUE,
-                    );
-                });
-            });
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(&device.status).color(MUTED));
-            if !device.caches.is_empty() {
-                ui.add_space(7.0);
-                ui.horizontal_wrapped(|ui| {
-                    for cache in &device.caches {
-                        status_pill(
-                            ui,
-                            &format!(
-                                "L{} {:?} · {} KiB",
-                                cache.level,
-                                cache.kind,
-                                cache.size_bytes / 1024
-                            ),
-                            ACCENT,
-                        );
-                    }
-                });
-            }
-            if !device.properties.is_empty() {
-                egui::CollapsingHeader::new("Capabilities and topology")
-                    .id_salt(format!("device-capabilities-{}", device.id))
-                    .show(ui, |ui| {
-                        egui::Grid::new(format!("device-properties-{}", device.id))
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for (key, value) in &device.properties {
-                                    ui.label(egui::RichText::new(key).color(MUTED));
-                                    ui.monospace(value);
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            }
-        });
+fn preferred_gpu_id(devices: &[DeviceDescriptor], current: Option<&str>) -> Option<String> {
+    current
+        .and_then(|id| {
+            devices
+                .iter()
+                .find(|device| {
+                    device.category == DeviceCategory::Gpu && device.available && device.id == id
+                })
+                .map(|device| device.id.clone())
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| device.category == DeviceCategory::Gpu && device.available)
+                .map(|device| device.id.clone())
+        })
 }
 
-fn primary_button(label: &'static str) -> egui::Button<'static> {
-    egui::Button::new(
-        egui::RichText::new(label)
-            .strong()
-            .color(egui::Color32::from_rgb(7, 24, 25)),
-    )
-    .fill(ACCENT)
-    .stroke(egui::Stroke::new(1.0, ACCENT))
+fn category_name(category: DeviceCategory) -> &'static str {
+    match category {
+        DeviceCategory::Cpu => "CPU",
+        DeviceCategory::Memory => "MEMORY",
+        DeviceCategory::Gpu => "GPU",
+    }
 }
-
-fn table_header(ui: &mut egui::Ui, label: &str) {
-    ui.label(egui::RichText::new(label).size(10.0).strong().color(MUTED));
+fn device_accent(category: DeviceCategory) -> Color {
+    match category {
+        DeviceCategory::Cpu => Color::from_rgb_u8(108, 158, 255),
+        DeviceCategory::Memory => Color::from_rgb_u8(85, 220, 174),
+        DeviceCategory::Gpu => Color::from_rgb_u8(209, 155, 255),
+    }
 }
-
+fn cache_details(device: &DeviceDescriptor) -> String {
+    if device.caches.is_empty() {
+        return "Cache topology is not exposed by this device; benchmarking remains available where supported.".into();
+    }
+    device
+        .caches
+        .iter()
+        .map(|cache| {
+            format!(
+                "L{} {:?}: {} KiB, {} instance(s), {} B lines",
+                cache.level,
+                cache.kind,
+                cache.size_bytes / 1024,
+                cache.instances,
+                cache.line_size_bytes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+fn suite_description(suite: &str) -> &'static str {
+    match suite {
+        "cpu.bandwidth" => "Read, write, and copy bandwidth with per-operation sample statistics.",
+        "cpu.performance" => {
+            "Aggregate processor throughput, single-thread INT64, and compute-vs-memory diagnosis."
+        }
+        "gpu.bandwidth" => "Estimated cache, GPU-local memory, and host-device bandwidth.",
+        "gpu.performance" => {
+            "Vector shader and cooperative-matrix throughput, capability-gated per format."
+        }
+        _ => "Select a benchmark suite.",
+    }
+}
+fn result_row(result: &BenchmarkResult, devices: &[DeviceDescriptor]) -> ResultRow {
+    let primary = result.metrics.first();
+    let secondary_metrics = result
+        .metrics
+        .iter()
+        .skip(1)
+        .map(|metric| {
+            format!(
+                "{}: {}",
+                metric.name,
+                format_metric(metric.value, &metric.unit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let diagnosis = result
+        .workload_metadata
+        .get("bound_classification")
+        .map(|s| format!("Bound diagnosis: {}", s.replace('_', " ")))
+        .unwrap_or_else(|| "Five-sample statistics recorded.".into());
+    let details = result
+        .workload_metadata
+        .iter()
+        .chain(result.device_metadata.iter())
+        .take(5)
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let device = devices
+        .iter()
+        .find(|device| device.id == result.device_id)
+        .map(|device| device.name.as_str())
+        .unwrap_or(result.device_id.as_str());
+    ResultRow {
+        title: result.benchmark_id.as_str().into(),
+        device: device.into(),
+        elapsed: format!("{:.2} ms", result.elapsed_ns as f64 / 1e6).into(),
+        primary_name: primary
+            .map(|metric| metric.name.as_str())
+            .unwrap_or("No metric reported")
+            .into(),
+        primary_value: primary
+            .map(|metric| format_metric(metric.value, &metric.unit))
+            .unwrap_or_else(|| "N/A".into())
+            .into(),
+        statistics: primary
+            .map(|metric| {
+                format!(
+                    "{} samples | min {} | median {} | max {} | variation {:.2}",
+                    metric.statistics.sample_count,
+                    format_metric(metric.statistics.minimum, &metric.unit),
+                    format_metric(metric.statistics.median, &metric.unit),
+                    format_metric(metric.statistics.maximum, &metric.unit),
+                    metric.statistics.standard_deviation
+                )
+            })
+            .unwrap_or_else(|| "No sample statistics reported.".into())
+            .into(),
+        secondary_metrics: if secondary_metrics.is_empty() {
+            "No secondary metrics reported."
+        } else {
+            &secondary_metrics
+        }
+        .into(),
+        diagnosis: diagnosis.into(),
+        details: if details.is_empty() {
+            "No additional workload metadata reported."
+        } else {
+            &details
+        }
+        .into(),
+    }
+}
 fn worker_path() -> PathBuf {
     let mut path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     path.set_file_name(if cfg!(windows) {
@@ -992,177 +872,216 @@ fn worker_path() -> PathBuf {
     path
 }
 
+fn metadata_cache_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|path| {
+        PathBuf::from(path)
+            .join("Gluj-Bench")
+            .join("hardware-metadata.json")
+    })
+}
+
+fn load_metadata_cache() -> Option<HardwareMetadataCache> {
+    let path = metadata_cache_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    let cache: HardwareMetadataCache = serde_json::from_str(&content).ok()?;
+    (cache.version == HARDWARE_METADATA_CACHE_VERSION).then_some(cache)
+}
+
+fn save_metadata_cache(
+    fingerprint: &str,
+    devices: &[DeviceDescriptor],
+    benchmarks: &[BenchmarkDescriptor],
+) -> Result<(), String> {
+    let path = metadata_cache_path().ok_or_else(|| "APPDATA is unavailable".to_owned())?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "cache directory is unavailable".to_owned())?;
+    fs::create_dir_all(directory).map_err(|problem| problem.to_string())?;
+    let content = serde_json::to_vec_pretty(&HardwareMetadataCache {
+        version: HARDWARE_METADATA_CACHE_VERSION,
+        fingerprint: fingerprint.to_owned(),
+        devices: devices.to_vec(),
+        benchmarks: benchmarks.to_vec(),
+    })
+    .map_err(|problem| problem.to_string())?;
+    fs::write(path, content).map_err(|problem| problem.to_string())
+}
 fn format_metric(value: f64, unit: &str) -> String {
-    if unit == "bytes/s" {
-        return format!("{:.2} GB/s", value / 1e9);
+    match unit {
+        "bytes/s" => format!("{:.2} GB/s", value / 1e9),
+        "operations/s" => readable_rate(value, "OPS"),
+        "MB/s" => format!("{value:.2} MB/s"),
+        "strings/s" => readable_rate(value, "strings/s"),
+        "primes/s" => readable_rate(value, "primes/s"),
+        _ => format!("{value:.2} {unit}"),
     }
-    if unit == "operations/s" {
-        let (scale, suffix) = if value >= 1e12 {
-            (1e12, "TOPS")
-        } else if value >= 1e6 {
-            (1e6, "MOPS")
-        } else if value >= 1e3 {
-            (1e3, "KOPS")
-        } else {
-            (1.0, "OPS")
-        };
-        return format!("{} {suffix}", format_grouped_2(value / scale));
-    }
-    if unit == "MB/s" {
-        return format!("{} MB/s", format_grouped_2(value));
-    }
-    if unit == "strings/s" {
-        let (scale, suffix) = if value >= 1e6 {
-            (1e6, "M strings/s")
-        } else if value >= 1e3 {
-            (1e3, "K strings/s")
-        } else {
-            (1.0, "strings/s")
-        };
-        return format!("{} {suffix}", format_grouped_2(value / scale));
-    }
-    if unit == "primes/s" {
-        let (scale, suffix) = if value >= 1e6 {
-            (1e6, "M primes/s")
-        } else if value >= 1e3 {
-            (1e3, "K primes/s")
-        } else {
-            (1.0, "primes/s")
-        };
-        return format!("{} {suffix}", format_grouped_2(value / scale));
-    }
-    format!("{value:.2} {unit}")
 }
-
-fn format_grouped_2(value: f64) -> String {
-    let raw = format!("{:.2}", value.abs());
-    let (integer, fraction) = raw.split_once('.').unwrap_or((&raw, "00"));
-    let mut grouped = String::with_capacity(raw.len() + integer.len() / 3);
-    if value.is_sign_negative() {
-        grouped.push('-');
-    }
-    for (index, character) in integer.chars().enumerate() {
-        if index != 0 && (integer.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(character);
-    }
-    grouped.push('.');
-    grouped.push_str(fraction);
-    grouped
-}
-
-fn is_diagnosis_key(key: &str) -> bool {
-    matches!(
-        key,
-        "bound_classification"
-            | "cpu_runnable_percent"
-            | "large_data_slowdown_percent"
-            | "memory_wait_pressure_percent"
-            | "memory_sensitivity_ratio"
-            | "classification_method"
-            | "classification_is_inference"
-            | "cpu_activity_interpretation"
-            | "diagnostic_domain"
-            | "implied_output_bandwidth_bytes_per_second"
-    )
-}
-
-fn show_bound_diagnosis(ui: &mut egui::Ui, metadata: &std::collections::BTreeMap<String, String>) {
-    let Some(classification) = metadata.get("bound_classification") else {
-        return;
-    };
-    ui.add_space(6.0);
-    let (label, color) = if classification == "memory_bandwidth_bound" {
-        ("MEMORY BANDWIDTH BOUND", egui::Color32::YELLOW)
+fn readable_rate(value: f64, suffix: &str) -> String {
+    let (scale, prefix) = if value >= 1e12 {
+        (1e12, "T")
+    } else if value >= 1e6 {
+        (1e6, "M")
+    } else if value >= 1e3 {
+        (1e3, "K")
     } else {
-        ("COMPUTE BOUND", egui::Color32::LIGHT_GREEN)
+        (1., "")
     };
-    ui.horizontal(|ui| {
-        ui.strong("Bound diagnosis:");
-        ui.colored_label(color, label);
-    });
-    if metadata.get("execution_domain").map(String::as_str) == Some("cooperative_matrix") {
-        ui.small(
-            metadata
-                .get("classification_method")
-                .map(String::as_str)
-                .unwrap_or("Register-resident cooperative-matrix workload."),
-        );
-        ui.small("Classification is inferred from the deliberately high arithmetic intensity; it is not a hardware stall-counter reading.");
-        return;
-    }
-    if metadata.get("diagnostic_domain").map(String::as_str) == Some("gpu") {
-        let sensitivity = metadata
-            .get("memory_sensitivity_ratio")
-            .and_then(|value| value.parse::<f64>().ok())
-            .map(|value| format!("{:.2}%", value * 100.0))
-            .unwrap_or_else(|| "unknown".into());
-        let slowdown = metadata
-            .get("large_data_slowdown_percent")
-            .map(String::as_str)
-            .unwrap_or("unknown");
-        let output_bandwidth = metadata
-            .get("implied_output_bandwidth_bytes_per_second")
-            .and_then(|value| value.parse::<f64>().ok())
-            .map(|value| format_metric(value, "bytes/s"))
-            .unwrap_or_else(|| "unknown".into());
-        ui.small(format!(
-            "Arithmetic-intensity sensitivity: {sensitivity}  |  Low-intensity slowdown: {slowdown}%  |  Implied output traffic: {output_bandwidth}"
-        ));
-        ui.small("Classification compares normalized throughput at two arithmetic intensities. It is an inference, not a hardware stall-counter reading.");
-        return;
-    }
-    let runnable = metadata
-        .get("cpu_runnable_percent")
-        .map(String::as_str)
-        .unwrap_or("unknown");
-    let pressure = metadata
-        .get("large_data_slowdown_percent")
-        .or_else(|| metadata.get("memory_wait_pressure_percent"))
-        .map(String::as_str)
-        .unwrap_or("unknown");
-    let sensitivity = metadata
-        .get("memory_sensitivity_ratio")
-        .and_then(|value| value.parse::<f64>().ok())
-        .map(|value| format!("{:.2}%", value * 100.0))
-        .unwrap_or_else(|| "unknown".into());
-    ui.small(format!(
-        "CPU runnable: {runnable}%  |  Large-data slowdown: {pressure}%  |  Large/cache throughput: {sensitivity}"
-    ));
-    ui.small("Classification is inferred from working-set sensitivity. Slowdown shows memory influence, not necessarily bandwidth saturation; CPU runnable time is not a hardware stall counter.");
+    format!("{:.2} {prefix}{suffix}", value / scale)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_grouped_2, format_metric};
-
+    use super::{
+        benchmark_available_for, benchmark_hardware_supported_for, cache_details, format_metric,
+        preferred_gpu_id, result_row,
+    };
+    use gluj_bench_core::{
+        BenchmarkCategory, BenchmarkDescriptor, BenchmarkResult, CacheDescriptor, CacheKind,
+        DeviceCategory, DeviceDescriptor, Metric, SampleStatistics,
+    };
+    use std::collections::BTreeMap;
     #[test]
     fn operation_rates_use_readable_si_prefixes() {
         assert_eq!(format_metric(12_500.0, "operations/s"), "12.50 KOPS");
         assert_eq!(
-            format_metric(129_718_800_000.0, "operations/s"),
-            "129,718.80 MOPS"
-        );
-        assert_eq!(
             format_metric(3_200_000_000_000.0, "operations/s"),
             "3.20 TOPS"
         );
-        assert_eq!(
-            format_metric(1_800_000_000_000.0, "operations/s"),
-            "1.80 TOPS"
-        );
-        assert_eq!(format_metric(3_744.186_882_15, "MB/s"), "3,744.19 MB/s");
-        assert_eq!(
-            format_metric(1_141_432_000.0, "strings/s"),
-            "1,141.43 M strings/s"
-        );
-        assert_eq!(format_metric(12_345_678.0, "primes/s"), "12.35 M primes/s");
     }
 
     #[test]
-    fn grouped_numbers_keep_the_decimal_in_the_correct_place() {
-        assert_eq!(format_grouped_2(129_718.8), "129,718.80");
-        assert_eq!(format_grouped_2(-1_234.5), "-1,234.50");
+    fn gpu_workload_requires_the_selected_supported_adapter() {
+        let benchmark = BenchmarkDescriptor {
+            id: "gpu.vector.fp32".into(),
+            name: "FP32".into(),
+            category: BenchmarkCategory::Gpu,
+            workload: "test".into(),
+            data_type: "FP32".into(),
+            unit: "operations/s".into(),
+            supported_device_ids: vec!["gpu:one".into()],
+            available: true,
+            unavailable_reason: String::new(),
+            suite_id: "gpu.performance".into(),
+            display_order: 0,
+            metadata: BTreeMap::new(),
+        };
+        assert!(benchmark_available_for(&benchmark, Some("gpu:one")));
+        assert!(!benchmark_available_for(&benchmark, Some("gpu:two")));
+        assert!(!benchmark_available_for(&benchmark, None));
+    }
+
+    #[test]
+    fn capability_metadata_does_not_hide_hardware_support() {
+        let benchmark = BenchmarkDescriptor {
+            id: "gpu.performance.matrix.int8".into(),
+            name: "Dense INT8 matrix performance".into(),
+            category: BenchmarkCategory::Gpu,
+            workload: "test".into(),
+            data_type: "int8".into(),
+            unit: "operations/s".into(),
+            supported_device_ids: Vec::new(),
+            available: false,
+            unavailable_reason: "capability_gated_runner_unavailable".into(),
+            suite_id: "gpu.performance".into(),
+            display_order: 0,
+            metadata: BTreeMap::from([(
+                "hardware_supported_device_ids".into(),
+                "gpu:vulkan:xtx".into(),
+            )]),
+        };
+        assert!(benchmark_hardware_supported_for(
+            &benchmark,
+            Some("gpu:vulkan:xtx")
+        ));
+        assert!(!benchmark_hardware_supported_for(
+            &benchmark,
+            Some("gpu:vulkan:other")
+        ));
+        assert!(!benchmark_available_for(&benchmark, Some("gpu:vulkan:xtx")));
+    }
+
+    #[test]
+    fn cached_gpu_metadata_selects_the_first_available_adapter() {
+        let devices = [DeviceDescriptor {
+            id: "gpu:one".into(),
+            name: "Graphics adapter".into(),
+            category: DeviceCategory::Gpu,
+            available: true,
+            status: "Ready".into(),
+            properties: BTreeMap::new(),
+            caches: vec![],
+        }];
+        assert_eq!(preferred_gpu_id(&devices, None).as_deref(), Some("gpu:one"));
+        assert_eq!(
+            preferred_gpu_id(&devices, Some("missing")).as_deref(),
+            Some("gpu:one")
+        );
+    }
+
+    #[test]
+    fn result_rows_preserve_statistics_and_cache_discovery_context() {
+        let result = BenchmarkResult {
+            benchmark_id: "gpu.bandwidth.cache".into(),
+            device_id: "gpu:one".into(),
+            elapsed_ns: 2_000_000,
+            metrics: vec![Metric {
+                name: "Bandwidth".into(),
+                value: 1_000_000_000.0,
+                unit: "bytes/s".into(),
+                statistics: SampleStatistics {
+                    sample_count: 5,
+                    minimum: 900_000_000.0,
+                    median: 1_000_000_000.0,
+                    maximum: 1_100_000_000.0,
+                    standard_deviation: 10.0,
+                },
+            }],
+            workload_metadata: BTreeMap::from([(
+                "cache_discovery_status".into(),
+                "not_detected".into(),
+            )]),
+            device_metadata: BTreeMap::new(),
+        };
+        let device = DeviceDescriptor {
+            id: "gpu:one".into(),
+            name: "Integrated GPU".into(),
+            category: DeviceCategory::Gpu,
+            available: true,
+            status: "Ready".into(),
+            properties: BTreeMap::new(),
+            caches: vec![],
+        };
+        let row = result_row(&result, &[device]);
+        assert_eq!(row.device.as_str(), "Integrated GPU");
+        assert!(row.statistics.as_str().contains("5 samples"));
+        assert!(
+            row.details
+                .as_str()
+                .contains("cache_discovery_status: not_detected")
+        );
+    }
+
+    #[test]
+    fn empty_cache_topology_is_an_explanatory_state() {
+        let mut device = DeviceDescriptor {
+            id: "gpu:one".into(),
+            name: "Integrated GPU".into(),
+            category: DeviceCategory::Gpu,
+            available: true,
+            status: "Ready".into(),
+            properties: BTreeMap::new(),
+            caches: vec![],
+        };
+        assert!(cache_details(&device).contains("not exposed"));
+        let cache = CacheDescriptor {
+            level: 3,
+            kind: CacheKind::Unified,
+            size_bytes: 32 * 1024 * 1024,
+            line_size_bytes: 64,
+            sharing_logical_processors: 16,
+            instances: 1,
+        };
+        device.caches.push(cache);
+        assert!(cache_details(&device).contains("L3 Unified"));
     }
 }

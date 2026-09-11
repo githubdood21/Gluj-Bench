@@ -79,7 +79,7 @@ pub struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            target_duration_ms: 5_000,
+            target_duration_ms: 2_000,
             samples: 5,
             options: BTreeMap::new(),
         }

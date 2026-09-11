@@ -1,0 +1,30 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint MATRIX_M = 16;
+layout(constant_id = 1) const uint MATRIX_N = 16;
+layout(constant_id = 2) const uint MATRIX_K = 16;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutputBuffer {
+    uint32_t output_values[];
+};
+
+void main() {
+    coopmat<uint8_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_K, gl_MatrixUseA> a =
+        coopmat<uint8_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_K, gl_MatrixUseA>(uint8_t(1));
+    coopmat<uint8_t, gl_ScopeSubgroup, MATRIX_K, MATRIX_N, gl_MatrixUseB> b =
+        coopmat<uint8_t, gl_ScopeSubgroup, MATRIX_K, MATRIX_N, gl_MatrixUseB>(uint8_t(1));
+    coopmat<uint32_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_N, gl_MatrixUseAccumulator> c =
+        coopmat<uint32_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_N, gl_MatrixUseAccumulator>(uint32_t(0));
+    for (uint iteration = 0; iteration < 256; ++iteration) {
+        c = coopMatMulAdd(a, b, c);
+    }
+    uint matrix_index = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint base = matrix_index * MATRIX_M * MATRIX_N;
+    coopMatStore(c, output_values, base, MATRIX_N, gl_CooperativeMatrixLayoutRowMajor);
+}

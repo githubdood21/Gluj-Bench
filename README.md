@@ -27,7 +27,7 @@ Download the latest Windows x64 release, extract it, and run `gluj-bench-ui.exe`
 
 Gluj-Bench is a free, vendor-neutral, AIDA64-like hardware benchmarking tool for Windows. It is designed to test CPU and GPU compute performance together with CPU cache, system RAM, GPU cache, VRAM, and host-to-GPU link bandwidth.
 
-Gluj-Bench provides transparent, reproducible measurements rather than a single unexplained score. GPU performance separates portable vector-shader throughput from capability-gated cooperative-matrix throughput, while GPU bandwidth measures empirically inferred effective L2/L3 regions, cache-separated GPU-local memory, and bidirectional host-device transfers. CPU suites measure aggregate L0-L3 data-cache and system-RAM bandwidth plus pinned integer, floating-point, string, prime-search, codec, POPCNT, AES, and AVX2/FMA workloads. Unsupported capabilities remain visibly disabled rather than producing synthetic results.
+Gluj-Bench provides transparent, reproducible measurements rather than a single unexplained score. GPU performance separates portable vector-shader throughput from capability-gated cooperative-matrix throughput, while GPU bandwidth measures empirically inferred effective L2/L3 regions, cache-separated GPU-local memory, and bidirectional host-device transfers. CPU suites measure aggregate L1-L3 data-cache and system-RAM bandwidth plus pinned integer, floating-point, string, prime-search, codec, POPCNT, AES, and AVX2/FMA workloads. Unsupported capabilities remain visibly disabled rather than producing synthetic results.
 
 Gluj-Bench is independently developed and is not affiliated with or endorsed by FinalWire or AIDA64.
 
@@ -79,7 +79,8 @@ Gluj-Bench intentionally places sustained load on the CPU, memory, and GPU. Ensu
 - `eframe`/`egui` desktop interface using the lightweight Glow renderer
 - Separate long-lived benchmark worker process for measurement isolation
 - `sysinfo` for portable CPU and memory discovery
-- `wgpu` for capability-based GPU discovery, timestamp queries, and WGSL bandwidth kernels
+- Vulkan through `ash` for authoritative GPU discovery, stable device identity, queue/timestamp capabilities, and cooperative-matrix format enumeration
+- Raw Vulkan with embedded SPIR-V for GPU bandwidth, FP16/FP32/FP64 vector benchmarks, and capability-gated FP16/INT8 cooperative-matrix benchmarks
 - Versioned newline-delimited JSON for UI-to-worker communication
 - LLVM-MinGW Windows toolchain, with no Visual Studio installation required
 
@@ -91,7 +92,7 @@ The application is split into five Cargo packages:
 
 - `gluj-bench-core` defines devices, benchmarks, results, metrics, cancellation, progress, providers, and the protocol.
 - `gluj-bench-cpu` contains optimized CPU topology discovery and bandwidth kernels.
-- `gluj-bench-gpu` contains vendor-neutral adapter discovery, empirical cache analysis, WGSL kernels, and host-device transfer measurements.
+- `gluj-bench-gpu` contains Vulkan capability discovery, empirical cache analysis, GPU kernels, and host-device transfer measurements.
 - `gluj-bench-worker` provides hardware discovery, the CLI, and the standard-I/O protocol host.
 - `gluj-bench-ui` provides the desktop application and manages the worker as a child process.
 
@@ -181,14 +182,15 @@ Human-readable commands write normal output to stdout. With `--json`, stdout con
 - Detected cache regions are displayed as **Estimated Effective L2** and **Estimated Effective L3**. They are behavioral inferences, not claims about physical cache topology; capacity intervals, confidence, thresholds, and the complete sweep are attached to result metadata.
 - Effective-cache and GPU-local kernels use coalesced 16-byte vector accesses with independent accumulators and sparse checksum writes. Cache reads use four vectors per invocation, streaming VRAM reads use sixty-four across eight dependency chains, streaming writes/copies use sixteen, and write/copy cache kernels retain one vector per invocation to keep small working sets highly parallel. GPU-local memory uses at least 256 MiB and four times the outer inferred cache boundary.
 - GPU copy bandwidth reports read-plus-write device-memory traffic for comparison with peak VRAM/cache bandwidth; useful copied payload is exactly half that reported rate and the convention is recorded in result metadata.
-- GPU-local operations run a discarded 750 ms sustained preconditioning workload before calibration and sampling so portable power management can raise core and memory clocks. wgpu cannot force a driver clock lock, and results explicitly record that distinction.
-- GPU compute benchmarks cover FP32, hardware-gated FP16 and FP64, INT32, and packed INT8 vector dot products. They autotune 512–8192 workgroups, use independent register-resident arithmetic chains, count scalar lane operations consistently, and compare two arithmetic intensities for an inferred compute-versus-memory diagnosis. Capability-gated FP16 cooperative-matrix throughput is also available where wgpu and the Vulkan driver expose a compatible configuration. Unsupported matrix formats remain visible with their exact capability reason.
+- GPU-local operations run a discarded 750 ms sustained preconditioning workload before calibration and sampling so portable power management can raise core and memory clocks. The application does not force a vendor driver clock lock, and results explicitly record that distinction.
+- GPU shader benchmarks cover FP16, FP32, and FP64 vector arithmetic. Matrix benchmarks expose dense and sparse FP16, INT8, and FP8 families. Vulkan-reported MxNxK and numeric-type configurations directly gate the raw Vulkan cooperative-matrix runners; formats without a capability-verified path remain visible with their exact reason.
+- Precision classes are compared within the same execution domain. In particular, the RX 7900 XTX is specified for equal FP16-vector and FP32-vector peak throughput; its doubled FP16 figure belongs to the separate matrix path.
 - Host-to-device and device-to-host tests use a first-touched ring of three preallocated 64 MiB host-visible staging buffers, batched native buffer copies, and CPU wall-clock completion timing. Discrete adapters are marked `probable_pcie`, integrated adapters `shared_memory_or_uma`, and both classifications remain explicit inferences.
 - Overview, Benchmarks, and Results screens are present in the UI.
-- L0-L3 cache and system-RAM read, write, and copy bandwidth benchmarks run across all discovered physical cores when topology and working-set requirements can be satisfied.
+- L1-L3 cache and system-RAM read, write, and copy bandwidth benchmarks run across all discovered physical cores when topology and working-set requirements can be satisfied.
 - Per-cache-instance working-set partitioning supports processors with multiple shared last-level caches without relying on manufacturer IDs.
 - Cache measurements use 40% of each discovered cache instance, divide that capacity only among cores in the instance's topology mask, and preload disjoint per-core buffers before timing. RAM measurements flush their working cache lines and rotate the sequential starting line before every timed sweep. Buffers are first-touched by their pinned owner core; preparation and cache flushing are excluded from elapsed time.
-- Read, write, and copy operations each target 5 seconds by default and report the median of five approximately one-second samples.
+- Read, write, and copy operations each target 2 seconds by default and report the median of five samples.
 - Physical-core workers remain the default. Protocol clients can request `thread_mode=logical_processors` for controlled SMT comparisons; cache capacity is divided between sibling workers so physical-core and logical-processor modes use the same aggregate footprint.
 - Cache copy bandwidth follows AIDA64-style read-plus-write traffic accounting; RAM copy continues to report useful payload bandwidth. Result metadata identifies the byte definition explicitly.
 - Cache SIMD kernels process eight vectors per iteration. Read kernels maintain eight independent accumulators to avoid serial load dependencies; write and copy kernels issue batched aligned operations to approach the available cache data-path throughput.

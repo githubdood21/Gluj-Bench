@@ -1,0 +1,20 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) writeonly buffer Output { vec4 values[]; } output_data;
+layout(push_constant) uniform Params { uint loop_count; uint seed; uint invocation_count; uint padding; } params;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.invocation_count) { return; }
+    float base = float((index ^ params.seed) & 1023u) * 0.0001 + 0.25;
+    vec4 a0=vec4(base)+vec4(0.01,0.02,0.03,0.04); vec4 a1=a0+vec4(0.05);
+    vec4 a2=a0+vec4(0.10); vec4 a3=a0+vec4(0.15); vec4 a4=a0+vec4(0.20);
+    vec4 a5=a0+vec4(0.25); vec4 a6=a0+vec4(0.30); vec4 a7=a0+vec4(0.35);
+    for (uint i=0; i<params.loop_count; ++i) {
+        a0=fma(a0,vec4(1.000001),vec4(0.000001)); a1=fma(a1,vec4(0.999999),vec4(0.000002));
+        a2=fma(a2,vec4(1.000002),vec4(0.000003)); a3=fma(a3,vec4(0.999998),vec4(0.000004));
+        a4=fma(a4,vec4(1.000003),vec4(0.000005)); a5=fma(a5,vec4(0.999997),vec4(0.000006));
+        a6=fma(a6,vec4(1.000004),vec4(0.000007)); a7=fma(a7,vec4(0.999996),vec4(0.000008));
+    }
+    output_data.values[index]=a0+a1+a2+a3+a4+a5+a6+a7;
+}

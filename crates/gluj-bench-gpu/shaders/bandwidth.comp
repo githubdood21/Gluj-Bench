@@ -1,0 +1,107 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SourceBuffer {
+    uvec4 source_data[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer DestinationBuffer {
+    uvec4 destination_data[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer ChecksumBuffer {
+    uint checksums[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint element_count;
+    uint seed;
+    uint row_width;
+    uint access_count;
+} params;
+
+uint invocation_index() {
+    return gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * params.row_width;
+}
+
+uint mapped_index(uint index) {
+    return params.access_count != params.element_count
+        ? index & (params.element_count - 1u)
+        : index;
+}
+
+uint fold_value(uvec4 value) {
+    return value.x ^ value.y ^ value.z ^ value.w;
+}
+
+void write_vector(uint index) {
+    uint value = params.seed ^ index;
+    destination_data[index] = uvec4(value, value + 1u, value + 2u, value + 3u);
+}
+
+#if KERNEL == 0
+void main() {
+    uint invocation = invocation_index();
+    uint count = params.access_count / 4u;
+    if (invocation >= count) return;
+    uvec4 a = source_data[mapped_index(invocation)];
+    uvec4 b = source_data[mapped_index(invocation + count)];
+    a ^= source_data[mapped_index(invocation + count * 2u)];
+    b ^= source_data[mapped_index(invocation + count * 3u)];
+    checksums[invocation] = fold_value(a ^ b) ^ params.seed;
+}
+#elif KERNEL == 1
+void main() {
+    uint index = invocation_index();
+    if (index >= params.element_count) return;
+    write_vector(index);
+}
+#elif KERNEL == 2
+void main() {
+    uint index = invocation_index();
+    if (index >= params.element_count) return;
+    destination_data[index] = source_data[index];
+}
+#elif KERNEL == 3
+void main() {
+    uint invocation = invocation_index();
+    uint stride = params.access_count / 64u;
+    if (invocation >= stride) return;
+    uvec4 a = source_data[invocation];
+    uvec4 b = source_data[invocation + stride];
+    uvec4 c = source_data[invocation + stride * 2u];
+    uvec4 d = source_data[invocation + stride * 3u];
+    uvec4 e = source_data[invocation + stride * 4u];
+    uvec4 f = source_data[invocation + stride * 5u];
+    uvec4 g = source_data[invocation + stride * 6u];
+    uvec4 h = source_data[invocation + stride * 7u];
+    for (uint group = 1u; group < 8u; ++group) {
+        uint base = group * 8u;
+        a ^= source_data[invocation + stride * (base + 0u)];
+        b ^= source_data[invocation + stride * (base + 1u)];
+        c ^= source_data[invocation + stride * (base + 2u)];
+        d ^= source_data[invocation + stride * (base + 3u)];
+        e ^= source_data[invocation + stride * (base + 4u)];
+        f ^= source_data[invocation + stride * (base + 5u)];
+        g ^= source_data[invocation + stride * (base + 6u)];
+        h ^= source_data[invocation + stride * (base + 7u)];
+    }
+    checksums[invocation] = fold_value(a ^ b ^ c ^ d ^ e ^ f ^ g ^ h) ^ params.seed;
+}
+#elif KERNEL == 4
+void main() {
+    uint invocation = invocation_index();
+    uint stride = params.element_count / 16u;
+    if (invocation >= stride) return;
+    for (uint lane = 0u; lane < 16u; ++lane) write_vector(invocation + stride * lane);
+}
+#elif KERNEL == 5
+void main() {
+    uint invocation = invocation_index();
+    uint stride = params.element_count / 16u;
+    if (invocation >= stride) return;
+    for (uint lane = 0u; lane < 16u; ++lane) {
+        uint index = invocation + stride * lane;
+        destination_data[index] = source_data[index];
+    }
+}
+#endif
