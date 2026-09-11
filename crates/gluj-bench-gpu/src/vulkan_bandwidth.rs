@@ -145,7 +145,7 @@ impl VulkanBandwidthContext {
                         .sharing_mode(vk::SharingMode::EXCLUSIVE),
                     None,
                 )
-                .map_err(|problem| allocation_error(problem))?;
+                .map_err(allocation_error)?;
             let requirements = self.device.get_buffer_memory_requirements(handle);
             let memory_type = match find_memory_type(
                 &self.memory_properties,
@@ -863,8 +863,10 @@ fn shader_words(
         ));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("SPIR-V word")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect())
 }
 

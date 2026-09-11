@@ -3,6 +3,7 @@ mod compute;
 mod cooperative_matrix;
 mod vulkan;
 mod vulkan_bandwidth;
+mod vulkan_compute_profile;
 mod vulkan_vector;
 
 pub use analysis::{EffectiveCacheTier, SweepPoint, detect_effective_cache_tiers};
@@ -146,6 +147,10 @@ impl GpuBandwidthProvider {
             );
             properties.insert("timestamp_queries".into(), timestamp_queries.to_string());
             properties.insert("shader_f16".into(), vulkan.shader_float16.to_string());
+            properties.insert(
+                "storage_buffer_16bit_access".into(),
+                vulkan.storage_buffer_16bit_access.to_string(),
+            );
             properties.insert("shader_f64".into(), vulkan.shader_float64.to_string());
             properties.insert("shader_int8".into(), vulkan.shader_int8.to_string());
             properties.insert(
@@ -179,6 +184,10 @@ impl GpuBandwidthProvider {
             properties.insert(
                 "max_storage_buffer_binding_size".into(),
                 vulkan.max_storage_buffer_range.to_string(),
+            );
+            properties.insert(
+                "device_local_memory_bytes".into(),
+                vulkan.device_local_memory_bytes.to_string(),
             );
             devices.push(DeviceDescriptor {
                 id: id.clone(),
@@ -761,7 +770,7 @@ impl BenchmarkProvider for GpuBandwidthProvider {
             CACHE_ID => self.run_cache(adapter_index, config, cancellation, progress),
             VRAM_ID => self.run_vram(adapter_index, config, cancellation, progress),
             HOST_LINK_ID => self.run_host_link(adapter_index, config, cancellation, progress),
-            _ if compute::kind(benchmark_id).is_some() => compute::run(
+            _ if compute::is_benchmark(benchmark_id) => compute::run(
                 &self.adapters[adapter_index],
                 benchmark_id,
                 config,
@@ -961,7 +970,9 @@ mod tests {
                 "gpu.performance.fp16",
                 "gpu.performance.fp32",
                 "gpu.performance.fp64",
+                "gpu.performance.fp32.scaling",
                 cooperative_matrix::FP16_MATRIX_ID,
+                cooperative_matrix::FP16_MATRIX_SCALING_ID,
                 cooperative_matrix::INT8_MATRIX_ID,
                 cooperative_matrix::FP8_MATRIX_ID,
                 cooperative_matrix::SPARSE_FP16_MATRIX_ID,

@@ -1,0 +1,50 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint MATRIX_M = 16;
+layout(constant_id = 1) const uint MATRIX_N = 16;
+layout(constant_id = 2) const uint MATRIX_K = 16;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputA {
+    float16_t values_a[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer InputB {
+    float16_t values_b[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    float output_values[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint tile_count;
+    uint tile_iterations;
+    uint reuse_count;
+    uint total_subgroups;
+} params;
+
+void main() {
+    uint subgroup_index = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    coopmat<float, gl_ScopeSubgroup, MATRIX_M, MATRIX_N, gl_MatrixUseAccumulator> result =
+        coopmat<float, gl_ScopeSubgroup, MATRIX_M, MATRIX_N, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint sweep = 0; sweep < params.tile_iterations; ++sweep) {
+        uint tile_index = (subgroup_index + sweep * params.total_subgroups) % params.tile_count;
+        uint base_a = tile_index * MATRIX_M * MATRIX_K;
+        uint base_b = tile_index * MATRIX_K * MATRIX_N;
+        coopmat<float16_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_K, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, MATRIX_K, MATRIX_N, gl_MatrixUseB> b;
+        coopMatLoad(a, values_a, base_a, MATRIX_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, values_b, base_b, MATRIX_N, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint reuse = 0; reuse < params.reuse_count; ++reuse) {
+            result = coopMatMulAdd(a, b, result);
+        }
+    }
+
+    uint output_base = subgroup_index * MATRIX_M * MATRIX_N;
+    coopMatStore(result, output_values, output_base, MATRIX_N, gl_CooperativeMatrixLayoutRowMajor);
+}

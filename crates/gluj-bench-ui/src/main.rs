@@ -2,7 +2,7 @@
 
 use gluj_bench_core::{
     BenchmarkCategory, BenchmarkDescriptor, BenchmarkResult, DeviceCategory, DeviceDescriptor,
-    PROTOCOL_VERSION,
+    Metric, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ use std::{
 
 slint::include_modules!();
 
-const HARDWARE_METADATA_CACHE_VERSION: u32 = 7;
+const HARDWARE_METADATA_CACHE_VERSION: u32 = 9;
 const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
 const BENCHMARK_SAMPLES: u32 = 5;
 
@@ -694,7 +694,7 @@ impl App {
             .results
             .iter()
             .rev()
-            .map(|result| result_row(result, &app.devices))
+            .map(|result| result_row(result, &app.devices, &app.benchmarks))
             .collect();
         window.set_results(ModelRc::new(VecModel::from(results)));
     }
@@ -784,31 +784,52 @@ fn suite_description(suite: &str) -> &'static str {
         }
         "gpu.bandwidth" => "Estimated cache, GPU-local memory, and host-device bandwidth.",
         "gpu.performance" => {
-            "Vector shader and cooperative-matrix throughput, capability-gated per format."
+            "Register throughput, working-set scaling, and capability-gated matrix performance."
         }
         _ => "Select a benchmark suite.",
     }
 }
-fn result_row(result: &BenchmarkResult, devices: &[DeviceDescriptor]) -> ResultRow {
+fn result_row(
+    result: &BenchmarkResult,
+    devices: &[DeviceDescriptor],
+    benchmarks: &[BenchmarkDescriptor],
+) -> ResultRow {
     let primary = result.metrics.first();
-    let secondary_metrics = result
-        .metrics
+    let title = benchmarks
         .iter()
-        .skip(1)
-        .map(|metric| {
-            format!(
-                "{}: {}",
-                metric.name,
-                format_metric(metric.value, &metric.unit)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let diagnosis = result
-        .workload_metadata
-        .get("bound_classification")
-        .map(|s| format!("Bound diagnosis: {}", s.replace('_', " ")))
-        .unwrap_or_else(|| "Five-sample statistics recorded.".into());
+        .find(|benchmark| benchmark.id == result.benchmark_id)
+        .map(|benchmark| benchmark.name.as_str())
+        .unwrap_or(result.benchmark_id.as_str());
+    let diagnosis = if result.benchmark_id.ends_with(".scaling") {
+        match (
+            result
+                .workload_metadata
+                .get("bandwidth_transition_status")
+                .map(String::as_str),
+            result
+                .workload_metadata
+                .get("bandwidth_transition_working_set_bytes")
+                .and_then(|value| value.parse::<f64>().ok()),
+            result
+                .workload_metadata
+                .get("bandwidth_transition_retained_ratio")
+                .and_then(|value| value.parse::<f64>().ok()),
+        ) {
+            (Some("observed"), Some(bytes), Some(ratio)) => format!(
+                "Bandwidth influence begins near {}; compute retained {:.1}% of the small-working-set baseline.",
+                format_metric(bytes, "bytes"),
+                ratio * 100.0
+            ),
+            _ => "No sustained bandwidth transition was observed within the tested working-set range."
+                .into(),
+        }
+    } else {
+        result
+            .workload_metadata
+            .get("bound_classification")
+            .map(|s| format!("Bound diagnosis: {}", s.replace('_', " ")))
+            .unwrap_or_else(|| "Sample statistics recorded.".into())
+    };
     let details = result
         .workload_metadata
         .iter()
@@ -822,37 +843,32 @@ fn result_row(result: &BenchmarkResult, devices: &[DeviceDescriptor]) -> ResultR
         .find(|device| device.id == result.device_id)
         .map(|device| device.name.as_str())
         .unwrap_or(result.device_id.as_str());
+    let facts = result_facts(result, primary);
     ResultRow {
-        title: result.benchmark_id.as_str().into(),
+        title: title.into(),
         device: device.into(),
         elapsed: format!("{:.2} ms", result.elapsed_ns as f64 / 1e6).into(),
         primary_name: primary
-            .map(|metric| metric.name.as_str())
-            .unwrap_or("No metric reported")
+            .map(|metric| display_metric_name(&metric.name))
+            .unwrap_or_else(|| "No metric reported".into())
             .into(),
         primary_value: primary
             .map(|metric| format_metric(metric.value, &metric.unit))
             .unwrap_or_else(|| "N/A".into())
             .into(),
-        statistics: primary
-            .map(|metric| {
-                format!(
-                    "{} samples | min {} | median {} | max {} | variation {:.2}",
-                    metric.statistics.sample_count,
-                    format_metric(metric.statistics.minimum, &metric.unit),
-                    format_metric(metric.statistics.median, &metric.unit),
-                    format_metric(metric.statistics.maximum, &metric.unit),
-                    metric.statistics.standard_deviation
-                )
-            })
-            .unwrap_or_else(|| "No sample statistics reported.".into())
+        sample_count: primary
+            .map(|metric| format!("{} samples", metric.statistics.sample_count))
+            .unwrap_or_else(|| "No samples".into())
             .into(),
-        secondary_metrics: if secondary_metrics.is_empty() {
-            "No secondary metrics reported."
-        } else {
-            &secondary_metrics
-        }
-        .into(),
+        fact_one_label: facts[0].0.as_str().into(),
+        fact_one_value: facts[0].1.as_str().into(),
+        fact_two_label: facts[1].0.as_str().into(),
+        fact_two_value: facts[1].1.as_str().into(),
+        fact_three_label: facts[2].0.as_str().into(),
+        fact_three_value: facts[2].1.as_str().into(),
+        fact_four_label: facts[3].0.as_str().into(),
+        fact_four_value: facts[3].1.as_str().into(),
+        summary: result_summary(result).into(),
         diagnosis: diagnosis.into(),
         details: if details.is_empty() {
             "No additional workload metadata reported."
@@ -860,6 +876,218 @@ fn result_row(result: &BenchmarkResult, devices: &[DeviceDescriptor]) -> ResultR
             &details
         }
         .into(),
+    }
+}
+
+fn result_facts(result: &BenchmarkResult, primary: Option<&Metric>) -> [(String, String); 4] {
+    if result.benchmark_id.ends_with(".scaling") {
+        return scaling_facts(result);
+    }
+    let consistency = primary.map_or_else(
+        || "Not available".into(),
+        |metric| {
+            if metric.statistics.sample_count < 2 || metric.statistics.median == 0.0 {
+                return "Single sample".into();
+            }
+            let variation =
+                metric.statistics.standard_deviation.abs() / metric.statistics.median.abs() * 100.0;
+            let rating = if variation < 1.0 {
+                "Excellent"
+            } else if variation < 3.0 {
+                "Good"
+            } else if variation < 7.0 {
+                "Fair"
+            } else {
+                "Variable"
+            };
+            format!("{rating} / {variation:.1}%")
+        },
+    );
+    let (workload_label, workload_value) = matrix_shape(result)
+        .map(|shape| ("MATRIX TILE".into(), shape))
+        .or_else(|| {
+            metadata_size(result, "working_set_bytes").map(|size| ("WORKING SET".into(), size))
+        })
+        .unwrap_or_else(|| {
+            (
+                "DATA TYPE".into(),
+                result
+                    .workload_metadata
+                    .get("data_type")
+                    .cloned()
+                    .unwrap_or_else(|| "Workload-specific".into())
+                    .to_uppercase(),
+            )
+        });
+    let (analysis_label, analysis_value) =
+        if let Some(value) = result.workload_metadata.get("bound_classification") {
+            (
+                "LIMITING FACTOR".into(),
+                match value.as_str() {
+                    "compute_bound" => "Compute".into(),
+                    "memory_bandwidth_bound" => "Memory bandwidth".into(),
+                    _ => value.replace('_', " "),
+                },
+            )
+        } else if let Some(status) = result.workload_metadata.get("cache_discovery_status") {
+            ("CACHE PROFILE".into(), status.replace('_', " "))
+        } else {
+            let count = result.metrics.len();
+            (
+                "MEASUREMENTS".into(),
+                format!("{count} {}", if count == 1 { "output" } else { "outputs" }),
+            )
+        };
+    let execution = result
+        .workload_metadata
+        .get("api")
+        .or_else(|| result.workload_metadata.get("execution_backend"))
+        .map(|value| match value.as_str() {
+            "VK_KHR_cooperative_matrix" => "Vulkan matrix".into(),
+            "raw-vulkan" => "Raw Vulkan".into(),
+            _ => value.replace('_', " "),
+        })
+        .unwrap_or_else(|| "Native".into());
+    [
+        ("CONSISTENCY".into(), consistency),
+        (workload_label, workload_value),
+        (analysis_label, analysis_value),
+        ("EXECUTION".into(), execution),
+    ]
+}
+
+fn scaling_facts(result: &BenchmarkResult) -> [(String, String); 4] {
+    let tiers = scaling_compute_tiers(result);
+    let peak = tiers
+        .iter()
+        .copied()
+        .max_by(|(_, left), (_, right)| left.value.total_cmp(&right.value));
+    let transition_size = result
+        .workload_metadata
+        .get("bandwidth_transition_working_set_bytes")
+        .and_then(|value| value.parse::<f64>().ok());
+    let largest = tiers.last().copied();
+    let peak_value = peak.map(|(_, metric)| metric.value).unwrap_or(0.0);
+    let largest_retained = largest.and_then(|(_, metric)| {
+        (peak_value > 0.0).then_some((metric.value / peak_value * 100.0).clamp(0.0, 999.0))
+    });
+    [
+        (
+            peak.map(|(bytes, _)| format!("PEAK @ {}", format_binary_size(bytes as f64)))
+                .unwrap_or_else(|| "PEAK OUTPUT".into()),
+            peak.map(|(_, metric)| format_metric(metric.value, &metric.unit))
+                .unwrap_or_else(|| "N/A".into()),
+        ),
+        (
+            "LARGEST TESTED".into(),
+            largest
+                .map(|(bytes, _)| format_binary_size(bytes as f64))
+                .unwrap_or_else(|| "N/A".into()),
+        ),
+        (
+            "DEGRADATION BEGINS".into(),
+            transition_size
+                .map(format_binary_size)
+                .unwrap_or_else(|| "Not observed".into()),
+        ),
+        (
+            largest_retained
+                .map(|retained| format!("AT LARGEST / {retained:.1}% PEAK"))
+                .unwrap_or_else(|| "AT LARGEST".into()),
+            largest
+                .map(|(_, metric)| format_metric(metric.value, &metric.unit))
+                .unwrap_or_else(|| "N/A".into()),
+        ),
+    ]
+}
+
+fn scaling_compute_tiers(result: &BenchmarkResult) -> Vec<(u64, &Metric)> {
+    result
+        .metrics
+        .iter()
+        .filter_map(|metric| {
+            metric
+                .name
+                .strip_prefix("working_set_")
+                .and_then(|rest| rest.strip_suffix(".compute"))
+                .and_then(|bytes| bytes.parse::<u64>().ok())
+                .map(|bytes| (bytes, metric))
+        })
+        .collect()
+}
+
+fn matrix_shape(result: &BenchmarkResult) -> Option<String> {
+    Some(format!(
+        "{}x{}x{}",
+        result.workload_metadata.get("matrix_m")?,
+        result.workload_metadata.get("matrix_n")?,
+        result.workload_metadata.get("matrix_k")?
+    ))
+}
+
+fn metadata_size(result: &BenchmarkResult, key: &str) -> Option<String> {
+    result
+        .workload_metadata
+        .get(key)?
+        .parse::<f64>()
+        .ok()
+        .map(format_binary_size)
+}
+
+fn result_summary(result: &BenchmarkResult) -> String {
+    if result.benchmark_id.ends_with(".scaling") {
+        let compute_tiers = scaling_compute_tiers(result);
+        if let (Some(first), Some(last)) = (compute_tiers.first(), compute_tiers.last()) {
+            let tier_label = if compute_tiers.len() == 1 {
+                "tier"
+            } else {
+                "tiers"
+            };
+            let peak = compute_tiers
+                .iter()
+                .map(|(_, metric)| metric.value)
+                .fold(0.0_f64, f64::max);
+            let retained = if peak > 0.0 {
+                (last.1.value / peak * 100.0).clamp(0.0, 999.0)
+            } else {
+                0.0
+            };
+            return format!(
+                "{} {tier_label} tested from {} to {} | largest set: {} ({retained:.1}% of peak)",
+                compute_tiers.len(),
+                format_binary_size(first.0 as f64),
+                format_binary_size(last.0 as f64),
+                format_metric(last.1.value, &last.1.unit)
+            );
+        }
+    }
+    let secondary = result
+        .metrics
+        .iter()
+        .skip(1)
+        .take(3)
+        .map(|metric| {
+            format!(
+                "{} {}",
+                display_metric_name(&metric.name),
+                format_metric(metric.value, &metric.unit)
+            )
+        })
+        .collect::<Vec<_>>();
+    if secondary.is_empty() {
+        "Primary workload result; configuration and capability context are available in measurement details."
+            .into()
+    } else {
+        let remaining = result.metrics.len().saturating_sub(1 + secondary.len());
+        format!(
+            "Also measured: {}{}",
+            secondary.join(" | "),
+            if remaining > 0 {
+                format!(" | +{remaining} more")
+            } else {
+                String::new()
+            }
+        )
     }
 }
 fn worker_path() -> PathBuf {
@@ -908,6 +1136,7 @@ fn save_metadata_cache(
 }
 fn format_metric(value: f64, unit: &str) -> String {
     match unit {
+        "bytes" => format_binary_size(value),
         "bytes/s" => format!("{:.2} GB/s", value / 1e9),
         "operations/s" => readable_rate(value, "OPS"),
         "MB/s" => format!("{value:.2} MB/s"),
@@ -915,6 +1144,39 @@ fn format_metric(value: f64, unit: &str) -> String {
         "primes/s" => readable_rate(value, "primes/s"),
         _ => format!("{value:.2} {unit}"),
     }
+}
+
+fn format_binary_size(bytes: f64) -> String {
+    if bytes >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2} GiB", bytes / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024.0 * 1024.0 {
+        format!("{:.2} MiB", bytes / (1024.0 * 1024.0))
+    } else if bytes >= 1024.0 {
+        format!("{:.2} KiB", bytes / 1024.0)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn display_metric_name(name: &str) -> String {
+    if name == "cache_resident_compute" {
+        return "Small-working-set compute baseline".into();
+    }
+    if name == "bandwidth_transition_working_set" {
+        return "Detected bandwidth transition".into();
+    }
+    if let Some(rest) = name.strip_prefix("working_set_")
+        && let Some((bytes, kind)) = rest.split_once('.')
+        && let Ok(bytes) = bytes.parse::<f64>()
+    {
+        let label = if kind == "compute" {
+            "compute"
+        } else {
+            "effective traffic"
+        };
+        return format!("{} {label}", format_binary_size(bytes));
+    }
+    name.replace('_', " ")
 }
 fn readable_rate(value: f64, suffix: &str) -> String {
     let (scale, prefix) = if value >= 1e12 {
@@ -947,6 +1209,7 @@ mod tests {
             format_metric(3_200_000_000_000.0, "operations/s"),
             "3.20 TOPS"
         );
+        assert_eq!(format_metric(8.0 * 1024.0 * 1024.0, "bytes"), "8.00 MiB");
     }
 
     #[test]
@@ -1051,14 +1314,84 @@ mod tests {
             properties: BTreeMap::new(),
             caches: vec![],
         };
-        let row = result_row(&result, &[device]);
+        let row = result_row(&result, &[device], &[]);
         assert_eq!(row.device.as_str(), "Integrated GPU");
-        assert!(row.statistics.as_str().contains("5 samples"));
+        assert_eq!(row.sample_count.as_str(), "5 samples");
+        assert_eq!(row.fact_one_label.as_str(), "CONSISTENCY");
+        assert_eq!(row.fact_one_value.as_str(), "Excellent / 0.0%");
         assert!(
             row.details
                 .as_str()
                 .contains("cache_discovery_status: not_detected")
         );
+    }
+
+    #[test]
+    fn compute_profile_result_explains_the_detected_transition() {
+        let stats = SampleStatistics {
+            sample_count: 3,
+            minimum: 49e12,
+            median: 50e12,
+            maximum: 51e12,
+            standard_deviation: 1e12,
+        };
+        let result = BenchmarkResult {
+            benchmark_id: "gpu.performance.fp32.scaling".into(),
+            device_id: "gpu:one".into(),
+            elapsed_ns: 1,
+            metrics: vec![
+                Metric {
+                    name: "cache_resident_compute".into(),
+                    value: 50e12,
+                    unit: "operations/s".into(),
+                    statistics: stats.clone(),
+                },
+                Metric {
+                    name: "working_set_4194304.compute".into(),
+                    value: 52e12,
+                    unit: "operations/s".into(),
+                    statistics: stats.clone(),
+                },
+                Metric {
+                    name: "working_set_8388608.compute".into(),
+                    value: 43e12,
+                    unit: "operations/s".into(),
+                    statistics: stats.clone(),
+                },
+                Metric {
+                    name: "working_set_536870912.compute".into(),
+                    value: 39e12,
+                    unit: "operations/s".into(),
+                    statistics: stats,
+                },
+            ],
+            workload_metadata: BTreeMap::from([
+                ("bandwidth_transition_status".into(), "observed".into()),
+                (
+                    "bandwidth_transition_working_set_bytes".into(),
+                    "8388608".into(),
+                ),
+                ("bandwidth_transition_retained_ratio".into(), "0.86".into()),
+            ]),
+            device_metadata: BTreeMap::new(),
+        };
+        let row = result_row(&result, &[], &[]);
+        assert_eq!(
+            row.primary_name.as_str(),
+            "Small-working-set compute baseline"
+        );
+        assert!(row.diagnosis.as_str().contains("8.00 MiB"));
+        assert!(row.diagnosis.as_str().contains("86.0%"));
+        assert!(row.summary.as_str().contains("3 tiers"));
+        assert!(row.summary.as_str().contains("512.00 MiB"));
+        assert!(row.summary.as_str().contains("75.0% of peak"));
+        assert_eq!(row.fact_one_label.as_str(), "PEAK @ 4.00 MiB");
+        assert_eq!(row.fact_one_value.as_str(), "52.00 TOPS");
+        assert_eq!(row.fact_two_label.as_str(), "LARGEST TESTED");
+        assert_eq!(row.fact_two_value.as_str(), "512.00 MiB");
+        assert_eq!(row.fact_three_value.as_str(), "8.00 MiB");
+        assert_eq!(row.fact_four_label.as_str(), "AT LARGEST / 75.0% PEAK");
+        assert_eq!(row.fact_four_value.as_str(), "39.00 TOPS");
     }
 
     #[test]

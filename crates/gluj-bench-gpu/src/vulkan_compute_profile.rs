@@ -1,17 +1,17 @@
-use crate::{AdapterRecord, WORKGROUP_SIZE, compute::ComputeKind};
+use crate::{AdapterRecord, WORKGROUP_SIZE};
 use ash::{Entry, vk};
 use gluj_bench_core::BenchmarkError;
 
-const FP16_SPV: &[u8] = include_bytes!("../shaders/spv/vector_fp16.spv");
-const FP32_SPV: &[u8] = include_bytes!("../shaders/spv/vector_fp32.spv");
-const FP64_SPV: &[u8] = include_bytes!("../shaders/spv/vector_fp64.spv");
+const PROFILE_SPV: &[u8] = include_bytes!("../shaders/spv/compute_profile_fp32.spv");
+const BYTES_PER_ELEMENT: u64 = 48;
+const OPERATIONS_PER_LOOP_PER_ELEMENT: u64 = 64;
 
 struct Buffer {
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
 }
 
-pub(super) struct VulkanVectorHarness {
+pub(super) struct VulkanComputeProfileHarness {
     _entry: Entry,
     instance: ash::Instance,
     device: ash::Device,
@@ -24,39 +24,40 @@ pub(super) struct VulkanVectorHarness {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     query_pool: vk::QueryPool,
+    input_a: Buffer,
+    input_b: Buffer,
     output: Buffer,
     timestamp_period_ns: f64,
     timestamp_valid_bits: u32,
-    workgroups: u32,
-    loop_count: u32,
-    pub output_size: u64,
+    pub maximum_working_set_bytes: u64,
 }
 
-impl VulkanVectorHarness {
-    pub fn new(
-        record: &AdapterRecord,
-        kind: ComputeKind,
-        workgroups: u32,
-        loop_count: u32,
-    ) -> Result<Self, BenchmarkError> {
-        // SAFETY: every created Vulkan handle is owned by the returned harness and destroyed
-        // in reverse dependency order by Drop.
-        unsafe { Self::new_inner(record, kind, workgroups, loop_count) }
+impl VulkanComputeProfileHarness {
+    pub fn new(record: &AdapterRecord, requested_working_set: u64) -> Result<Self, BenchmarkError> {
+        // SAFETY: every Vulkan handle is owned by the returned harness and destroyed by Drop.
+        unsafe { Self::new_inner(record, requested_working_set) }
     }
 
     unsafe fn new_inner(
         record: &AdapterRecord,
-        kind: ComputeKind,
-        workgroups: u32,
-        loop_count: u32,
+        requested_working_set: u64,
     ) -> Result<Self, BenchmarkError> {
+        let element_count = requested_working_set / BYTES_PER_ELEMENT;
+        let per_buffer_size = element_count * 16;
+        if element_count < WORKGROUP_SIZE || element_count > u32::MAX as u64 {
+            return Err(BenchmarkError::new(
+                "invalid_working_set",
+                "The compute-profile working set is outside the supported shader index range.",
+            ));
+        }
+        let maximum_working_set_bytes = element_count * BYTES_PER_ELEMENT;
         let entry = unsafe { Entry::load() }
             .map_err(|problem| error("vulkan_loader_unavailable", problem))?;
-        let app_name = c"Gluj-Bench";
+        let app = c"Gluj-Bench";
         let app_info = vk::ApplicationInfo::default()
-            .application_name(app_name)
+            .application_name(app)
             .application_version(1)
-            .engine_name(app_name)
+            .engine_name(app)
             .engine_version(1)
             .api_version(record.vulkan.api_version.min(vk::API_VERSION_1_3));
         let instance = unsafe {
@@ -66,7 +67,6 @@ impl VulkanVectorHarness {
             )
         }
         .map_err(|problem| error("vulkan_instance_failed", problem))?;
-
         let physical_device =
             match unsafe { find_physical_device(&instance, &record.vulkan.device_uuid) } {
                 Ok(device) => device,
@@ -75,21 +75,17 @@ impl VulkanVectorHarness {
                     return Err(problem);
                 }
             };
-        let priority = [1.0_f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
+        let priorities = [1.0_f32];
+        let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(record.vulkan.compute_queue_family)
-            .queue_priorities(&priority)];
-        let mut core_features = vk::PhysicalDeviceFeatures::default();
-        if kind == ComputeKind::Fp64 {
-            core_features.shader_float64 = vk::TRUE;
-        }
-        let mut float16_features = vk::PhysicalDeviceShaderFloat16Int8Features::default()
-            .shader_float16(kind == ComputeKind::Fp16);
-        let device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_info)
-            .enabled_features(&core_features)
-            .push_next(&mut float16_features);
-        let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
+            .queue_priorities(&priorities)];
+        let device = match unsafe {
+            instance.create_device(
+                physical_device,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                None,
+            )
+        } {
             Ok(device) => device,
             Err(problem) => {
                 unsafe { instance.destroy_instance(None) };
@@ -97,48 +93,44 @@ impl VulkanVectorHarness {
             }
         };
         let queue = unsafe { device.get_device_queue(record.vulkan.compute_queue_family, 0) };
-
-        let output_size = workgroups as u64 * WORKGROUP_SIZE * 16;
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let input_a =
+            unsafe { create_buffer(&instance, &device, physical_device, per_buffer_size, usage) }?;
+        let input_b =
+            unsafe { create_buffer(&instance, &device, physical_device, per_buffer_size, usage) }?;
         let output =
-            match unsafe { create_device_buffer(&instance, &device, physical_device, output_size) }
-            {
-                Ok(buffer) => buffer,
-                Err(problem) => {
-                    unsafe { device.destroy_device(None) };
-                    unsafe { instance.destroy_instance(None) };
-                    return Err(problem);
-                }
-            };
-
-        let descriptor_binding = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+            unsafe { create_buffer(&instance, &device, physical_device, per_buffer_size, usage) }?;
+        let bindings = [0_u32, 1, 2].map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
         let descriptor_layout = unsafe {
             device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_binding),
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }
         .map_err(|problem| error("vulkan_descriptor_layout_failed", problem))?;
-        let push_range = [vk::PushConstantRange::default()
+        let set_layouts = [descriptor_layout];
+        let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
             .size(16)];
-        let set_layouts = [descriptor_layout];
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
-                    .push_constant_ranges(&push_range),
+                    .push_constant_ranges(&push_ranges),
                 None,
             )
         }
         .map_err(|problem| error("vulkan_pipeline_layout_failed", problem))?;
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)];
+            .descriptor_count(3)];
         let descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -156,34 +148,36 @@ impl VulkanVectorHarness {
             )
         }
         .map_err(|problem| error("vulkan_descriptor_set_failed", problem))?[0];
-        let buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(output.handle)
-            .offset(0)
-            .range(output_size)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&buffer_info)];
+        let buffer_infos = [input_a.handle, input_b.handle, output.handle].map(|buffer| {
+            vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .range(per_buffer_size)
+        });
+        let writes = [0_u32, 1, 2].map(|binding| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[binding as usize]))
+        });
         unsafe { device.update_descriptor_sets(&writes, &[]) };
-
-        let shader_words = shader_words(kind)?;
+        let words = shader_words()?;
         let shader = unsafe {
-            device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&shader_words),
-                None,
-            )
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
         }
         .map_err(|problem| error("vulkan_shader_module_failed", problem))?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(c"main");
-        let pipeline_info = [vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(pipeline_layout)];
         let pipeline_result = unsafe {
-            device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout)],
+                None,
+            )
         };
         unsafe { device.destroy_shader_module(shader, None) };
         let pipeline = pipeline_result
@@ -215,8 +209,7 @@ impl VulkanVectorHarness {
             )
         }
         .map_err(|problem| error("vulkan_command_buffer_failed", problem))?[0];
-
-        Ok(Self {
+        let harness = Self {
             _entry: entry,
             instance,
             device,
@@ -229,35 +222,74 @@ impl VulkanVectorHarness {
             pipeline_layout,
             pipeline,
             query_pool,
+            input_a,
+            input_b,
             output,
             timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
             timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
-            workgroups,
-            loop_count,
-            output_size,
-        })
+            maximum_working_set_bytes,
+        };
+        harness.initialize(per_buffer_size)?;
+        Ok(harness)
     }
 
-    pub fn operations_per_dispatch(&self) -> u64 {
-        self.workgroups as u64 * WORKGROUP_SIZE * self.loop_count as u64 * 64
-    }
-
-    pub fn measure(&self, iterations: u32) -> Result<f64, BenchmarkError> {
-        let invocation_count = self.workgroups.saturating_mul(WORKGROUP_SIZE as u32);
-        let params = parameters(self.loop_count, invocation_count);
-        // SAFETY: command buffer and all referenced objects belong to this live device and the
-        // queue is waited idle before the command pool is reused.
+    fn initialize(&self, per_buffer_size: u64) -> Result<(), BenchmarkError> {
+        // SAFETY: buffers have TRANSFER_DST usage and no benchmark submission is in flight.
         unsafe {
-            self.device
-                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
-                .map_err(|problem| error("vulkan_command_reset_failed", problem))?;
-            self.device
-                .begin_command_buffer(
-                    self.command_buffer,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .map_err(|problem| error("vulkan_command_begin_failed", problem))?;
+            self.begin()?;
+            self.device.cmd_fill_buffer(
+                self.command_buffer,
+                self.input_a.handle,
+                0,
+                per_buffer_size,
+                0x3f00_0000,
+            );
+            self.device.cmd_fill_buffer(
+                self.command_buffer,
+                self.input_b.handle,
+                0,
+                per_buffer_size,
+                0x3f00_0000,
+            );
+            self.device.cmd_fill_buffer(
+                self.command_buffer,
+                self.output.handle,
+                0,
+                per_buffer_size,
+                0,
+            );
+            self.submit()?;
+        }
+        Ok(())
+    }
+
+    pub fn actual_working_set(&self, requested: u64) -> u64 {
+        let elements =
+            (requested.min(self.maximum_working_set_bytes) / BYTES_PER_ELEMENT / WORKGROUP_SIZE)
+                * WORKGROUP_SIZE;
+        elements.max(WORKGROUP_SIZE) * BYTES_PER_ELEMENT
+    }
+
+    pub fn operations_per_dispatch(&self, working_set: u64, loop_count: u32) -> u64 {
+        (working_set / BYTES_PER_ELEMENT) * loop_count as u64 * OPERATIONS_PER_LOOP_PER_ELEMENT
+    }
+
+    pub fn traffic_bytes_per_dispatch(&self, working_set: u64) -> u64 {
+        working_set
+    }
+
+    pub fn measure(
+        &self,
+        working_set: u64,
+        loop_count: u32,
+        iterations: u32,
+    ) -> Result<f64, BenchmarkError> {
+        let element_count = (working_set / BYTES_PER_ELEMENT) as u32;
+        let workgroups = (element_count as u64).div_ceil(WORKGROUP_SIZE) as u32;
+        let params = parameters(loop_count, element_count);
+        // SAFETY: the command buffer and all referenced handles are owned by this harness.
+        unsafe {
+            self.begin()?;
             self.device
                 .cmd_reset_query_pool(self.command_buffer, self.query_pool, 0, 2);
             self.device.cmd_write_timestamp(
@@ -288,7 +320,7 @@ impl VulkanVectorHarness {
             );
             for _ in 0..iterations {
                 self.device
-                    .cmd_dispatch(self.command_buffer, self.workgroups, 1, 1);
+                    .cmd_dispatch(self.command_buffer, workgroups, 1, 1);
             }
             self.device.cmd_write_timestamp(
                 self.command_buffer,
@@ -296,17 +328,7 @@ impl VulkanVectorHarness {
                 self.query_pool,
                 1,
             );
-            self.device
-                .end_command_buffer(self.command_buffer)
-                .map_err(|problem| error("vulkan_command_end_failed", problem))?;
-            let command_buffers = [self.command_buffer];
-            let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-            self.device
-                .queue_submit(self.queue, &submits, vk::Fence::null())
-                .map_err(|problem| error("vulkan_queue_submit_failed", problem))?;
-            self.device
-                .queue_wait_idle(self.queue)
-                .map_err(|problem| error("vulkan_device_lost", problem))?;
+            self.submit()?;
             let mut timestamps = [0_u64; 2];
             self.device
                 .get_query_pool_results(
@@ -316,23 +338,55 @@ impl VulkanVectorHarness {
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                 )
                 .map_err(|problem| error("vulkan_timestamp_failed", problem))?;
-            let ticks = timestamp_delta(timestamps[0], timestamps[1], self.timestamp_valid_bits);
-            let elapsed_ns = ticks as f64 * self.timestamp_period_ns;
-            if elapsed_ns <= 0.0 || !elapsed_ns.is_finite() {
+            let elapsed = timestamp_delta(timestamps[0], timestamps[1], self.timestamp_valid_bits)
+                as f64
+                * self.timestamp_period_ns;
+            if elapsed <= 0.0 || !elapsed.is_finite() {
                 return Err(BenchmarkError::new(
                     "vulkan_timestamp_invalid",
-                    "The Vulkan timestamp interval was not finite and positive.",
+                    "The compute-profile timestamp was not finite and positive.",
                 ));
             }
-            Ok(elapsed_ns)
+            Ok(elapsed)
         }
+    }
+
+    unsafe fn begin(&self) -> Result<(), BenchmarkError> {
+        unsafe {
+            self.device
+                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+        }
+        .map_err(|problem| error("vulkan_command_reset_failed", problem))?;
+        unsafe {
+            self.device.begin_command_buffer(
+                self.command_buffer,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|problem| error("vulkan_command_begin_failed", problem))
+    }
+
+    unsafe fn submit(&self) -> Result<(), BenchmarkError> {
+        unsafe { self.device.end_command_buffer(self.command_buffer) }
+            .map_err(|problem| error("vulkan_command_end_failed", problem))?;
+        let buffers = [self.command_buffer];
+        unsafe {
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::default().command_buffers(&buffers)],
+                vk::Fence::null(),
+            )
+        }
+        .map_err(|problem| error("vulkan_queue_submit_failed", problem))?;
+        unsafe { self.device.queue_wait_idle(self.queue) }
+            .map_err(|problem| error("vulkan_device_lost", problem))
     }
 }
 
-impl Drop for VulkanVectorHarness {
+impl Drop for VulkanComputeProfileHarness {
     fn drop(&mut self) {
-        // SAFETY: all handles belong to this device/instance and are destroyed once, in reverse
-        // dependency order after waiting for submitted work.
+        // SAFETY: all resources are exclusively owned and the device is made idle first.
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_query_pool(self.query_pool, None);
@@ -344,12 +398,60 @@ impl Drop for VulkanVectorHarness {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
-            self.device.destroy_buffer(self.output.handle, None);
-            self.device.free_memory(self.output.memory, None);
+            for buffer in [&self.input_a, &self.input_b, &self.output] {
+                self.device.destroy_buffer(buffer.handle, None);
+                self.device.free_memory(buffer.memory, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
     }
+}
+
+unsafe fn create_buffer(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+) -> Result<Buffer, BenchmarkError> {
+    let handle = unsafe {
+        device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+    }
+    .map_err(|problem| error("vulkan_buffer_failed", problem))?;
+    let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
+    let properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let memory_type = (0..properties.memory_type_count)
+        .find(|index| {
+            requirements.memory_type_bits & (1 << index) != 0
+                && properties.memory_types[*index as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        })
+        .ok_or_else(|| {
+            BenchmarkError::new(
+                "vulkan_device_memory_unavailable",
+                "No device-local memory type can back the compute-profile buffers.",
+            )
+        })?;
+    let memory = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type),
+            None,
+        )
+    }
+    .map_err(|problem| error("vulkan_memory_allocation_failed", problem))?;
+    unsafe { device.bind_buffer_memory(handle, memory, 0) }
+        .map_err(|problem| error("vulkan_buffer_bind_failed", problem))?;
+    Ok(Buffer { handle, memory })
 }
 
 unsafe fn find_physical_device(
@@ -372,65 +474,14 @@ unsafe fn find_physical_device(
     ))
 }
 
-unsafe fn create_device_buffer(
-    instance: &ash::Instance,
-    device: &ash::Device,
-    physical_device: vk::PhysicalDevice,
-    size: u64,
-) -> Result<Buffer, BenchmarkError> {
-    let handle = unsafe {
-        device.create_buffer(
-            &vk::BufferCreateInfo::default()
-                .size(size)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE),
-            None,
-        )
-    }
-    .map_err(|problem| error("vulkan_buffer_failed", problem))?;
-    let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
-    let memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let memory_type_index = (0..memory_properties.memory_type_count)
-        .find(|index| {
-            requirements.memory_type_bits & (1 << index) != 0
-                && memory_properties.memory_types[*index as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        })
-        .ok_or_else(|| {
-            BenchmarkError::new(
-                "vulkan_device_memory_unavailable",
-                "No device-local Vulkan memory type can back the vector output buffer.",
-            )
-        })?;
-    let memory = unsafe {
-        device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type_index),
-            None,
-        )
-    }
-    .map_err(|problem| error("vulkan_memory_allocation_failed", problem))?;
-    unsafe { device.bind_buffer_memory(handle, memory, 0) }
-        .map_err(|problem| error("vulkan_buffer_bind_failed", problem))?;
-    Ok(Buffer { handle, memory })
-}
-
-fn shader_words(kind: ComputeKind) -> Result<Vec<u32>, BenchmarkError> {
-    let bytes = match kind {
-        ComputeKind::Fp16 => FP16_SPV,
-        ComputeKind::Fp32 => FP32_SPV,
-        ComputeKind::Fp64 => FP64_SPV,
-    };
-    if !bytes.len().is_multiple_of(4) {
+fn shader_words() -> Result<Vec<u32>, BenchmarkError> {
+    if !PROFILE_SPV.len().is_multiple_of(4) {
         return Err(BenchmarkError::new(
             "invalid_spirv",
-            "Embedded Vulkan shader byte length is not word-aligned.",
+            "Embedded compute-profile SPIR-V is not word-aligned.",
         ));
     }
-    Ok(bytes
+    Ok(PROFILE_SPV
         .as_chunks::<4>()
         .0
         .iter()
@@ -438,11 +489,11 @@ fn shader_words(kind: ComputeKind) -> Result<Vec<u32>, BenchmarkError> {
         .collect())
 }
 
-fn parameters(loop_count: u32, invocation_count: u32) -> [u8; 16] {
+fn parameters(loop_count: u32, element_count: u32) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
     bytes[0..4].copy_from_slice(&loop_count.to_le_bytes());
-    bytes[4..8].copy_from_slice(&0x9e37_79b9_u32.to_le_bytes());
-    bytes[8..12].copy_from_slice(&invocation_count.to_le_bytes());
+    bytes[4..8].copy_from_slice(&element_count.to_le_bytes());
+    bytes[8..12].copy_from_slice(&0x9e37_79b9_u32.to_le_bytes());
     bytes
 }
 
@@ -458,7 +509,6 @@ fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
 fn error(code: &str, problem: impl std::fmt::Display) -> BenchmarkError {
     BenchmarkError::new(code, problem.to_string())
 }
@@ -468,15 +518,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_shaders_are_spirv_modules() {
-        for kind in [ComputeKind::Fp16, ComputeKind::Fp32, ComputeKind::Fp64] {
-            assert_eq!(shader_words(kind).unwrap()[0], 0x0723_0203);
-        }
+    fn profile_shader_is_spirv() {
+        assert_eq!(shader_words().unwrap()[0], 0x0723_0203);
     }
 
     #[test]
-    fn timestamp_wrap_respects_valid_bit_count() {
-        assert_eq!(timestamp_delta(250, 3, 8), 9);
-        assert_eq!(timestamp_delta(10, 20, 64), 10);
+    fn accounting_matches_shader_contract() {
+        assert_eq!(BYTES_PER_ELEMENT, 48);
+        assert_eq!(OPERATIONS_PER_LOOP_PER_ELEMENT, 64);
     }
 }

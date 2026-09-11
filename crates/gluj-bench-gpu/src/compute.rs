@@ -2,16 +2,22 @@ use super::{
     AdapterRecord, GPU_PRECONDITION_MS, WORKGROUP_SIZE, common_metadata, device_metadata, done,
     duration_ns, ensure_not_cancelled, insert_clock_policy, per_sample_duration, statistics,
 };
+use crate::vulkan_compute_profile::VulkanComputeProfileHarness;
 use crate::vulkan_vector::VulkanVectorHarness;
 use gluj_bench_core::{
     BenchmarkCategory, BenchmarkConfig, BenchmarkDescriptor, BenchmarkError, BenchmarkResult,
-    CancellationToken, Metric, ProgressCallback, ProgressUpdate,
+    CancellationToken, Metric, ProgressCallback, ProgressUpdate, SampleStatistics,
 };
 use std::{collections::BTreeMap, time::Instant};
 
 const FP32_ID: &str = "gpu.performance.fp32";
 const FP16_ID: &str = "gpu.performance.fp16";
 const FP64_ID: &str = "gpu.performance.fp64";
+const FP32_SCALING_ID: &str = "gpu.performance.fp32.scaling";
+const PROFILE_LOOP_COUNT: u32 = 64;
+const PROFILE_MIN_SIZE: u64 = 256 * 1024;
+const PROFILE_MAX_SIZE: u64 = 512 * 1024 * 1024;
+const PROFILE_DROP_RATIO: f64 = 0.90;
 const LOOP_COUNT: u32 = 1024;
 const PROBE_LOOP_COUNT: u32 = 2048;
 const AUTOTUNE_LOOP_COUNT: u32 = 128;
@@ -78,8 +84,12 @@ pub(super) fn kind(id: &str) -> Option<ComputeKind> {
     KINDS.into_iter().find(|kind| kind.id() == id)
 }
 
+pub(super) fn is_benchmark(id: &str) -> bool {
+    kind(id).is_some() || id == FP32_SCALING_ID
+}
+
 pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor> {
-    KINDS
+    let mut descriptors = KINDS
         .into_iter()
         .enumerate()
         .map(|(index, kind)| {
@@ -127,7 +137,50 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
                 metadata,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let supported_device_ids = adapters
+        .iter()
+        .filter(|record| record.supports_vulkan_timestamps())
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let available = !supported_device_ids.is_empty();
+    descriptors.push(BenchmarkDescriptor {
+        id: FP32_SCALING_ID.into(),
+        name: "FP32 compute scaling profile".into(),
+        category: BenchmarkCategory::Gpu,
+        workload: "Memory-backed FP32 FMA throughput across increasing device-local working sets"
+            .into(),
+        data_type: "fp32".into(),
+        unit: "operations/s".into(),
+        supported_device_ids,
+        available,
+        unavailable_reason: if available {
+            ""
+        } else if adapters.is_empty() {
+            "adapter_not_found"
+        } else {
+            "timestamp_query_unsupported"
+        }
+        .into(),
+        suite_id: "gpu.performance".into(),
+        display_order: 103,
+        metadata: BTreeMap::from([
+            (
+                "execution_domain".into(),
+                "memory_backed_vector_compute".into(),
+            ),
+            ("profile_axis".into(), "working_set_bytes".into()),
+            (
+                "arithmetic_intensity".into(),
+                format!(
+                    "{:.4} operations/byte",
+                    PROFILE_LOOP_COUNT as f64 * 64.0 / 48.0
+                ),
+            ),
+            ("shader_format".into(), "embedded_spirv".into()),
+        ]),
+    });
+    descriptors
 }
 
 pub(super) fn run(
@@ -137,6 +190,9 @@ pub(super) fn run(
     cancellation: &CancellationToken,
     progress: &mut ProgressCallback<'_>,
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    if benchmark_id == FP32_SCALING_ID {
+        return run_fp32_scaling(record, config, cancellation, progress);
+    }
     let started = Instant::now();
     let kind = kind(benchmark_id).ok_or_else(|| {
         BenchmarkError::new(
@@ -284,6 +340,260 @@ pub(super) fn run(
     })
 }
 
+#[derive(Debug)]
+struct ProfilePoint {
+    working_set_bytes: u64,
+    compute: SampleStatistics,
+    bandwidth: SampleStatistics,
+    retained_ratio: f64,
+}
+
+fn run_fp32_scaling(
+    record: &AdapterRecord,
+    config: &BenchmarkConfig,
+    cancellation: &CancellationToken,
+    progress: &mut ProgressCallback<'_>,
+) -> Result<BenchmarkResult, BenchmarkError> {
+    let started = Instant::now();
+    ensure_not_cancelled(cancellation)?;
+    let loop_count = config
+        .options
+        .get("arithmetic_iterations")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(PROFILE_LOOP_COUNT)
+        .clamp(1, 1024);
+    let maximum = (record.vulkan.max_storage_buffer_range.saturating_mul(3)).min(PROFILE_MAX_SIZE);
+    let requested_sizes = profile_sizes(maximum);
+    if requested_sizes.len() < 3 {
+        return Err(BenchmarkError::new(
+            "insufficient_gpu_memory",
+            "At least three working-set tiers are required for a compute scaling profile.",
+        ));
+    }
+    progress(ProgressUpdate {
+        fraction: 0.01,
+        phase: "gpu_compute_profile_setup".into(),
+        message: format!(
+            "Allocating an FP32 profile working set up to {} MiB",
+            maximum / (1024 * 1024)
+        ),
+    });
+    let harness = VulkanComputeProfileHarness::new(record, maximum)?;
+    let sizes = requested_sizes
+        .into_iter()
+        .map(|size| harness.actual_working_set(size))
+        .collect::<Vec<_>>();
+    let sample_count = config.samples.clamp(2, 5);
+    let target_seconds =
+        (config.target_duration_ms as f64 / 1000.0 / sizes.len() as f64 / sample_count as f64)
+            .clamp(0.01, 0.10);
+    let arithmetic_intensity = loop_count as f64 * 64.0 / 48.0;
+    let mut raw_points = Vec::with_capacity(sizes.len());
+    for (index, working_set) in sizes.iter().copied().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        progress(ProgressUpdate {
+            fraction: 0.04 + index as f64 / sizes.len() as f64 * 0.91,
+            phase: "gpu_compute_profile_sweep".into(),
+            message: format!(
+                "Measuring FP32 compute with a {} working set ({}/{})",
+                format_size(working_set),
+                index + 1,
+                sizes.len()
+            ),
+        });
+        let _ = harness.measure(working_set, loop_count, 1)?;
+        let calibration_ns = harness.measure(working_set, loop_count, 1)?;
+        let iterations = iterations_for_target(calibration_ns, target_seconds);
+        let operations = harness.operations_per_dispatch(working_set, loop_count) as f64;
+        let traffic = harness.traffic_bytes_per_dispatch(working_set) as f64;
+        let mut compute_values = Vec::with_capacity(sample_count as usize);
+        let mut bandwidth_values = Vec::with_capacity(sample_count as usize);
+        for _ in 0..sample_count {
+            ensure_not_cancelled(cancellation)?;
+            let elapsed_ns = harness.measure(working_set, loop_count, iterations)?;
+            let seconds = elapsed_ns / 1e9;
+            compute_values.push(operations * iterations as f64 / seconds);
+            bandwidth_values.push(traffic * iterations as f64 / seconds);
+        }
+        raw_points.push((
+            working_set,
+            statistics(&compute_values),
+            statistics(&bandwidth_values),
+        ));
+    }
+    let (baseline, baseline_statistics) = raw_points
+        .iter()
+        .take(3)
+        .max_by(|(_, left, _), (_, right, _)| left.median.total_cmp(&right.median))
+        .map(|(_, compute, _)| (compute.median, compute.clone()))
+        .unwrap_or_default();
+    let points = raw_points
+        .into_iter()
+        .map(|(working_set_bytes, compute, bandwidth)| ProfilePoint {
+            working_set_bytes,
+            retained_ratio: (compute.median / baseline).clamp(0.0, 2.0),
+            compute,
+            bandwidth,
+        })
+        .collect::<Vec<_>>();
+    let transition_index = sustained_transition(&points);
+    let mut metrics = vec![Metric {
+        name: "cache_resident_compute".into(),
+        value: baseline,
+        unit: "operations/s".into(),
+        statistics: baseline_statistics,
+    }];
+    for point in &points {
+        metrics.push(Metric {
+            name: format!("working_set_{}.compute", point.working_set_bytes),
+            value: point.compute.median,
+            unit: "operations/s".into(),
+            statistics: point.compute.clone(),
+        });
+        metrics.push(Metric {
+            name: format!("working_set_{}.bandwidth", point.working_set_bytes),
+            value: point.bandwidth.median,
+            unit: "bytes/s".into(),
+            statistics: point.bandwidth.clone(),
+        });
+    }
+    if let Some(index) = transition_index {
+        metrics.push(Metric {
+            name: "bandwidth_transition_working_set".into(),
+            value: points[index].working_set_bytes as f64,
+            unit: "bytes".into(),
+            statistics: statistics(&[points[index].working_set_bytes as f64]),
+        });
+    }
+    let mut metadata = common_metadata(record, "vulkan_gpu_timestamp");
+    insert_clock_policy(&mut metadata);
+    metadata.insert("execution_backend".into(), "raw-vulkan".into());
+    metadata.insert(
+        "execution_domain".into(),
+        "memory_backed_vector_compute".into(),
+    );
+    metadata.insert("shader_format".into(), "embedded_spirv".into());
+    metadata.insert("shader_source_language".into(), "GLSL".into());
+    metadata.insert(
+        "compute_profile_revision".into(),
+        "working-set-sweep-1".into(),
+    );
+    metadata.insert("data_type".into(), "fp32".into());
+    metadata.insert("arithmetic_iterations".into(), loop_count.to_string());
+    metadata.insert(
+        "arithmetic_intensity_operations_per_byte".into(),
+        format!("{arithmetic_intensity:.4}"),
+    );
+    metadata.insert("bytes_per_element".into(), "48".into());
+    metadata.insert(
+        "byte_definition".into(),
+        "two_16_byte_input_reads_plus_one_16_byte_output_write".into(),
+    );
+    metadata.insert(
+        "baseline_operations_per_second".into(),
+        format!("{baseline:.0}"),
+    );
+    metadata.insert("tested_tier_count".into(), points.len().to_string());
+    metadata.insert(
+        "profile_sample_count_per_tier".into(),
+        sample_count.to_string(),
+    );
+    metadata.insert(
+        "transition_threshold".into(),
+        "two consecutive low-noise tiers below 90 percent of the small-set baseline with no later two-tier recovery".into(),
+    );
+    metadata.insert(
+        "bandwidth_transition_status".into(),
+        if transition_index.is_some() {
+            "observed"
+        } else {
+            "not_observed_within_tested_range"
+        }
+        .into(),
+    );
+    if let Some(index) = transition_index {
+        metadata.insert(
+            "bandwidth_transition_working_set_bytes".into(),
+            points[index].working_set_bytes.to_string(),
+        );
+        metadata.insert(
+            "bandwidth_transition_retained_ratio".into(),
+            format!("{:.4}", points[index].retained_ratio),
+        );
+    }
+    metadata.insert(
+        "compute_scaling_points".into(),
+        points
+            .iter()
+            .map(|point| {
+                format!(
+                    "{}:{:.0}:{:.0}:{:.4}",
+                    point.working_set_bytes,
+                    point.compute.median,
+                    point.bandwidth.median,
+                    point.retained_ratio
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    progress(done("FP32 compute scaling profile completed."));
+    let mut result_device_metadata = device_metadata(record);
+    result_device_metadata.insert("execution_backend".into(), "raw-vulkan".into());
+    Ok(BenchmarkResult {
+        benchmark_id: FP32_SCALING_ID.into(),
+        device_id: record.id.clone(),
+        elapsed_ns: duration_ns(started.elapsed()),
+        metrics,
+        workload_metadata: metadata,
+        device_metadata: result_device_metadata,
+    })
+}
+
+fn profile_sizes(maximum: u64) -> Vec<u64> {
+    let mut sizes = Vec::new();
+    let mut size = PROFILE_MIN_SIZE;
+    while size <= maximum {
+        sizes.push(size);
+        let Some(next) = size.checked_mul(2) else {
+            break;
+        };
+        size = next;
+    }
+    sizes
+}
+
+fn sustained_transition(points: &[ProfilePoint]) -> Option<usize> {
+    points.windows(2).enumerate().find_map(|(index, pair)| {
+        let is_drop = pair[0].retained_ratio < PROFILE_DROP_RATIO
+            && pair[1].retained_ratio < PROFILE_DROP_RATIO
+            && significant_drop(&pair[0])
+            && significant_drop(&pair[1]);
+        let later_recovery = points[index + 2..].windows(2).any(|recovery| {
+            recovery[0].retained_ratio >= PROFILE_DROP_RATIO
+                && recovery[1].retained_ratio >= PROFILE_DROP_RATIO
+        });
+        (is_drop && !later_recovery).then_some(index)
+    })
+}
+
+fn significant_drop(point: &ProfilePoint) -> bool {
+    let relative_noise = if point.compute.median > 0.0 {
+        point.compute.standard_deviation / point.compute.median
+    } else {
+        1.0
+    };
+    1.0 - point.retained_ratio > (relative_noise * 2.0).max(0.02)
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} KiB", bytes as f64 / 1024.0)
+    }
+}
+
 fn classify(sensitivity_ratio: f64) -> &'static str {
     if sensitivity_ratio < COMPUTE_BOUND_RATIO {
         "memory_bandwidth_bound"
@@ -341,12 +651,17 @@ mod tests {
     #[test]
     fn descriptors_keep_optional_hardware_types_visible() {
         let descriptors = descriptors(&[]);
-        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors.len(), 4);
         assert!(descriptors.iter().all(|descriptor| !descriptor.available));
         assert_eq!(descriptors[0].id, FP16_ID);
         assert_eq!(descriptors[1].id, FP32_ID);
         assert_eq!(descriptors[2].id, FP64_ID);
+        assert_eq!(descriptors[3].id, FP32_SCALING_ID);
         assert_eq!(descriptors[0].metadata.get("api").unwrap(), "Vulkan");
+        assert_eq!(
+            descriptors[3].metadata.get("profile_axis").unwrap(),
+            "working_set_bytes"
+        );
     }
 
     #[test]
@@ -366,5 +681,68 @@ mod tests {
     fn iteration_calibration_is_bounded() {
         assert_eq!(iterations_for_target(1_000_000.0, 1.0), 1000);
         assert_eq!(iterations_for_target(1.0, 10.0), 4096);
+    }
+
+    #[test]
+    fn profile_sizes_are_power_of_two_tiers_within_the_limit() {
+        assert_eq!(
+            profile_sizes(2 * 1024 * 1024),
+            vec![256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024]
+        );
+        assert!(profile_sizes(PROFILE_MIN_SIZE - 1).is_empty());
+    }
+
+    #[test]
+    fn transition_requires_two_consecutive_significant_drops() {
+        let point = |working_set_bytes, retained_ratio, noise| ProfilePoint {
+            working_set_bytes,
+            retained_ratio,
+            compute: SampleStatistics {
+                sample_count: 3,
+                minimum: 100.0 * (1.0 - noise),
+                median: 100.0,
+                maximum: 100.0 * (1.0 + noise),
+                standard_deviation: 100.0 * noise,
+            },
+            bandwidth: SampleStatistics::default(),
+        };
+        let isolated_drop = [
+            point(1, 1.0, 0.01),
+            point(2, 0.85, 0.01),
+            point(4, 0.95, 0.01),
+        ];
+        assert_eq!(sustained_transition(&isolated_drop), None);
+
+        let sustained_drop = [
+            point(1, 1.0, 0.01),
+            point(2, 0.85, 0.01),
+            point(4, 0.82, 0.01),
+        ];
+        assert_eq!(sustained_transition(&sustained_drop), Some(1));
+
+        let noisy_drop = [
+            point(1, 1.0, 0.01),
+            point(2, 0.85, 0.10),
+            point(4, 0.82, 0.01),
+        ];
+        assert_eq!(sustained_transition(&noisy_drop), None);
+
+        let noisy_confirmation = [
+            point(1, 1.0, 0.01),
+            point(2, 0.85, 0.01),
+            point(4, 0.82, 0.10),
+        ];
+        assert_eq!(sustained_transition(&noisy_confirmation), None);
+
+        let temporary_dip_then_recovery = [
+            point(1, 1.0, 0.01),
+            point(2, 0.82, 0.01),
+            point(4, 0.84, 0.01),
+            point(8, 0.96, 0.01),
+            point(16, 0.94, 0.01),
+            point(32, 0.70, 0.01),
+            point(64, 0.68, 0.01),
+        ];
+        assert_eq!(sustained_transition(&temporary_dip_then_recovery), Some(5));
     }
 }

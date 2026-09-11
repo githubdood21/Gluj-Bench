@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputA { vec4 values[]; } input_a;
+layout(set = 0, binding = 1, std430) readonly buffer InputB { vec4 values[]; } input_b;
+layout(set = 0, binding = 2, std430) writeonly buffer Output { vec4 values[]; } output_data;
+layout(push_constant) uniform Parameters {
+    uint loop_count;
+    uint element_count;
+    uint seed;
+    uint padding;
+} params;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.element_count) return;
+    vec4 x = input_a.values[index];
+    vec4 y = input_b.values[index];
+    float perturbation = float((index ^ params.seed) & 255u) * 0.000001;
+    vec4 a0=x+vec4(perturbation); vec4 a1=x+vec4(0.01); vec4 a2=x+vec4(0.02); vec4 a3=x+vec4(0.03);
+    vec4 a4=x+vec4(0.04); vec4 a5=x+vec4(0.05); vec4 a6=x+vec4(0.06); vec4 a7=x+vec4(0.07);
+    vec4 multiplier = y * vec4(0.000002) + vec4(0.999999);
+    for (uint iteration = 0; iteration < params.loop_count; ++iteration) {
+        a0=fma(a0,multiplier,vec4(0.000001)); a1=fma(a1,multiplier,vec4(0.000002));
+        a2=fma(a2,multiplier,vec4(0.000003)); a3=fma(a3,multiplier,vec4(0.000004));
+        a4=fma(a4,multiplier,vec4(0.000005)); a5=fma(a5,multiplier,vec4(0.000006));
+        a6=fma(a6,multiplier,vec4(0.000007)); a7=fma(a7,multiplier,vec4(0.000008));
+    }
+    output_data.values[index] = a0+a1+a2+a3+a4+a5+a6+a7;
+}

@@ -10,13 +10,28 @@ export struct BenchmarkRow {
 }
 export struct ResultRow {
     title: string, device: string, elapsed: string, primary-name: string,
-    primary-value: string, statistics: string, secondary-metrics: string,
-    diagnosis: string, details: string,
+    primary-value: string, sample-count: string,
+    fact-one-label: string, fact-one-value: string, fact-two-label: string, fact-two-value: string,
+    fact-three-label: string, fact-three-value: string, fact-four-label: string, fact-four-value: string,
+    summary: string, diagnosis: string, details: string,
 }
 
 component SectionTitle inherits Text { color: #f4f7fb; font-size: 25px; font-weight: 700; }
 component Surface inherits Rectangle { background: #151b26; border-color: #293448; border-width: 1px; border-radius: 14px; }
 component Label inherits Text { color: #8f9caf; font-size: 11px; font-weight: 700; }
+component StatTile inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    height: 50px;
+    background: #111722;
+    border-color: #263247;
+    border-width: 1px;
+    border-radius: 8px;
+    VerticalLayout { padding: 8px; spacing: 2px;
+        Text { text: root.label; color: #71809a; font-size: 9px; font-weight: 700; }
+        Text { text: root.value; color: #dbe3ee; font-size: 12px; font-weight: 650; }
+    }
+}
 
 export component MainWindow inherits Window {
     title: "Gluj-Bench";
@@ -133,7 +148,7 @@ export component MainWindow inherits Window {
                         Surface { height: 122px; vertical-stretch: 0; VerticalLayout { padding: 14px; spacing: 8px;
                             Label { text: "BENCHMARK SUITE"; }
                             HorizontalLayout { spacing: 7px; Button { text: "CPU bandwidth"; primary: root.suite-description == "Read, write, and copy bandwidth with per-operation sample statistics."; clicked => { root.select-suite("cpu.bandwidth"); } } Button { text: "CPU performance"; primary: root.suite-description == "Aggregate processor throughput, single-thread INT64, and compute-vs-memory diagnosis."; clicked => { root.select-suite("cpu.performance"); } } }
-                            HorizontalLayout { spacing: 7px; Button { text: "GPU bandwidth"; primary: root.suite-description == "Estimated cache, GPU-local memory, and host-device bandwidth."; clicked => { root.select-suite("gpu.bandwidth"); } } Button { text: "GPU performance"; primary: root.suite-description == "Vector shader and cooperative-matrix throughput, capability-gated per format."; clicked => { root.select-suite("gpu.performance"); } } }
+                            HorizontalLayout { spacing: 7px; Button { text: "GPU bandwidth"; primary: root.suite-description == "Estimated cache, GPU-local memory, and host-device bandwidth."; clicked => { root.select-suite("gpu.bandwidth"); } } Button { text: "GPU performance"; primary: root.suite-description == "Register throughput, working-set scaling, and capability-gated matrix performance."; clicked => { root.select-suite("gpu.performance"); } } }
                         } }
                         Text { text: root.suite-description; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                         benchmarks-scroll := ScrollView { vertical-stretch: 1; viewport-width: self.width; VerticalLayout { width: benchmarks-scroll.visible-width - 16px; spacing: 9px; alignment: start;
@@ -171,19 +186,20 @@ export component MainWindow inherits Window {
                     VerticalLayout { width: results-scroll.visible-width - 16px; spacing: 16px; alignment: start;
                         HorizontalLayout { height: 58px; vertical-stretch: 0; VerticalLayout { spacing: 4px; SectionTitle { text: "Results workspace"; } Text { text: "Session measurements with performance context and confidence."; color: #8f9caf; font-size: 13px; } } Rectangle { horizontal-stretch: 1; } Button { width: 126px; height: 36px; vertical-stretch: 0; text: "Clear session"; enabled: root.results.length > 0; clicked => { root.clear-results(); } } }
                         if root.results.length == 0: Surface { height: 205px; vertical-stretch: 0; VerticalLayout { padding: 26px; spacing: 10px; Text { text: "No measurements yet"; color: #f4f7fb; font-size: 22px; font-weight: 700; } Text { text: "Run a workload from Test Lab and its featured score, variability, and measurement context will appear here."; color: #9facbd; font-size: 13px; wrap: word-wrap; } Button { width: 150px; height: 36px; vertical-stretch: 0; text: "Open Test Lab"; primary: true; clicked => { root.select-page(1); } } } }
-                        if root.results.length > 0: Surface { height: root.result-details-expanded ? 274px : 220px; vertical-stretch: 0; background: #142331; border-color: #315d7a; VerticalLayout { padding: 20px; spacing: 7px;
+                        if root.results.length > 0: Surface { height: root.result-details-expanded ? 320px : 258px; vertical-stretch: 0; background: #142331; border-color: #315d7a; VerticalLayout { padding: 20px; spacing: 9px;
                             Label { text: "LATEST MEASUREMENT"; color: #73dcca; }
                             HorizontalLayout { VerticalLayout { spacing: 3px; Text { text: root.results[0].title; color: #f4f7fb; font-size: 18px; font-weight: 700; } Text { text: root.results[0].device + "  |  " + root.results[0].elapsed; color: #a5b4c7; font-size: 11px; } } Rectangle { horizontal-stretch: 1; } Text { text: root.results[0].primary-value; color: #70e4cc; font-size: 30px; font-weight: 800; } }
-                            Text { text: root.results[0].primary-name; color: #92a3b9; font-size: 11px; } Rectangle { height: 1px; background: #315069; }
-                            Text { text: root.results[0].statistics; color: #d1d9e4; font-size: 11px; wrap: word-wrap; } Text { text: root.results[0].diagnosis; color: #9caec2; font-size: 11px; wrap: word-wrap; }
+                            Text { text: root.results[0].primary-name + "  •  " + root.results[0].sample-count; color: #92a3b9; font-size: 11px; }
+                            HorizontalLayout { spacing: 8px; StatTile { horizontal-stretch: 1; label: root.results[0].fact-one-label; value: root.results[0].fact-one-value; } StatTile { horizontal-stretch: 1; label: root.results[0].fact-two-label; value: root.results[0].fact-two-value; } StatTile { horizontal-stretch: 1; label: root.results[0].fact-three-label; value: root.results[0].fact-three-value; } StatTile { horizontal-stretch: 1; label: root.results[0].fact-four-label; value: root.results[0].fact-four-value; } }
+                            Text { text: root.results[0].diagnosis; color: #b9c7d8; font-size: 11px; wrap: word-wrap; }
                             if root.result-details-expanded: Text { text: "Measurement details: " + root.results[0].details; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
                             Button { text: root.result-details-expanded ? "Hide measurement details" : "Show measurement details"; clicked => { root.toggle-result-details(); } }
                         } }
                         if root.results.length > 0: Text { height: 18px; vertical-stretch: 0; text: "RECENT RUNS"; color: #71809a; font-size: 11px; font-weight: 700; }
-                        for result in root.results: Surface { height: 146px; vertical-stretch: 0; VerticalLayout { padding: 14px; spacing: 5px;
-                            HorizontalLayout { Text { text: result.title; color: #f4f7fb; font-size: 15px; font-weight: 700; } Rectangle { horizontal-stretch: 1; } Text { text: result.primary-value; color: #70e4cc; font-size: 16px; font-weight: 700; } }
-                            Text { text: result.device + "  |  " + result.elapsed + "  |  " + result.statistics; color: #9eacc0; font-size: 10px; wrap: word-wrap; }
-                            Text { text: result.secondary-metrics; color: #79a9ff; font-size: 11px; wrap: word-wrap; } Text { text: "Select the latest measurement above to inspect its recorded metadata."; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
+                        for result in root.results: Surface { height: 174px; vertical-stretch: 0; VerticalLayout { padding: 15px; spacing: 7px;
+                            HorizontalLayout { VerticalLayout { spacing: 3px; Text { text: result.title; color: #f4f7fb; font-size: 15px; font-weight: 700; } Text { text: result.device + "  •  " + result.elapsed + "  •  " + result.sample-count; color: #8998ad; font-size: 10px; } } Rectangle { horizontal-stretch: 1; } VerticalLayout { alignment: end; spacing: 2px; Text { text: result.primary-value; color: #70e4cc; font-size: 19px; font-weight: 750; horizontal-alignment: right; } Text { text: result.primary-name; color: #71809a; font-size: 9px; horizontal-alignment: right; } } }
+                            HorizontalLayout { spacing: 8px; StatTile { horizontal-stretch: 1; label: result.fact-one-label; value: result.fact-one-value; } StatTile { horizontal-stretch: 1; label: result.fact-two-label; value: result.fact-two-value; } StatTile { horizontal-stretch: 1; label: result.fact-three-label; value: result.fact-three-value; } StatTile { horizontal-stretch: 1; label: result.fact-four-label; value: result.fact-four-value; } }
+                            Text { text: result.summary; color: #9db1c8; font-size: 10px; wrap: word-wrap; }
                         } }
                     }
                 }

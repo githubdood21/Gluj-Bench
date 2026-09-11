@@ -18,9 +18,11 @@ pub(super) struct VulkanAdapterInfo {
     pub timestamp_period_ns: f32,
     pub subgroup_size: u32,
     pub shader_float16: bool,
+    pub storage_buffer_16bit_access: bool,
     pub shader_int8: bool,
     pub shader_float64: bool,
     pub max_storage_buffer_range: u64,
+    pub device_local_memory_bytes: u64,
     pub extensions: BTreeSet<String>,
     pub cooperative: CooperativeSupport,
 }
@@ -119,14 +121,26 @@ fn discover_with_instance(
             .collect::<BTreeSet<_>>();
 
         let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut storage_16bit = vk::PhysicalDevice16BitStorageFeatures::default();
         let shader_float64 = {
-            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut float16_int8);
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut float16_int8)
+                .push_next(&mut storage_16bit);
             // SAFETY: the output chain is valid and physical_device belongs to instance.
             unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
             features2.features.shader_float64 == vk::TRUE
         };
         let shader_float16 = float16_int8.shader_float16 == vk::TRUE;
         let shader_int8 = float16_int8.shader_int8 == vk::TRUE;
+        let storage_buffer_16bit_access = storage_16bit.storage_buffer16_bit_access == vk::TRUE;
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let device_local_memory_bytes = memory_properties.memory_heaps
+            [..memory_properties.memory_heap_count as usize]
+            .iter()
+            .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|heap| heap.size)
+            .sum();
 
         // SAFETY: physical_device belongs to instance.
         let queue_families =
@@ -178,9 +192,11 @@ fn discover_with_instance(
             timestamp_period_ns: properties.limits.timestamp_period,
             subgroup_size: subgroup_properties.subgroup_size,
             shader_float16,
+            storage_buffer_16bit_access,
             shader_int8,
             shader_float64,
             max_storage_buffer_range: properties.limits.max_storage_buffer_range as u64,
+            device_local_memory_bytes,
             extensions,
             cooperative,
         });
