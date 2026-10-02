@@ -300,6 +300,7 @@ impl VulkanVectorHarness {
                 .end_command_buffer(self.command_buffer)
                 .map_err(|problem| error("vulkan_command_end_failed", problem))?;
             let command_buffers = [self.command_buffer];
+            let activity_started = std::time::Instant::now();
             let submits = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
             self.device
                 .queue_submit(self.queue, &submits, vk::Fence::null())
@@ -307,6 +308,7 @@ impl VulkanVectorHarness {
             self.device
                 .queue_wait_idle(self.queue)
                 .map_err(|problem| error("vulkan_device_lost", problem))?;
+            gluj_bench_core::pace_gpu(activity_started.elapsed())?;
             let mut timestamps = [0_u64; 2];
             self.device
                 .get_query_pool_results(

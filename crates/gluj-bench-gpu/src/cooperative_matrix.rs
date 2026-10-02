@@ -26,7 +26,6 @@ const MATRIX_WORKGROUP_SIZE: u64 = 64;
 const MATRIX_LOOP_COUNT: u64 = 256;
 const MATRIX_PROFILE_REUSE: u32 = 8;
 const MATRIX_PROFILE_MIN_SIZE: u64 = 256 * 1024;
-const MATRIX_PROFILE_MAX_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const WORKGROUP_CANDIDATES: [u32; 5] = [512, 1024, 2048, 4096, 8192];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,10 +260,10 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
         1,
         BenchmarkDescriptor {
             id: FP16_MATRIX_SCALING_ID.into(),
-            name: "FP16 matrix working-set profile".into(),
+            name: "FP16 matrix compute scaling".into(),
             category: BenchmarkCategory::Gpu,
             workload:
-                "Dense cooperative-matrix throughput across cache-sized and LLM-scale operand sets"
+                "Measures FP16 matrix calculation speed as data grows from cache-sized sets toward your selected VRAM budget"
                     .into(),
             data_type: "fp16".into(),
             unit: "operations/s".into(),
@@ -365,7 +364,13 @@ pub(super) fn run(
         message: "Saturating the GPU matrix execution units before measurement".into(),
     });
     let initial_ns = harness.measure(1)?;
-    let warm_iterations = iterations_for_target(initial_ns, GPU_PRECONDITION_MS / 1000.0);
+    let warm_iterations = iterations_for_target(
+        initial_ns,
+        gluj_bench_core::gpu_burst_duration(std::time::Duration::from_secs_f64(
+            GPU_PRECONDITION_MS / 1000.0,
+        ))
+        .as_secs_f64(),
+    );
     let _ = harness.measure(warm_iterations)?;
     let sample_count = config.samples.max(1);
     let calibrated_ns = harness.measure(1)?;
@@ -452,7 +457,7 @@ fn run_fp16_matrix_scaling(
     shape: MatrixShape,
     config: &BenchmarkConfig,
     cancellation: &CancellationToken,
-    progress: &mut ProgressCallback<'_>,
+    callback: &mut ProgressCallback<'_>,
 ) -> Result<BenchmarkResult, BenchmarkError> {
     if !record.supports_vulkan_timestamps() {
         return Err(BenchmarkError::new(
@@ -476,6 +481,25 @@ fn run_fp16_matrix_scaling(
     }
     let started = Instant::now();
     ensure_not_cancelled(cancellation)?;
+    let reference = {
+        let mut reference_progress = |mut update: ProgressUpdate| {
+            update.fraction *= 0.20;
+            update.message = format!("Compute reference: {}", update.message);
+            callback(update);
+        };
+        run(
+            record,
+            FP16_MATRIX_ID,
+            &crate::scaling::reference_config(config),
+            cancellation,
+            &mut reference_progress,
+        )?
+    };
+    let mut sweep_progress = |mut update: ProgressUpdate| {
+        update.fraction = 0.20 + update.fraction * 0.75;
+        callback(update);
+    };
+    let progress = &mut sweep_progress;
     let context = VulkanMatrixContext::new(record, kind)?;
     progress(ProgressUpdate {
         fraction: 0.01,
@@ -488,13 +512,18 @@ fn run_fp16_matrix_scaling(
         / (shape.m as u64 * shape.k as u64 * 2))
         .min(record.vulkan.max_storage_buffer_range / (shape.k as u64 * shape.n as u64 * 2));
     let binding_limit = max_tiles_per_binding.saturating_mul(bytes_per_tile);
-    let memory_limit = record.vulkan.device_local_memory_bytes
-        / if record.vulkan.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-            4
-        } else {
-            8
-        };
-    let maximum = binding_limit.min(memory_limit).min(MATRIX_PROFILE_MAX_SIZE);
+    let budget_percent = gluj_bench_core::vram_budget_percent(config)?;
+    let allocation_budget =
+        gluj_bench_core::vram_budget_bytes(record.vulkan.device_local_memory_bytes, budget_percent);
+    let active_subgroups = workgroups as u64 * MATRIX_WORKGROUP_SIZE / context.subgroup_size as u64;
+    let output_bytes = active_subgroups * shape.m as u64 * shape.n as u64 * 4;
+    let mut memory_limit = allocation_budget
+        .saturating_sub(output_bytes)
+        .saturating_sub(16 * 1024 * 1024);
+    if record.vulkan.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+        memory_limit = memory_limit.min(record.vulkan.device_local_memory_bytes / 8);
+    }
+    let maximum = binding_limit.min(memory_limit);
     let requested_sizes = matrix_profile_sizes(maximum);
     if requested_sizes.len() < 3 {
         return Err(BenchmarkError::new(
@@ -525,6 +554,9 @@ fn run_fp16_matrix_scaling(
     let target_seconds =
         (config.target_duration_ms as f64 / 1000.0 / sizes.len() as f64 / sample_count as f64)
             .clamp(0.01, 0.08);
+    let target_seconds =
+        gluj_bench_core::gpu_burst_duration(std::time::Duration::from_secs_f64(target_seconds))
+            .as_secs_f64();
     let mut raw_points = Vec::with_capacity(sizes.len());
     for (index, working_set) in sizes.iter().copied().enumerate() {
         ensure_not_cancelled(cancellation)?;
@@ -622,6 +654,14 @@ fn run_fp16_matrix_scaling(
     metadata.insert("operand_bytes_per_tile".into(), bytes_per_tile.to_string());
     metadata.insert("tested_tier_count".into(), points.len().to_string());
     metadata.insert(
+        "allocation_budget_bytes".into(),
+        allocation_budget.to_string(),
+    );
+    metadata.insert(
+        "allocated_test_buffer_bytes".into(),
+        (harness.maximum_working_set_bytes + output_bytes).to_string(),
+    );
+    metadata.insert(
         "profile_sample_count_per_tier".into(),
         sample_count.to_string(),
     );
@@ -673,7 +713,29 @@ fn run_fp16_matrix_scaling(
             .collect::<Vec<_>>()
             .join(","),
     );
-    progress(done("FP16 matrix working-set profile completed."));
+    drop(harness);
+    let check = {
+        let mut check_progress = |mut update: ProgressUpdate| {
+            update.fraction = 0.95 + update.fraction * 0.05;
+            update.message = format!("Checking compute reference drift: {}", update.message);
+            callback(update);
+        };
+        run(
+            record,
+            FP16_MATRIX_ID,
+            &crate::scaling::reference_config(config),
+            cancellation,
+            &mut check_progress,
+        )?
+    };
+    let reference = crate::scaling::validate_reference(reference, check);
+    crate::scaling::add_reference_analysis(
+        &mut metrics,
+        &mut metadata,
+        &reference,
+        transition_index.is_some(),
+    );
+    callback(done("FP16 matrix compute scaling completed."));
     Ok(BenchmarkResult {
         benchmark_id: FP16_MATRIX_SCALING_ID.into(),
         device_id: record.id.clone(),
@@ -693,6 +755,9 @@ fn matrix_profile_sizes(maximum: u64) -> Vec<u64> {
             break;
         };
         size = next;
+    }
+    if !sizes.is_empty() && sizes.last().copied() != Some(maximum) {
+        sizes.push(maximum);
     }
     sizes
 }
@@ -977,6 +1042,7 @@ impl VulkanMatrixContext {
             self.device
                 .end_command_buffer(self.command_buffer)
                 .map_err(|problem| error("vulkan_command_end_failed", problem))?;
+            let activity_started = std::time::Instant::now();
             let command_buffers = [self.command_buffer];
             self.device
                 .queue_submit(
@@ -988,6 +1054,7 @@ impl VulkanMatrixContext {
             self.device
                 .queue_wait_idle(self.queue)
                 .map_err(|problem| error("device_lost", problem))?;
+            gluj_bench_core::pace_gpu(activity_started.elapsed())?;
             let mut timestamps = [0_u64; 2];
             self.device
                 .get_query_pool_results(
@@ -1678,6 +1745,10 @@ mod tests {
 
     #[test]
     fn matrix_profile_uses_power_of_two_targets_and_fp16_operand_bytes() {
+        let partial_limit = 3 * 1024 * 1024;
+        let tiers = matrix_profile_sizes(partial_limit);
+        assert_eq!(tiers.last(), Some(&partial_limit));
+        assert!(tiers.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
             matrix_profile_sizes(1024 * 1024),
             [256 * 1024, 512 * 1024, 1024 * 1024]

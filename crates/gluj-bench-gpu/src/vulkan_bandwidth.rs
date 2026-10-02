@@ -213,6 +213,7 @@ impl VulkanBandwidthContext {
     }
 
     fn submit_and_wait(&self) -> Result<(), BenchmarkError> {
+        let activity_started = std::time::Instant::now();
         // SAFETY: the recorded command buffer and queue belong to the same live device.
         unsafe {
             self.device
@@ -228,8 +229,9 @@ impl VulkanBandwidthContext {
                 .map_err(|problem| error("vulkan_queue_submit_failed", problem))?;
             self.device
                 .queue_wait_idle(self.queue)
-                .map_err(|problem| error("device_lost", problem))
+                .map_err(|problem| error("device_lost", problem))?;
         }
+        gluj_bench_core::pace_gpu(activity_started.elapsed())
     }
 
     fn timestamp_elapsed_ns(&self) -> Result<f64, BenchmarkError> {
@@ -626,6 +628,7 @@ fn calibrated_samples<F>(
 where
     F: FnMut(u32) -> Result<f64, BenchmarkError>,
 {
+    let target = gluj_bench_core::gpu_burst_duration(target);
     let calibration_iterations = 64;
     let mut per_iteration_ns = measure(calibration_iterations)? / calibration_iterations as f64;
     if per_iteration_ns <= 0.0 || !per_iteration_ns.is_finite() {
@@ -635,7 +638,12 @@ where
         ));
     }
     if precondition {
-        let warm_iterations = (GPU_PRECONDITION_MS * 1e6 / per_iteration_ns)
+        let warm_iterations = (gluj_bench_core::gpu_burst_duration(Duration::from_secs_f64(
+            GPU_PRECONDITION_MS / 1000.0,
+        ))
+        .as_secs_f64()
+            * 1e9
+            / per_iteration_ns)
             .ceil()
             .clamp(1.0, 4096.0) as u32;
         per_iteration_ns = measure(warm_iterations)? / warm_iterations as f64;

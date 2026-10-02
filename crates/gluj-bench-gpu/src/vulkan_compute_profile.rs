@@ -20,7 +20,8 @@ pub(super) struct VulkanComputeProfileHarness {
     command_buffer: vk::CommandBuffer,
     descriptor_pool: vk::DescriptorPool,
     descriptor_layout: vk::DescriptorSetLayout,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+    elements_per_chunk: u32,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     query_pool: vk::QueryPool,
@@ -42,7 +43,8 @@ impl VulkanComputeProfileHarness {
         record: &AdapterRecord,
         requested_working_set: u64,
     ) -> Result<Self, BenchmarkError> {
-        let element_count = requested_working_set / BYTES_PER_ELEMENT;
+        let element_count =
+            requested_working_set / BYTES_PER_ELEMENT / WORKGROUP_SIZE * WORKGROUP_SIZE;
         let per_buffer_size = element_count * 16;
         if element_count < WORKGROUP_SIZE || element_count > u32::MAX as u64 {
             return Err(BenchmarkError::new(
@@ -75,6 +77,19 @@ impl VulkanComputeProfileHarness {
                     return Err(problem);
                 }
             };
+        let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
+        let elements_per_chunk = chunk_element_limit(
+            limits.max_compute_work_group_count[0],
+            limits.min_storage_buffer_offset_alignment,
+        );
+        if elements_per_chunk == 0 {
+            unsafe { instance.destroy_instance(None) };
+            return Err(BenchmarkError::new(
+                "invalid_dispatch_limit",
+                "The device cannot dispatch an aligned compute-profile chunk.",
+            ));
+        }
+        let chunks = dispatch_chunks(element_count as u32, elements_per_chunk);
         let priorities = [1.0_f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(record.vulkan.compute_queue_family)
@@ -130,37 +145,43 @@ impl VulkanComputeProfileHarness {
         .map_err(|problem| error("vulkan_pipeline_layout_failed", problem))?;
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3)];
+            .descriptor_count(3 * chunks.len() as u32)];
         let descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
+                    .max_sets(chunks.len() as u32)
                     .pool_sizes(&pool_sizes),
                 None,
             )
         }
         .map_err(|problem| error("vulkan_descriptor_pool_failed", problem))?;
-        let descriptor_set = unsafe {
+        let chunk_layouts = vec![descriptor_layout; chunks.len()];
+        let descriptor_sets = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptor_pool)
-                    .set_layouts(&set_layouts),
+                    .set_layouts(&chunk_layouts),
             )
         }
-        .map_err(|problem| error("vulkan_descriptor_set_failed", problem))?[0];
-        let buffer_infos = [input_a.handle, input_b.handle, output.handle].map(|buffer| {
-            vk::DescriptorBufferInfo::default()
-                .buffer(buffer)
-                .range(per_buffer_size)
-        });
-        let writes = [0_u32, 1, 2].map(|binding| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_infos[binding as usize]))
-        });
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        .map_err(|problem| error("vulkan_descriptor_set_failed", problem))?;
+        // Each set exposes a non-overlapping slice, so the existing shader's local
+        // index can address large working sets without exceeding dispatch limits.
+        for (&descriptor_set, &(offset, count)) in descriptor_sets.iter().zip(&chunks) {
+            let buffer_infos = [input_a.handle, input_b.handle, output.handle].map(|buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer)
+                    .offset(offset as u64 * 16)
+                    .range(count as u64 * 16)
+            });
+            let writes = [0_u32, 1, 2].map(|binding| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buffer_infos[binding as usize]))
+            });
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
         let words = shader_words()?;
         let shader = unsafe {
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
@@ -218,7 +239,8 @@ impl VulkanComputeProfileHarness {
             command_buffer,
             descriptor_pool,
             descriptor_layout,
-            descriptor_set,
+            descriptor_sets,
+            elements_per_chunk,
             pipeline_layout,
             pipeline,
             query_pool,
@@ -285,8 +307,7 @@ impl VulkanComputeProfileHarness {
         iterations: u32,
     ) -> Result<f64, BenchmarkError> {
         let element_count = (working_set / BYTES_PER_ELEMENT) as u32;
-        let workgroups = (element_count as u64).div_ceil(WORKGROUP_SIZE) as u32;
-        let params = parameters(loop_count, element_count);
+        let chunks = dispatch_chunks(element_count, self.elements_per_chunk);
         // SAFETY: the command buffer and all referenced handles are owned by this harness.
         unsafe {
             self.begin()?;
@@ -303,24 +324,30 @@ impl VulkanComputeProfileHarness {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline,
             );
-            self.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
-                0,
-                &[self.descriptor_set],
-                &[],
-            );
-            self.device.cmd_push_constants(
-                self.command_buffer,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                &params,
-            );
             for _ in 0..iterations {
-                self.device
-                    .cmd_dispatch(self.command_buffer, workgroups, 1, 1);
+                for (index, &(_, count)) in chunks.iter().enumerate() {
+                    self.device.cmd_bind_descriptor_sets(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.pipeline_layout,
+                        0,
+                        &[self.descriptor_sets[index]],
+                        &[],
+                    );
+                    self.device.cmd_push_constants(
+                        self.command_buffer,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        &parameters(loop_count, count),
+                    );
+                    self.device.cmd_dispatch(
+                        self.command_buffer,
+                        (count as u64).div_ceil(WORKGROUP_SIZE) as u32,
+                        1,
+                        1,
+                    );
+                }
             }
             self.device.cmd_write_timestamp(
                 self.command_buffer,
@@ -368,6 +395,7 @@ impl VulkanComputeProfileHarness {
     }
 
     unsafe fn submit(&self) -> Result<(), BenchmarkError> {
+        let activity_started = std::time::Instant::now();
         unsafe { self.device.end_command_buffer(self.command_buffer) }
             .map_err(|problem| error("vulkan_command_end_failed", problem))?;
         let buffers = [self.command_buffer];
@@ -380,7 +408,8 @@ impl VulkanComputeProfileHarness {
         }
         .map_err(|problem| error("vulkan_queue_submit_failed", problem))?;
         unsafe { self.device.queue_wait_idle(self.queue) }
-            .map_err(|problem| error("vulkan_device_lost", problem))
+            .map_err(|problem| error("vulkan_device_lost", problem))?;
+        gluj_bench_core::pace_gpu(activity_started.elapsed())
     }
 }
 
@@ -489,6 +518,21 @@ fn shader_words() -> Result<Vec<u32>, BenchmarkError> {
         .collect())
 }
 
+fn chunk_element_limit(max_workgroups: u32, offset_alignment: u64) -> u32 {
+    // Vulkan buffer-offset alignment is a power of two. Whole workgroups use
+    // 4096 bytes per binding; align chunk boundaries for stricter devices too.
+    let groups_per_alignment = offset_alignment.max(WORKGROUP_SIZE * 16) / (WORKGROUP_SIZE * 16);
+    let groups = (max_workgroups as u64).min(u32::MAX as u64 / WORKGROUP_SIZE);
+    (groups / groups_per_alignment * groups_per_alignment * WORKGROUP_SIZE) as u32
+}
+
+fn dispatch_chunks(elements: u32, limit: u32) -> Vec<(u32, u32)> {
+    (0..elements)
+        .step_by(limit as usize)
+        .map(|offset| (offset, limit.min(elements - offset)))
+        .collect()
+}
+
 fn parameters(loop_count: u32, element_count: u32) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
     bytes[0..4].copy_from_slice(&loop_count.to_le_bytes());
@@ -526,5 +570,35 @@ mod tests {
     fn accounting_matches_shader_contract() {
         assert_eq!(BYTES_PER_ELEMENT, 48);
         assert_eq!(OPERATIONS_PER_LOOP_PER_ELEMENT, 64);
+    }
+
+    #[test]
+    fn large_dispatch_chunks_cover_buffers_once_within_device_limits() {
+        let limit = chunk_element_limit(65535, 256);
+        let elements = (5_u64 * 1024 * 1024 * 1024 / BYTES_PER_ELEMENT / WORKGROUP_SIZE
+            * WORKGROUP_SIZE) as u32;
+        let chunks = dispatch_chunks(elements, limit);
+        assert!(chunks.len() > 1);
+        let mut covered = 0;
+        for (offset, count) in chunks {
+            assert_eq!(offset, covered);
+            assert_eq!(offset as u64 * 16 % 256, 0);
+            assert_eq!(count as u64 % WORKGROUP_SIZE, 0);
+            assert!((count as u64).div_ceil(WORKGROUP_SIZE) <= 65535);
+            assert!(offset as u64 * 16 + count as u64 * 16 <= elements as u64 * 16);
+            covered += count;
+        }
+        assert_eq!(covered, elements);
+    }
+
+    #[test]
+    fn chunk_limit_handles_stricter_alignment_and_large_dispatch_limits() {
+        let limit = chunk_element_limit(65535, 65536);
+        assert_eq!(limit as u64 * 16 % 65536, 0);
+        assert!(limit / WORKGROUP_SIZE as u32 <= 65535);
+        assert_eq!(
+            chunk_element_limit(u32::MAX, 256) % WORKGROUP_SIZE as u32,
+            0
+        );
     }
 }

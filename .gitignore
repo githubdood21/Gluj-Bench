@@ -9,3 +9,7 @@
 *.VC.VC.opendb
 *.pdb
 VP_VULKANINFO_*.json
+/results.json
+/results.json.*.tmp
+/settings.json
+/settings.json.*.tmp

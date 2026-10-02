@@ -347,12 +347,17 @@ impl CpuBandwidthProvider {
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let topology = self.topology.as_ref().map_err(Clone::clone)?;
         let logical_mode = Self::logical_mode(config);
-        let layout = if logical_mode {
+        let mut layout = if logical_mode {
             Self::logical_cache_layout(topology, level)
         } else {
             Self::cache_layout(topology, level)
         }
         .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;
+        let budget = gluj_bench_core::worker_budget(
+            layout.len(),
+            gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
+        );
+        layout.truncate(budget);
         let target = topology.representative_caches.get(&level).unwrap();
         let locations: Vec<_> = layout.iter().map(|(location, _)| *location).collect();
         let full_payload_sizes: Vec<_> = layout.iter().map(|(_, bytes)| *bytes).collect();
@@ -493,7 +498,12 @@ impl CpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let topology = self.topology.as_ref().map_err(Clone::clone)?;
-        let locations = Self::benchmark_locations(topology, config);
+        let mut locations = Self::benchmark_locations(topology, config);
+        let budget = gluj_bench_core::worker_budget(
+            locations.len(),
+            gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
+        );
+        locations.truncate(budget);
         let payload = self
             .ram_payload(topology)
             .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;

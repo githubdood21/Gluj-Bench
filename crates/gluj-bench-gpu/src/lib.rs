@@ -1,6 +1,7 @@
 mod analysis;
 mod compute;
 mod cooperative_matrix;
+mod scaling;
 mod vulkan;
 mod vulkan_bandwidth;
 mod vulkan_compute_profile;
@@ -836,7 +837,9 @@ fn host_transfer_size(adapter_limit: u64, available_memory: u64, integrated: boo
 }
 
 fn per_sample_duration(config: &BenchmarkConfig) -> Duration {
-    Duration::from_millis((config.target_duration_ms / config.samples.max(1) as u64).max(1))
+    gluj_bench_core::gpu_burst_duration(Duration::from_millis(
+        (config.target_duration_ms / config.samples.max(1) as u64).max(1),
+    ))
 }
 
 fn metric(name: String, values: Vec<f64>) -> Metric {

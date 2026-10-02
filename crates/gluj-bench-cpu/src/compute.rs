@@ -933,6 +933,11 @@ pub fn run(
         let mut locations: Vec<_> = topology.core_threads.values().flatten().copied().collect();
         locations.sort_unstable();
         locations.dedup();
+        let budget = gluj_bench_core::worker_budget(
+            locations.len(),
+            gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
+        );
+        locations.truncate(budget);
         if locations.is_empty() {
             return Err(BenchmarkError::new(
                 "topology_unavailable",

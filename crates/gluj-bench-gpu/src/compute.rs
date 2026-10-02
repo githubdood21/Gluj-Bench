@@ -16,7 +16,6 @@ const FP64_ID: &str = "gpu.performance.fp64";
 const FP32_SCALING_ID: &str = "gpu.performance.fp32.scaling";
 const PROFILE_LOOP_COUNT: u32 = 64;
 const PROFILE_MIN_SIZE: u64 = 256 * 1024;
-const PROFILE_MAX_SIZE: u64 = 512 * 1024 * 1024;
 const PROFILE_DROP_RATIO: f64 = 0.90;
 const LOOP_COUNT: u32 = 1024;
 const PROBE_LOOP_COUNT: u32 = 2048;
@@ -224,7 +223,13 @@ pub(super) fn run(
         message: "Saturating GPU execution cores before measurement".into(),
     });
     let initial_ns = harness.measure(1)?;
-    let warm_iterations = iterations_for_target(initial_ns, GPU_PRECONDITION_MS / 1000.0);
+    let warm_iterations = iterations_for_target(
+        initial_ns,
+        gluj_bench_core::gpu_burst_duration(std::time::Duration::from_secs_f64(
+            GPU_PRECONDITION_MS / 1000.0,
+        ))
+        .as_secs_f64(),
+    );
     let _ = harness.measure(warm_iterations)?;
 
     progress(ProgressUpdate {
@@ -352,17 +357,40 @@ fn run_fp32_scaling(
     record: &AdapterRecord,
     config: &BenchmarkConfig,
     cancellation: &CancellationToken,
-    progress: &mut ProgressCallback<'_>,
+    callback: &mut ProgressCallback<'_>,
 ) -> Result<BenchmarkResult, BenchmarkError> {
     let started = Instant::now();
     ensure_not_cancelled(cancellation)?;
+    let reference = {
+        let mut reference_progress = |mut update: ProgressUpdate| {
+            update.fraction *= 0.20;
+            update.message = format!("Compute reference: {}", update.message);
+            callback(update);
+        };
+        run(
+            record,
+            FP32_ID,
+            &crate::scaling::reference_config(config),
+            cancellation,
+            &mut reference_progress,
+        )?
+    };
+    let mut sweep_progress = |mut update: ProgressUpdate| {
+        update.fraction = 0.20 + update.fraction * 0.75;
+        callback(update);
+    };
+    let progress = &mut sweep_progress;
     let loop_count = config
         .options
         .get("arithmetic_iterations")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(PROFILE_LOOP_COUNT)
         .clamp(1, 1024);
-    let maximum = (record.vulkan.max_storage_buffer_range.saturating_mul(3)).min(PROFILE_MAX_SIZE);
+    let budget_percent = gluj_bench_core::vram_budget_percent(config)?;
+    let allocation_budget =
+        gluj_bench_core::vram_budget_bytes(record.vulkan.device_local_memory_bytes, budget_percent);
+    let maximum = (record.vulkan.max_storage_buffer_range.saturating_mul(3))
+        .min(allocation_budget.saturating_sub(16 * 1024 * 1024));
     let requested_sizes = profile_sizes(maximum);
     if requested_sizes.len() < 3 {
         return Err(BenchmarkError::new(
@@ -387,6 +415,9 @@ fn run_fp32_scaling(
     let target_seconds =
         (config.target_duration_ms as f64 / 1000.0 / sizes.len() as f64 / sample_count as f64)
             .clamp(0.01, 0.10);
+    let target_seconds =
+        gluj_bench_core::gpu_burst_duration(std::time::Duration::from_secs_f64(target_seconds))
+            .as_secs_f64();
     let arithmetic_intensity = loop_count as f64 * 64.0 / 48.0;
     let mut raw_points = Vec::with_capacity(sizes.len());
     for (index, working_set) in sizes.iter().copied().enumerate() {
@@ -481,6 +512,15 @@ fn run_fp32_scaling(
     metadata.insert("data_type".into(), "fp32".into());
     metadata.insert("arithmetic_iterations".into(), loop_count.to_string());
     metadata.insert(
+        "allocation_budget_bytes".into(),
+        allocation_budget.to_string(),
+    );
+    metadata.insert(
+        "allocated_test_buffer_bytes".into(),
+        harness.maximum_working_set_bytes.to_string(),
+    );
+    metadata.insert("allocation_limit_note".into(), "The selected VRAM budget is limited by the device's storage-buffer range, with 16 MiB reserved for allocation overhead.".into());
+    metadata.insert(
         "arithmetic_intensity_operations_per_byte".into(),
         format!("{arithmetic_intensity:.4}"),
     );
@@ -537,7 +577,30 @@ fn run_fp32_scaling(
             .collect::<Vec<_>>()
             .join(","),
     );
-    progress(done("FP32 compute scaling profile completed."));
+    drop(harness);
+    let check = {
+        let mut check_progress = |mut update: ProgressUpdate| {
+            // The final check occupies the last five percent of progress.
+            update.fraction = 0.95 + update.fraction * 0.05;
+            update.message = format!("Checking compute reference drift: {}", update.message);
+            callback(update);
+        };
+        run(
+            record,
+            FP32_ID,
+            &crate::scaling::reference_config(config),
+            cancellation,
+            &mut check_progress,
+        )?
+    };
+    let reference = crate::scaling::validate_reference(reference, check);
+    crate::scaling::add_reference_analysis(
+        &mut metrics,
+        &mut metadata,
+        &reference,
+        transition_index.is_some(),
+    );
+    callback(done("FP32 compute scaling profile completed."));
     let mut result_device_metadata = device_metadata(record);
     result_device_metadata.insert("execution_backend".into(), "raw-vulkan".into());
     Ok(BenchmarkResult {
@@ -559,6 +622,9 @@ fn profile_sizes(maximum: u64) -> Vec<u64> {
             break;
         };
         size = next;
+    }
+    if maximum >= PROFILE_MIN_SIZE && sizes.last().copied() != Some(maximum) {
+        sizes.push(maximum);
     }
     sizes
 }
@@ -690,6 +756,15 @@ mod tests {
             vec![256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024]
         );
         assert!(profile_sizes(PROFILE_MIN_SIZE - 1).is_empty());
+    }
+
+    #[test]
+    fn profile_reaches_selected_budget_above_one_gib() {
+        let maximum = 5 * 1024 * 1024 * 1024 - 16 * 1024 * 1024;
+        let sizes = profile_sizes(maximum);
+        assert_eq!(sizes.last(), Some(&maximum));
+        assert!(sizes.contains(&(4 * 1024 * 1024 * 1024)));
+        assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

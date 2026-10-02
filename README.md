@@ -33,6 +33,84 @@ Gluj-Bench is independently developed and is not affiliated with or endorsed by 
 
 ## Screenshots
 
+### Workload settings
+
+The **Settings** page provides CPU-worker and GPU-activity presets: Gentle (50%),
+Balanced (75%, the default), and Full (100%). CPU presets limit the workers used
+by aggregate compute, cache, and RAM tests. Single-thread tests still use one
+worker. GPU presets add cancellable idle pauses after completed submissions;
+reduced modes also target shorter batches. GPU timestamp scores exclude the idle
+pauses, while wall-clock transfer scores include them. Reduced modes can change
+scores and improve responsiveness, but do not guarantee temperature or stability.
+
+GPU scaling tests have a **20–80% VRAM allocation ceiling**, with a default of 25%.
+The ceiling includes their test buffers and reserves allocation overhead. The
+matrix profile reserves its output buffer before sizing input data. Storage-buffer
+limits and integrated-GPU shared-memory limits can reduce the tested size. The
+FP32 profile splits larger working sets into dispatches within the device's limits;
+both profiles include the selected maximum as their final aligned sweep tier.
+Allocation is based on reported VRAM capacity; other applications can consume
+memory concurrently and cause an allocation to fail. The requested ceiling and
+allocated test-buffer sizes are recorded with the result.
+
+Both GPU scaling profiles first run their register-resident compute benchmark to
+measure a compute ceiling under the same activity setting. This is an empirical
+reference, not a theoretical hardware specification. The small-set baseline is
+kept for detecting sustained memory-pressure transitions; every sweep tier also
+records its percentage delta against the compute reference.
+The reference is repeated after the sweep to check boost/thermal drift. The higher
+reference is retained, and drift above 5% labels clock trials as exploratory.
+
+The result includes a tuning trial when a sustained transition and a meaningful
+drop against the smaller of the small-set and register references support it.
+This avoids counting different-kernel overhead as spare core capacity. Drift and
+small-set/reference mismatch receive confidence notes rather than blocking a trial.
+A meaningful drop must exceed twice
+the combined relative sample deviation, with individual variation at most 10%.
+Runs above 2% variation receive an exploratory label and a reminder to repeat
+measurements. An idealized roofline model estimates core headroom as
+`1 - largest_throughput / compute_reference` and the bandwidth increase needed to
+reach the reference as `compute_reference / largest_throughput - 1`. Different
+kernels, boost clocks, cache, and other bottlenecks can invalidate those estimates.
+The core-frequency-limit trial uses 75% of estimated spare compute headroom,
+rounded down to 5% steps and capped at a further 40% reduction of the current
+frequency limit. Existing limits are already included in the measured reference;
+this is an additional relative reduction, not percentage points from stock.
+The trial changes the frequency ceiling only and requires reruns to verify at
+0–5% performance loss against the original result at the same largest data-set
+size. Users adjust the limit in small steps and raise it if loss exceeds 5%.
+It never applies clock or voltage changes or treats
+the calculated bandwidth gap as a memory-clock target. No MHz target or performance
+guarantee is inferred without measurements at changed clocks. Uncertain results
+withhold tuning suggestions. Old results remain readable; comparisons require
+matching analysis revisions and arithmetic/tile-reuse settings.
+Scaling summary scores and saved-result comparisons use the largest tested data
+set, with its size and throughput loss against the matching register-resident
+reference shown prominently. Best scores compare the same largest data-set size
+across runs, never the fastest small cache tier. Tuning guidance has its own box.
+
+Choices save to `settings.json` beside the executable and cannot be changed during
+a run. Results retain their intensity and scaling allocation settings; best-score
+selection and deltas only compare matching settings. Older results without these
+fields are treated as full intensity with the original 25% scaling budget.
+
+Results save automatically to a compact `results.json` beside `gluj-bench-ui.exe`
+and load when the app starts. The file keeps the latest result for each workload
+and detected hardware setup (up to 128 entries). Keep this file when moving or
+updating the app to retain your comparisons.
+
+After running a test again, choose a saved setup under **Compare with** to see the
+percentage change. Compute rows show **Change**; the memory button cycles through
+**Latest**, **Best**, and **Change** for read, write, and copy. A positive change
+means higher throughput. Results with different metric units or incompatible
+workload settings are not compared. **Clear view** clears the displayed runs while
+preserving the saved file. Save/load problems are shown on the Results page.
+
+Hardware identity uses detected component details, including CPU/cache metadata,
+RAM capacity, and GPU properties. RAM modules or timings that the hardware scan
+does not report cannot be distinguished as separate setups; repeated runs can
+still be compared with the results loaded at startup.
+
 <table>
   <tr>
     <td align="center">
@@ -183,7 +261,7 @@ Human-readable commands write normal output to stdout. With `--json`, stdout con
 - Effective-cache and GPU-local kernels use coalesced 16-byte vector accesses with independent accumulators and sparse checksum writes. Cache reads use four vectors per invocation, streaming VRAM reads use sixty-four across eight dependency chains, streaming writes/copies use sixteen, and write/copy cache kernels retain one vector per invocation to keep small working sets highly parallel. GPU-local memory uses at least 256 MiB and four times the outer inferred cache boundary.
 - GPU copy bandwidth reports read-plus-write device-memory traffic for comparison with peak VRAM/cache bandwidth; useful copied payload is exactly half that reported rate and the convention is recorded in result metadata.
 - GPU-local operations run a discarded 750 ms sustained preconditioning workload before calibration and sampling so portable power management can raise core and memory clocks. The application does not force a vendor driver clock lock, and results explicitly record that distinction.
-- GPU shader benchmarks cover FP16, FP32, and FP64 register-resident vector arithmetic. `gpu.performance.fp32.scaling` additionally measures a memory-backed FP32 workload at nominal power-of-two targets from 256 KiB through 512 MiB. `gpu.performance.matrix.fp16.scaling` streams dense FP16 cooperative-matrix operands from 256 KiB through as much as 4 GiB on discrete GPUs, subject to device-memory and Vulkan binding limits, to expose cache-to-VRAM degradation under neural-network-style weight pressure. Discrete adapters use at most one-quarter of device-local memory; integrated adapters remain capped at one-eighth. Both profiles report exact aligned working sets, compute and effective traffic per tier, and the first statistically significant sustained drop below the small-set baseline. The matrix profile uses configurable tile reuse and is not presented as end-to-end LLM inference. Matrix benchmarks expose dense and sparse FP16, INT8, and FP8 families. Vulkan-reported MxNxK and numeric-type configurations directly gate the raw Vulkan cooperative-matrix runners; formats without a capability-verified path remain visible with their exact reason.
+- GPU shader benchmarks cover FP16, FP32, and FP64 register-resident vector arithmetic. `gpu.performance.fp32.scaling` additionally measures a memory-backed FP32 workload at nominal power-of-two targets from 256 KiB up to the selected VRAM budget, including a final aligned tier near that budget. `gpu.performance.matrix.fp16.scaling` streams dense FP16 cooperative-matrix operands from 256 KiB up to the selected VRAM budget on discrete GPUs, subject to device-memory and Vulkan binding limits, to expose cache-to-VRAM degradation under neural-network-style weight pressure. Both profiles respect the selected 20–80% allocation ceiling (25% by default); the integrated matrix profile also remains capped at one-eighth of shared device-local memory. Both profiles report exact aligned working sets, compute and effective traffic per tier, and the first statistically significant sustained drop below the small-set baseline. The matrix profile uses configurable tile reuse and is not presented as end-to-end LLM inference. Matrix benchmarks expose dense and sparse FP16, INT8, and FP8 families. Vulkan-reported MxNxK and numeric-type configurations directly gate the raw Vulkan cooperative-matrix runners; formats without a capability-verified path remain visible with their exact reason.
 - Precision classes are compared within the same execution domain. In particular, the RX 7900 XTX is specified for equal FP16-vector and FP32-vector peak throughput; its doubled FP16 figure belongs to the separate matrix path.
 - Host-to-device and device-to-host tests use a first-touched ring of three preallocated 64 MiB host-visible staging buffers, batched native buffer copies, and CPU wall-clock completion timing. Discrete adapters are marked `probable_pcie`, integrated adapters `shared_memory_or_uma`, and both classifications remain explicit inferences.
 - Overview, Benchmarks, and Results screens are present in the UI.

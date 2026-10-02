@@ -34,6 +34,7 @@ impl BenchmarkRegistry {
         cancellation: &CancellationToken,
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
+        let _workload = crate::WorkloadGuard::enter(config, cancellation)?;
         if cancellation.is_cancelled() {
             return Err(BenchmarkError::new(
                 "cancelled",
@@ -47,7 +48,20 @@ impl BenchmarkRegistry {
                 .iter()
                 .any(|benchmark| benchmark.id == benchmark_id)
             {
-                return provider.run(benchmark_id, config, cancellation, progress);
+                let mut result = provider.run(benchmark_id, config, cancellation, progress)?;
+                for key in ["cpu_worker_percent", "gpu_activity_percent"] {
+                    result.workload_metadata.insert(
+                        key.into(),
+                        crate::workload_percent(config, key)?.to_string(),
+                    );
+                }
+                if benchmark_id.ends_with(".scaling") {
+                    result.workload_metadata.insert(
+                        "vram_budget_percent".into(),
+                        crate::vram_budget_percent(config)?.to_string(),
+                    );
+                }
+                return Ok(result);
             }
         }
 

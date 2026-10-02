@@ -13,26 +13,14 @@ export struct ResultRow {
     primary-value: string, sample-count: string,
     fact-one-label: string, fact-one-value: string, fact-two-label: string, fact-two-value: string,
     fact-three-label: string, fact-three-value: string, fact-four-label: string, fact-four-value: string,
-    summary: string, diagnosis: string, details: string,
+    summary: string, diagnosis: string, details: string, description: string, everyday-use: string, score-guide: string, tuning-guidance: string,
 }
+
+export struct SummaryRow { title: string, metric: string, latest: string, best: string, runs: string, section: int, bandwidth: bool, read-latest: string, write-latest: string, copy-latest: string, read-best: string, write-best: string, copy-best: string, delta: string, read-delta: string, write-delta: string, copy-delta: string, }
 
 component SectionTitle inherits Text { color: #f4f7fb; font-size: 25px; font-weight: 700; }
 component Surface inherits Rectangle { background: #151b26; border-color: #293448; border-width: 1px; border-radius: 14px; }
 component Label inherits Text { color: #8f9caf; font-size: 11px; font-weight: 700; }
-component StatTile inherits Rectangle {
-    in property <string> label;
-    in property <string> value;
-    height: 50px;
-    background: #111722;
-    border-color: #263247;
-    border-width: 1px;
-    border-radius: 8px;
-    VerticalLayout { padding: 8px; spacing: 2px;
-        Text { text: root.label; color: #71809a; font-size: 9px; font-weight: 700; }
-        Text { text: root.value; color: #dbe3ee; font-size: 12px; font-weight: 650; }
-    }
-}
-
 export component MainWindow inherits Window {
     title: "Gluj-Bench";
     min-width: 980px; min-height: 680px;
@@ -40,6 +28,14 @@ export component MainWindow inherits Window {
     background: #0b0f16;
 
     in-out property <int> page: 0;
+    in-out property <string> vram-budget-name;
+    callback select-vram-budget(int);
+    in-out property <string> cpu-intensity-name;
+    in-out property <string> gpu-intensity-name;
+    in-out property <string> settings-status;
+    in-out property <string> load-description;
+    callback select-cpu-intensity(int);
+    callback select-gpu-intensity(int);
     in-out property <string> status: "Starting benchmark worker...";
     in-out property <bool> worker-online: false;
     in-out property <string> suite-description: "";
@@ -55,7 +51,25 @@ export component MainWindow inherits Window {
     in-out property <bool> selected-benchmark-enabled: false;
     in-out property <[DeviceRow]> devices: [];
     in-out property <[BenchmarkRow]> benchmarks: [];
-    in-out property <[ResultRow]> results: [];
+    in-out property <[SummaryRow]> result-summaries: [];
+    in-out property <[string]> result-components: [];
+    in-out property <string> result-component-name;
+    in-out property <ResultRow> selected-result;
+    in-out property <int> result-count;
+    in-out property <int> result-header-count;
+    in-out property <bool> result-has-bandwidth;
+    in-out property <int> bandwidth-mode: 0;
+    in-out property <[string]> comparison-options: [];
+    in-out property <string> comparison-name;
+    in-out property <string> comparison-note;
+    in-out property <string> results-file-status;
+    callback select-comparison(int);
+    in-out property <int> result-page;
+    in-out property <int> result-page-count: 1;
+    in-out property <int> result-selection;
+    callback select-result-component(int);
+    callback select-result-row(int);
+    callback change-result-page(int);
     in-out property <string> expanded-device-id: "";
     in-out property <bool> result-details-expanded: false;
     in-out property <int> device-count: 0;
@@ -84,6 +98,7 @@ export component MainWindow inherits Window {
                 Button { text: "Overview"; primary: root.page == 0; clicked => { root.select-page(0); } }
                 Button { text: "Test Lab"; primary: root.page == 1; clicked => { root.select-page(1); } }
                 Button { text: "Results"; primary: root.page == 2; clicked => { root.select-page(2); } }
+                Button { text: "Settings"; primary: root.page == 3; clicked => { root.select-page(3); } }
                 Rectangle { vertical-stretch: 1; }
                 Surface {
                     height: 76px; background: root.worker-online ? #10251f : #291a20; border-color: root.worker-online ? #235f4e : #65323c;
@@ -153,14 +168,15 @@ export component MainWindow inherits Window {
                         Text { text: root.suite-description; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                         benchmarks-scroll := ScrollView { vertical-stretch: 1; viewport-width: self.width; VerticalLayout { width: benchmarks-scroll.visible-width - 16px; spacing: 9px; alignment: start;
                             for benchmark in root.benchmarks: Surface {
-                                height: 104px; vertical-stretch: 0;
+                                height: max(104px, workload-content.preferred-height + 28px); vertical-stretch: 0; clip: true;
                                 background: benchmark.selected ? #172e3b : workload-click.has-hover && benchmark.enabled ? #1a2330 : #151b26;
                                 border-color: benchmark.selected ? #4d91df : #293448;
                                 opacity: benchmark.enabled ? 1 : 0.62;
                                 HorizontalLayout { padding: 14px; spacing: 14px;
                                     Rectangle { width: 4px; background: benchmark.selected ? #65d9ba : #40506a; border-radius: 2px; }
-                                    VerticalLayout { spacing: 5px;
-                                        HorizontalLayout { Text { text: benchmark.name; color: #f4f7fb; font-size: 15px; font-weight: 700; } Rectangle { horizontal-stretch: 1; } Label { text: benchmark.data-type; color: #78a9ff; } }
+                                    workload-content := VerticalLayout { spacing: 5px; horizontal-stretch: 1;
+                                        Text { text: benchmark.name; color: #f4f7fb; font-size: 15px; font-weight: 700; wrap: word-wrap; }
+                                        Text { text: benchmark.data-type; color: #78a9ff; font-size: 11px; font-weight: 700; wrap: word-wrap; }
                                         Text { text: benchmark.workload; color: #adbacb; font-size: 11px; wrap: word-wrap; }
                                         Text { text: benchmark.enabled ? benchmark.unit : (benchmark.hardware-ready ? benchmark.availability : "Unavailable: " + benchmark.availability); color: benchmark.enabled ? #65d9ba : #f3ba67; font-size: 10px; wrap: word-wrap; }
                                     }
@@ -177,31 +193,145 @@ export component MainWindow inherits Window {
                         if root.show-gpu-selector && root.gpu-adapters.length > 0: ComboBox { model: root.gpu-adapters; current-value: root.selected-gpu-name; selected(value) => { root.select-gpu(self.current-index); } }
                         if !root.show-gpu-selector: Text { text: root.target-hardware-name; color: #f4f7fb; font-size: 14px; font-weight: 600; wrap: word-wrap; }
                         Text { text: root.target-hardware-description; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                        Text { text: root.load-description; color: #a5bce0; font-size: 11px; wrap: word-wrap; }
                         Rectangle { vertical-stretch: 1; }
                         if root.running: VerticalLayout { spacing: 10px; Label { text: "BENCHMARK IN PROGRESS"; color: #60e4c1; } Text { text: root.progress-message; color: #f4f7fb; font-size: 13px; wrap: word-wrap; } ProgressIndicator { progress: root.progress; } Text { text: root.queued-count > 0 ? "Queue: " + root.queued-count + " workload(s) remaining" : "Final workload in progress"; color: #9facbd; font-size: 11px; } Button { text: "Cancel benchmark"; clicked => { root.cancel(); } } }
-                        if !root.running: VerticalLayout { spacing: 10px; Text { text: "5 samples  |  approximately 2 seconds of timed measurement"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run selected workload"; primary: true; enabled: root.selected-benchmark-enabled; clicked => { root.run-selected(); } } Button { text: "Run all available in suite"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
+                        if !root.running: VerticalLayout { spacing: 10px; Text { text: "5 repeated samples · selected intensity controls apply"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run selected workload"; primary: true; enabled: root.selected-benchmark-enabled; clicked => { root.run-selected(); } } Button { text: "Run all available in suite"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
                     } }
                 }
-                if root.page == 2: results-scroll := ScrollView { vertical-stretch: 1; viewport-width: self.width;
-                    VerticalLayout { width: results-scroll.visible-width - 16px; spacing: 16px; alignment: start;
-                        HorizontalLayout { height: 58px; vertical-stretch: 0; VerticalLayout { spacing: 4px; SectionTitle { text: "Results workspace"; } Text { text: "Session measurements with performance context and confidence."; color: #8f9caf; font-size: 13px; } } Rectangle { horizontal-stretch: 1; } Button { width: 126px; height: 36px; vertical-stretch: 0; text: "Clear session"; enabled: root.results.length > 0; clicked => { root.clear-results(); } } }
-                        if root.results.length == 0: Surface { height: 205px; vertical-stretch: 0; VerticalLayout { padding: 26px; spacing: 10px; Text { text: "No measurements yet"; color: #f4f7fb; font-size: 22px; font-weight: 700; } Text { text: "Run a workload from Test Lab and its featured score, variability, and measurement context will appear here."; color: #9facbd; font-size: 13px; wrap: word-wrap; } Button { width: 150px; height: 36px; vertical-stretch: 0; text: "Open Test Lab"; primary: true; clicked => { root.select-page(1); } } } }
-                        if root.results.length > 0: Surface { height: root.result-details-expanded ? 320px : 258px; vertical-stretch: 0; background: #142331; border-color: #315d7a; VerticalLayout { padding: 20px; spacing: 9px;
-                            Label { text: "LATEST MEASUREMENT"; color: #73dcca; }
-                            HorizontalLayout { VerticalLayout { spacing: 3px; Text { text: root.results[0].title; color: #f4f7fb; font-size: 18px; font-weight: 700; } Text { text: root.results[0].device + "  |  " + root.results[0].elapsed; color: #a5b4c7; font-size: 11px; } } Rectangle { horizontal-stretch: 1; } Text { text: root.results[0].primary-value; color: #70e4cc; font-size: 30px; font-weight: 800; } }
-                            Text { text: root.results[0].primary-name + "  •  " + root.results[0].sample-count; color: #92a3b9; font-size: 11px; }
-                            HorizontalLayout { spacing: 8px; StatTile { horizontal-stretch: 1; label: root.results[0].fact-one-label; value: root.results[0].fact-one-value; } StatTile { horizontal-stretch: 1; label: root.results[0].fact-two-label; value: root.results[0].fact-two-value; } StatTile { horizontal-stretch: 1; label: root.results[0].fact-three-label; value: root.results[0].fact-three-value; } StatTile { horizontal-stretch: 1; label: root.results[0].fact-four-label; value: root.results[0].fact-four-value; } }
-                            Text { text: root.results[0].diagnosis; color: #b9c7d8; font-size: 11px; wrap: word-wrap; }
-                            if root.result-details-expanded: Text { text: "Measurement details: " + root.results[0].details; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
-                            Button { text: root.result-details-expanded ? "Hide measurement details" : "Show measurement details"; clicked => { root.toggle-result-details(); } }
-                        } }
-                        if root.results.length > 0: Text { height: 18px; vertical-stretch: 0; text: "RECENT RUNS"; color: #71809a; font-size: 11px; font-weight: 700; }
-                        for result in root.results: Surface { height: 174px; vertical-stretch: 0; VerticalLayout { padding: 15px; spacing: 7px;
-                            HorizontalLayout { VerticalLayout { spacing: 3px; Text { text: result.title; color: #f4f7fb; font-size: 15px; font-weight: 700; } Text { text: result.device + "  •  " + result.elapsed + "  •  " + result.sample-count; color: #8998ad; font-size: 10px; } } Rectangle { horizontal-stretch: 1; } VerticalLayout { alignment: end; spacing: 2px; Text { text: result.primary-value; color: #70e4cc; font-size: 19px; font-weight: 750; horizontal-alignment: right; } Text { text: result.primary-name; color: #71809a; font-size: 9px; horizontal-alignment: right; } } }
-                            HorizontalLayout { spacing: 8px; StatTile { horizontal-stretch: 1; label: result.fact-one-label; value: result.fact-one-value; } StatTile { horizontal-stretch: 1; label: result.fact-two-label; value: result.fact-two-value; } StatTile { horizontal-stretch: 1; label: result.fact-three-label; value: result.fact-three-value; } StatTile { horizontal-stretch: 1; label: result.fact-four-label; value: result.fact-four-value; } }
-                            Text { text: result.summary; color: #9db1c8; font-size: 10px; wrap: word-wrap; }
-                        } }
+                if root.page == 3: settings-scroll := ScrollView {
+                    viewport-width: self.width;
+                    VerticalLayout {
+                    width: settings-scroll.visible-width - 16px; spacing: 16px; alignment: start;
+                    SectionTitle { text: "Settings"; }
+                    Text { text: "Choose how much work the tests ask your system to do."; color: #8f9caf; font-size: 13px; wrap: word-wrap; }
+                    Surface { height: 190px; vertical-stretch: 0; VerticalLayout { padding: 18px; spacing: 10px;
+                        Text { text: "CPU worker allocation"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
+                        ComboBox { model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.cpu-intensity-name; enabled: !root.running; selected(value) => { root.select-cpu-intensity(self.current-index); } }
+                        Text { text: "Limits the number of workers used by CPU compute, cache, and RAM tests. Reduced modes leave some workers free for other apps and allocate fewer cache-test buffers. Single-thread tests still use one worker; a single-core system cannot reserve a whole core."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                    } }
+                    Surface { height: 190px; vertical-stretch: 0; VerticalLayout { padding: 18px; spacing: 10px;
+                        Text { text: "GPU activity pacing"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
+                        ComboBox { model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.gpu-intensity-name; enabled: !root.running; selected(value) => { root.select-gpu-intensity(self.current-index); } }
+                        Text { text: "Adds idle time between completed GPU work batches. Gentle waits about as long as the batch ran; Balanced adds about one-third as much idle time. These are activity targets, not exact utilization or power limits. GPU work can still reach full load during a burst."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                    } }
+                    Surface { height: 190px; vertical-stretch: 0; VerticalLayout { padding: 18px; spacing: 10px;
+                        Text { text: "Scaling test VRAM budget"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
+                        ComboBox { model: ["20% of VRAM", "25% of VRAM", "30% of VRAM", "40% of VRAM", "50% of VRAM", "60% of VRAM", "70% of VRAM", "80% of VRAM"]; current-value: root.vram-budget-name; enabled: !root.running; selected(value) => { root.select-vram-budget(self.current-index); } }
+                        Text { text: "Caps total test-buffer allocation for FP32 and FP16 matrix scaling profiles, with space reserved for outputs and allocation overhead. Both profiles sweep up to the selected budget. Larger budgets explore bigger data sets but leave less room for apps. Driver limits can lower the actual size; integrated matrix tests use an additional shared-memory cap."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                    } }
+                    Surface { height: 112px; vertical-stretch: 0; background: #292318; border-color: #635239; VerticalLayout { padding: 16px; spacing: 8px;
+                        Label { text: "HOW THIS AFFECTS YOUR RESULTS"; color: #f3ba67; }
+                        Text { text: "Reduced intensity can lower scores and improve responsiveness. Each result records its intensity; best scores and saved comparisons use matching settings. Lower load can reduce heat, but it cannot guarantee safe temperatures or prevent crashes. Settings apply to the next test and are locked while testing."; color: #d5c8b1; font-size: 12px; wrap: word-wrap; }
+                    } }
+                    Text { text: root.settings-status; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                     }
+                }
+                if root.page == 2: VerticalLayout {
+                    spacing: 10px;
+                    HorizontalLayout { height: 58px; vertical-stretch: 0;
+                        VerticalLayout { spacing: 4px; SectionTitle { text: "Component results"; } Text { text: "Latest and best scores by workload • " + root.result-count + " completed runs"; color: #8f9caf; font-size: 12px; } }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { width: 116px; height: 34px; vertical-stretch: 0; text: "Clear view"; enabled: root.result-count > 0; clicked => { root.clear-results(); } }
+                    }
+                    if root.result-count == 0: Surface { height: 190px; vertical-stretch: 0;
+                        VerticalLayout { padding: 24px; spacing: 12px;
+                            Text { text: "No measurements yet"; color: #f4f7fb; font-size: 22px; font-weight: 700; }
+                            Text { text: "Run workloads in Test Lab to build summaries for your CPU and graphics card. System memory results appear with the CPU."; color: #9facbd; font-size: 13px; wrap: word-wrap; }
+                            Button { width: 150px; height: 36px; text: "Open Test Lab"; primary: true; clicked => { root.select-page(1); } }
+                        }
+                    }
+                    if root.result-count > 0: HorizontalLayout { height: 34px; vertical-stretch: 0; spacing: 12px;
+                        Label { text: "COMPONENT"; vertical-alignment: center; }
+                        ComboBox { horizontal-stretch: 1; model: root.result-components; current-value: root.result-component-name; selected(value) => { root.select-result-component(self.current-index); } }
+                        if root.result-has-bandwidth: Button { text: root.bandwidth-mode == 2 ? "Memory: Change" : root.bandwidth-mode == 1 ? "Memory: Best" : "Memory: Latest"; clicked => { root.bandwidth-mode = mod(root.bandwidth-mode + 1, 3); } }
+                    }
+                    if root.result-count > 0: HorizontalLayout { height: 30px; vertical-stretch: 0; spacing: 10px;
+                        Label { text: "COMPARE WITH"; vertical-alignment: center; }
+                        ComboBox { horizontal-stretch: 1; model: root.comparison-options; current-value: root.comparison-name; selected(value) => { root.select-comparison(self.current-index); } }
+                    }
+                    if root.result-count > 0: summary-table := Surface {
+                        height: root.result-summaries.length * 23px + root.result-header-count * 27px + 20px;
+                        vertical-stretch: 0;
+                        VerticalLayout { padding: 10px; spacing: 3px;
+                            for row[index] in root.result-summaries: VerticalLayout {
+                                spacing: 3px; vertical-stretch: 0;
+                                if index == 0 || root.result-summaries[index - 1].section != row.section: HorizontalLayout {
+                                    height: 24px; spacing: 12px;
+                                    Label { text: row.bandwidth ? (root.bandwidth-mode == 2 ? "MEMORY / CHANGE" : root.bandwidth-mode == 1 ? "MEMORY / BEST" : "MEMORY / LATEST") : (row.section == 1 ? "CACHE & TRANSFERS" : "COMPUTE"); horizontal-stretch: 1; }
+                                    if row.bandwidth: Label { text: "READ"; width: 80px; horizontal-alignment: right; }
+                                    if row.bandwidth: Label { text: "WRITE"; width: 80px; horizontal-alignment: right; }
+                                    if row.bandwidth: Label { text: "COPY"; width: 80px; horizontal-alignment: right; }
+                                    if !row.bandwidth: Label { text: "LATEST"; width: 100px; horizontal-alignment: right; }
+                                    if !row.bandwidth: Label { text: "BEST"; width: 100px; horizontal-alignment: right; }
+                                    if !row.bandwidth: Label { text: "CHANGE"; width: 64px; horizontal-alignment: right; }
+                                    Label { text: "RUNS"; width: 38px; horizontal-alignment: right; }
+                                }
+                                Rectangle {
+                                    height: 20px; vertical-stretch: 0; border-radius: 5px;
+                                    background: root.result-selection == index ? #20364a : row-touch.has-hover ? #1b2838 : #111722;
+                                    HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 12px;
+                                        Text { text: row.title; color: #e2e9f2; font-size: 11px; font-weight: 600; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                                        if row.bandwidth: Text { text: root.bandwidth-mode == 2 ? row.read-delta : root.bandwidth-mode == 1 ? row.read-best : row.read-latest; color: root.bandwidth-mode == 1 ? #70e4cc : #dbe3ee; font-size: 11px; width: 80px; horizontal-alignment: right; vertical-alignment: center; }
+                                        if row.bandwidth: Text { text: root.bandwidth-mode == 2 ? row.write-delta : root.bandwidth-mode == 1 ? row.write-best : row.write-latest; color: root.bandwidth-mode == 1 ? #70e4cc : #dbe3ee; font-size: 11px; width: 80px; horizontal-alignment: right; vertical-alignment: center; }
+                                        if row.bandwidth: Text { text: root.bandwidth-mode == 2 ? row.copy-delta : root.bandwidth-mode == 1 ? row.copy-best : row.copy-latest; color: root.bandwidth-mode == 1 ? #70e4cc : #dbe3ee; font-size: 11px; width: 80px; horizontal-alignment: right; vertical-alignment: center; }
+                                        if !row.bandwidth: Text { text: row.latest; color: #dbe3ee; font-size: 12px; width: 100px; horizontal-alignment: right; vertical-alignment: center; }
+                                        if !row.bandwidth: Text { text: row.best; color: #70e4cc; font-size: 12px; width: 100px; horizontal-alignment: right; vertical-alignment: center; }
+                                        if !row.bandwidth: Text { text: row.delta; color: #a5bce0; font-size: 11px; width: 64px; horizontal-alignment: right; vertical-alignment: center; }
+                                        Text { text: row.runs; color: #8f9caf; font-size: 11px; width: 38px; horizontal-alignment: right; vertical-alignment: center; }
+                                    }
+                                    row-touch := TouchArea { mouse-cursor: pointer; clicked => { root.select-result-row(index); } }
+                                }
+                            }
+                        }
+                    }
+                    if root.result-page-count > 1: HorizontalLayout { height: 28px; vertical-stretch: 0; spacing: 10px;
+                        Text { text: "Workloads " + (root.result-page + 1) + " / " + root.result-page-count; color: #8f9caf; font-size: 11px; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "Previous"; enabled: root.result-page > 0; clicked => { root.change-result-page(-1); } }
+                        Button { text: "Next"; enabled: root.result-page + 1 < root.result-page-count; clicked => { root.change-result-page(1); } }
+                    }
+                    if root.result-count > 0: Surface { min-height: 70px; vertical-stretch: 1; background: #142331; border-color: #315d7a;
+                        VerticalLayout { padding: 12px; spacing: 6px;
+                            HorizontalLayout { height: 26px; vertical-stretch: 0;
+                                Label { text: "LATEST RUN CONTEXT"; color: #73dcca; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text { text: root.selected-result.sample-count + " • " + root.selected-result.elapsed; color: #8f9caf; font-size: 10px; vertical-alignment: center; }
+                                Button { text: root.result-details-expanded ? "Hide details" : "Details"; clicked => { root.toggle-result-details(); } }
+                            }
+                            context-scroll := ScrollView { viewport-width: self.width; vertical-stretch: 1;
+                                VerticalLayout { width: context-scroll.visible-width - 12px; spacing: 6px; alignment: start;
+                                    Text { text: root.selected-result.title; color: #dbe3ee; font-size: 12px; font-weight: 600; wrap: word-wrap; }
+                                    Text { text: root.comparison-note; color: #a5bce0; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: root.selected-result.summary; color: #73dcca; font-size: 13px; font-weight: 600; wrap: word-wrap; }
+                                    Label { text: "WHAT THIS TEST MEASURES"; }
+                                    Text { text: root.selected-result.description; color: #c2cede; font-size: 12px; wrap: word-wrap; }
+                                    Label { text: "WHERE IT CAN HELP"; }
+                                    Text { text: root.selected-result.everyday-use; color: #c2cede; font-size: 12px; wrap: word-wrap; }
+                                    Label { text: "HOW TO READ YOUR SCORE"; }
+                                    Text { text: root.selected-result.score-guide; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: root.selected-result.fact-one-label + ": " + root.selected-result.fact-one-value; color: #9db1c8; font-size: 10px; wrap: word-wrap; }
+                                    if root.result-details-expanded: Text { text: root.selected-result.diagnosis; color: #b9c7d8; font-size: 10px; wrap: word-wrap; }
+                                    if root.result-details-expanded: Text { text: root.selected-result.details; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    if root.selected-result.tuning-guidance != "" && root.result-count > 0: Surface {
+                        background: #172c32; border-color: #4aa99a; height: 148px; vertical-stretch: 0; clip: true;
+                        VerticalLayout { padding: 12px; spacing: 6px;
+                            Text { text: "TUNING SUGGESTIONS"; color: #83efda; font-size: 14px; font-weight: 700; }
+                            tuning-scroll := ScrollView { viewport-width: self.width; vertical-stretch: 1;
+                                VerticalLayout { width: tuning-scroll.visible-width - 12px; spacing: 8px; alignment: start;
+                                    Text { text: root.selected-result.tuning-guidance; color: #dbe8ee; font-size: 12px; wrap: word-wrap; }
+                                    Text { text: "These scores include your existing clock limits. Trial suggestions are relative to your current setup."; color: #9db9bd; font-size: 11px; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    if root.result-count > 0: Text { height: 16px; vertical-stretch: 0; text: "Change compares with the selected saved setup. + means higher throughput; — means no comparable score."; color: #71809a; font-size: 10px; wrap: word-wrap; }
+                    Text { text: root.results-file-status; color: #8f9caf; font-size: 10px; wrap: word-wrap; vertical-stretch: 0; }
+                    if root.result-count == 0: Rectangle { vertical-stretch: 1; }
                 }
             }
         }
