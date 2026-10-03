@@ -2,290 +2,225 @@
 
 [![CI](https://github.com/githubdood21/Gluj-Bench/actions/workflows/ci.yml/badge.svg)](https://github.com/githubdood21/Gluj-Bench/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/githubdood21/Gluj-Bench?display_name=tag)](https://github.com/githubdood21/Gluj-Bench/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-5d91ff)](#system-requirements)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-5d91ff)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-3dd6c6)](LICENSE)
 
 <p align="center">
-  <strong>A free, vendor-neutral CPU, GPU, cache, and memory benchmark for Windows.</strong>
+  <img src="design/logo-drafts/loop-chip-g-preview.png" alt="Gluj-Bench chip and retest-loop logo" width="112">
 </p>
+
+**Measure. Adjust. Retest.**
+
+Gluj-Bench is a free, vendor-neutral hardware benchmark for Windows. It measures CPU and GPU calculation throughput, cache and memory bandwidth, and how performance changes as a workload grows beyond cache into RAM or VRAM.
+
+Version **0.2.0** focuses on understanding the hardware available to a workload. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
+
+## Get started
+
+1. Download the [latest Windows x64 release](https://github.com/githubdood21/Gluj-Bench/releases/latest).
+2. Extract the entire ZIP into a writable folder. Keep `gluj-bench-ui.exe` and `gluj-bench-worker.exe` together.
+3. Launch `gluj-bench-ui.exe` and wait for the hardware scan to finish.
+4. Open **Settings** to choose your CPU allocation, GPU activity and scaling memory budgets.
+5. Open **Benchmarks**, select a category and benchmark, then run it or queue the available benchmarks in that category.
+6. Review **Benchmark Results**. Expand the explanations, scaling graphs or tuning measurements for more detail.
+
+A floating **Stop all tests** control remains accessible on every page while a benchmark runs. It requests cancellation of the active benchmark and clears the queue; it shows **Stopping...** until cancellation completes.
+
+## Requirements
+
+- Windows x64 and an x64 processor. CPU topology discovery and thread affinity currently use Windows APIs.
+- A graphics driver with Vulkan compute support for GPU benchmarks. CPU and RAM benchmarks remain usable when no compatible GPU is available.
+- AVX2 and FMA support for the CPU AVX2 vector and FP32 matrix scaling benchmarks.
+- Driver-exposed cooperative-matrix capabilities for the corresponding GPU matrix benchmarks.
+- Enough available RAM or GPU memory for the chosen allocation budget.
+
+The release does not require a manufacturer-specific compute SDK. Unsupported benchmarks stay visible with an explanation of the missing capability or implementation.
+
+## The application
+
+### System Information
 
 <p align="center">
-  <img src="App-Home.png" alt="Gluj-Bench overview showing detected CPU, memory, and GPU hardware" width="900">
+  <img src="SysInfo.png" alt="System Information showing scanned hardware, processor details and capability badges" width="1000">
 </p>
 
-## TL;DR
+Hardware cards show your processor, system memory and detected graphics devices with component icons, readable capacities and capability badges. **Details** expands the underlying hardware properties and CPU cache topology.
 
-Download the latest Windows x64 release, extract it, and run `gluj-bench-ui.exe`. Gluj-Bench measures CPU and GPU compute performance plus cache, RAM, VRAM, and host-to-GPU bandwidth without requiring manufacturer-specific SDKs. It is an early work in progress, so expect bugs and treat every result as an informative measured value—not an exact statement of theoretical hardware capability.
+A checkmark indicates that hardware has been scanned and benchmarks are available. The **available memory** figure reflects the hardware scan; it is not a live utilization monitor. **Refresh hardware** updates the discovered capabilities.
 
-> [!WARNING]
-> **Work in progress:** Gluj-Bench is an initial public preview and is not finalized. Bugs, incorrect readings, hangs, and crashes are possible. Benchmark definitions, kernels, metadata, and scores may change before 1.0.
+### Benchmarks
 
-> [!IMPORTANT]
-> **Results disclaimer:** This software is provided **as is**, without warranty. Results should be taken with a grain of salt: they reflect what Gluj-Bench measured under a particular workload, software stack, driver, power state, and system configuration. They are not 1:1 replicas of a device's complete capabilities, guaranteed theoretical peaks, or directly interchangeable with results from other benchmark tools.
+<p align="center">
+  <img src="Benchmarks.png" alt="Benchmarks page with CPU scaling workloads and benchmark details" width="1000">
+</p>
 
-## About Gluj-Bench
+Choose between CPU bandwidth, CPU performance, GPU bandwidth and GPU performance. GPU benchmarks use the selected graphics adapter. Benchmark descriptions explain what each workload measures and where that type of calculation or memory access is useful before you run it.
 
-Gluj-Bench is a free, vendor-neutral, AIDA64-like hardware benchmarking tool for Windows. It is designed to test CPU and GPU compute performance together with CPU cache, system RAM, GPU cache, VRAM, and host-to-GPU link bandwidth.
+Runs use five repeated samples by default. A scaling benchmark repeats sampling at each dataset size, so it can take substantially longer than a single throughput test.
 
-Gluj-Bench provides transparent, reproducible measurements rather than a single unexplained score. GPU performance separates register-resident vector throughput, a memory-backed FP32 working-set sweep, and capability-gated cooperative-matrix throughput. GPU bandwidth measures empirically inferred effective L2/L3 regions, cache-separated GPU-local memory, and bidirectional host-device transfers. CPU suites measure aggregate L1-L3 data-cache and system-RAM bandwidth plus pinned integer, floating-point, string, prime-search, codec, POPCNT, AES, and AVX2/FMA workloads. Unsupported capabilities remain visibly disabled rather than producing synthetic results.
+### Benchmark Results
 
-Gluj-Bench is independently developed and is not affiliated with or endorsed by FinalWire or AIDA64.
+<p align="center">
+  <img src="ScalingCompute.png" alt="FP16 matrix scaling results with compute throughput and effective traffic graphs" width="1000">
+</p>
 
-## Screenshots
+The selected component has one scrollable results page without workload pagination. CPU cache and system RAM measurements appear together. Memory rows show separate **read**, **write** and **copy** values in GB/s; compute rows show the latest and best compatible measurements.
 
-### Workload settings
+Descriptions and tuning guidance start with a short takeaway. Expand their dropdowns to inspect the explanation, statistics and reasoning. Scaling rows feature the **largest tested dataset**, rather than the fastest small dataset that fits in cache.
 
-The **Settings** page provides CPU-worker and GPU-activity presets: Gentle (50%),
-Balanced (75%, the default), and Full (100%). CPU presets limit the workers used
-by aggregate compute, cache, and RAM tests. Single-thread tests still use one
-worker. GPU presets add cancellable idle pauses after completed submissions;
-reduced modes also target shorter batches. GPU timestamp scores exclude the idle
-pauses, while wall-clock transfer scores include them. Reduced modes can change
-scores and improve responsiveness, but do not guarantee temperature or stability.
+## What is measured
 
-GPU scaling tests have a **20–80% VRAM allocation ceiling**, with a default of 25%.
-The ceiling includes their test buffers and reserves allocation overhead. The
-matrix profile reserves its output buffer before sizing input data. Storage-buffer
-limits and integrated-GPU shared-memory limits can reduce the tested size. The
-FP32 profile splits larger working sets into dispatches within the device's limits;
-both profiles include the selected maximum as their final aligned sweep tier.
-Allocation is based on reported VRAM capacity; other applications can consume
-memory concurrently and cause an allocation to fail. The requested ceiling and
-allocated test-buffer sizes are recorded with the result.
+| Category | Benchmarks |
+| --- | --- |
+| CPU bandwidth | L1, L2 and L3 data-cache bandwidth; system RAM read, write and copy bandwidth |
+| CPU performance | FP32/FP64 arithmetic, AVX2/FMA, integer arithmetic, single-thread integer throughput, ASCII scanning, prime sieve, DEFLATE compression/decompression, AES rounds and POPCNT |
+| CPU scaling | AVX2 FP32 vector throughput and blocked FP32 matrix throughput across increasing aggregate datasets |
+| GPU bandwidth | Estimated effective cache bandwidth, GPU-accessible memory read/write/copy bandwidth, and host-device transfers |
+| GPU performance | Register-resident FP16, FP32 and FP64 vector throughput; supported dense FP16 and INT8 matrix calculations |
+| GPU scaling | Memory-backed FP32 vector and dense FP16 matrix profiles across increasing working sets |
 
-Both GPU scaling profiles first run their register-resident compute benchmark to
-measure a compute ceiling under the same activity setting. This is an empirical
-reference, not a theoretical hardware specification. The small-set baseline is
-kept for detecting sustained memory-pressure transitions; every sweep tier also
-records its percentage delta against the compute reference.
-The reference is repeated after the sweep to check boost/thermal drift. The higher
-reference is retained, and drift above 5% labels clock trials as exploratory.
+FP8 and sparse matrix families are also represented in capability discovery. Their rows remain disabled when a compatible, verified runner is unavailable; dense matrix support alone does not imply sparse acceleration.
 
-The result includes a tuning trial when a sustained transition and a meaningful
-drop against the smaller of the small-set and register references support it.
-This avoids counting different-kernel overhead as spare core capacity. Drift and
-small-set/reference mismatch receive confidence notes rather than blocking a trial.
-A meaningful drop must exceed twice
-the combined relative sample deviation, with individual variation at most 10%.
-Runs above 2% variation receive an exploratory label and a reminder to repeat
-measurements. An idealized roofline model estimates core headroom as
-`1 - largest_throughput / compute_reference` and the bandwidth increase needed to
-reach the reference as `compute_reference / largest_throughput - 1`. Different
-kernels, boost clocks, cache, and other bottlenecks can invalidate those estimates.
-The core-frequency-limit trial uses 75% of estimated spare compute headroom,
-rounded down to 5% steps and capped at a further 40% reduction of the current
-frequency limit. Existing limits are already included in the measured reference;
-this is an additional relative reduction, not percentage points from stock.
-The trial changes the frequency ceiling only and requires reruns to verify at
-0–5% performance loss against the original result at the same largest data-set
-size. Users adjust the limit in small steps and raise it if loss exceeds 5%.
-It never applies clock or voltage changes or treats
-the calculated bandwidth gap as a memory-clock target. No MHz target or performance
-guarantee is inferred without measurements at changed clocks. Uncertain results
-withhold tuning suggestions. Old results remain readable; comparisons require
-matching analysis revisions and arithmetic/tile-reuse settings.
-Scaling summary scores and saved-result comparisons use the largest tested data
-set, with its size and throughput loss against the matching register-resident
-reference shown prominently. Best scores compare the same largest data-set size
-across runs, never the fastest small cache tier. Tuning guidance has its own box.
+### Reading the units
 
-Choices save to `settings.json` beside the executable and cannot be changed during
-a run. Results retain their intensity and scaling allocation settings; best-score
-selection and deltas only compare matching settings. Older results without these
-fields are treated as full intensity with the original 25% scaling budget.
+- **TOPS:** trillions of operations per second. Floating-point multiply and add count separately, so one FMA per lane counts as two operations. Other operation types have their own definitions in the benchmark details; their rates are not interchangeable.
+- **GB/s:** billions of bytes processed per second. Read, write and copy are distinct operations, with traffic accounting described in the details.
+- **KiB, MiB and GiB:** binary dataset sizes. A GiB is 1,073,741,824 bytes; memory capacities and working sets use these units.
+- **Sample statistics:** medians, minimums, maximums and variation describe repeated measurements of the same workload.
 
-Results save automatically to a compact `results.json` beside `gluj-bench-ui.exe`
-and load when the app starts. The file keeps the latest result for each workload
-and detected hardware setup (up to 128 entries). Keep this file when moving or
-updating the app to retain your comparisons.
+A throughput result describes that kernel, numeric format, dataset and configuration. It is not a measurement of every task the component can perform.
 
-After running a test again, choose a saved setup under **Compare with** to see the
-percentage change. Compute rows show **Change**; the memory button cycles through
-**Latest**, **Best**, and **Change** for read, write, and copy. A positive change
-means higher throughput. Results with different metric units or incompatible
-workload settings are not compared. **Clear view** clears the displayed runs while
-preserving the saved file. Save/load problems are shown on the Results page.
+## Allocation and activity settings
 
-Hardware identity uses detected component details, including CPU/cache metadata,
-RAM capacity, and GPU properties. RAM modules or timings that the hardware scan
-does not report cannot be distinguished as separate setups; repeated runs can
-still be compared with the results loaded at startup.
+Settings save beside the executable and apply to the next run. Controls are locked while benchmarking.
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="App-CPU-Benchmark-Options.png" alt="CPU benchmark selection and configuration options" width="520"><br>
-      <sub><strong>CPU benchmark selection and configuration</strong></sub>
-    </td>
-    <td align="center">
-      <img src="App-GPU-results.png" alt="GPU bandwidth and compute benchmark results" width="520"><br>
-      <sub><strong>Detailed GPU benchmark results</strong></sub>
-    </td>
-  </tr>
-</table>
+| Setting | Choices / default | Effect |
+| --- | --- | --- |
+| CPU worker allocation | Gentle 50%, Balanced 75% (default), Full 100% | In Automatic mode, selects that share of physical CPU cores, with at least one worker |
+| CPU physical cores | Automatic (default), or an exact count | Uses one pinned worker per selected physical core, excluding SMT siblings; an exact count overrides the percentage preset |
+| CPU scaling RAM budget | 20-80% of installed RAM; default 20% | Limits combined buffers for CPU vector and matrix scaling |
+| GPU activity pacing | Gentle 50%, Balanced 75% (default), Full 100% | Adds cancellable idle intervals between GPU submissions; reduced modes also target shorter batches |
+| GPU scaling VRAM budget | 20-80% of reported GPU memory; default 25% | Limits test-buffer allocation for GPU scaling profiles |
 
-## Download and run
+Single-thread CPU tests always use one worker. Ordinary CPU cache and RAM bandwidth tests keep their own dataset sizing; the percentage RAM budget applies to the scaling profiles.
 
-1. Download the Windows x64 ZIP and its `.sha256` file from the [latest GitHub release](https://github.com/githubdood21/Gluj-Bench/releases/latest).
-2. Verify the archive in PowerShell:
+The CPU scaling allocation also uses no more than 80% of currently available RAM and leaves at least 2 GiB available. GPU profiles reserve allocation overhead, and the matrix profile accounts for its output buffer. Vulkan storage-buffer limits, alignment and shared-memory limits on integrated GPUs can reduce the actual tested size. Concurrent applications can change memory availability or cause an allocation to fail.
 
-   ```powershell
-   Get-FileHash .\Gluj-Bench-0.1.0-windows-x64.zip -Algorithm SHA256
-   Get-Content .\Gluj-Bench-0.1.0-windows-x64.zip.sha256
-   ```
+Reduced allocation or activity can improve responsiveness and may reduce heat or power use, but it can also lower measured throughput. GPU timestamp measurements exclude pacing intervals; wall-clock transfer measurements include them. Settings do not impose a temperature limit or guarantee stability.
 
-3. Extract the entire ZIP and run `gluj-bench-ui.exe`. Keep `gluj-bench-worker.exe` beside it.
+## Scaling performance
 
-Release binaries are currently unsigned, so Windows may display a SmartScreen warning. Only download releases from this repository and verify the published SHA-256 checksum.
+A scaling profile measures progressively larger datasets to expose how cache reuse and memory traffic affect calculation throughput. Each profile measures a register-resident compute reference before and after the sweep. The **latest post-sweep reference** drives the reported delta and tuning guidance; the initial reference is used to assess drift. These are measured references, not theoretical peaks from a hardware specification.
 
-## System requirements
+Expanded results include:
 
-- Windows 10 or Windows 11, x64
-- A supported x64 CPU for CPU and memory suites
-- Current graphics drivers with a compatible Vulkan backend for GPU suites
-- Sufficient free RAM and VRAM for the selected bandwidth workloads
+- Compute throughput and effective traffic graphs against logarithmic dataset size.
+- Median points, minimum-maximum sample ranges and a current-run compute reference.
+- A dataset selector with exact sample statistics and, for CPU matrices, per-worker dimensions.
+- The largest tested allocation, its throughput and the change against the reference.
+- A sustained memory-pressure transition when the recorded samples support that inference.
 
-GPU support is optional. CPU and RAM benchmarks remain usable when no compatible GPU backend is available.
+### CPU vector and matrix profiles
 
-## Benchmarking safety and repeatability
+The AVX2 FP32 vector profile gives each worker two input arrays and one output array. It performs 16 FMAs per value, keeping a fixed compute-to-data ratio of about 2.67 operations per byte of effective traffic.
 
-Gluj-Bench intentionally places sustained load on the CPU, memory, and GPU. Ensure cooling is functioning correctly, avoid unstable overclocks, and stop a run if the system behaves abnormally. Close unnecessary background applications, use a consistent Windows power plan, and allow temperatures to stabilize before comparing results. Scores from different workload versions or metadata should not be treated as directly equivalent.
+The FP32 matrix profile uses blocked AVX2/FMA multiplication. Each worker owns A[32,K], B[K,N] and C[32,N], with K=N increasing through the sweep. The fixed 32-row batch reuses weights across rows. Dataset sizes are the **aggregate allocation across all workers**, not the size per core.
 
-## Technology
+Matrix GB/s counts effective accesses within the kernel, including data served repeatedly from cache. Vector traffic counts two input reads and an output write, excluding write allocation and cache-line writeback. Neither figure is direct RAM-controller utilization. Changing the core count also changes the per-worker matrix dimensions; inspect those shapes and the aggregate dataset size when comparing configurations.
 
-- Rust 2024 workspace managed by Cargo
-- `eframe`/`egui` desktop interface using the lightweight Glow renderer
-- Separate long-lived benchmark worker process for measurement isolation
-- `sysinfo` for portable CPU and memory discovery
-- Vulkan through `ash` for authoritative GPU discovery, stable device identity, queue/timestamp capabilities, and cooperative-matrix format enumeration
-- Raw Vulkan with embedded SPIR-V for GPU bandwidth, FP16/FP32/FP64 vector benchmarks, and capability-gated FP16/INT8 cooperative-matrix benchmarks
-- Versioned newline-delimited JSON for UI-to-worker communication
-- LLVM-MinGW Windows toolchain, with no Visual Studio installation required
+### GPU vector and matrix profiles
 
-GPU handling is based on exposed capabilities such as compute and timestamp-query support. There are no manufacturer-specific SDKs or execution paths.
+The FP32 vector profile streams progressively larger memory-backed arrays. The dense FP16 matrix profile streams cooperative-matrix operands with reuse. Both work toward the selected VRAM budget and report the actual aligned size reached, subject to device limits.
 
-## Workspace layout
+Their effective traffic can include cache-served data. A throughput drop as the working set grows suggests memory pressure for that workload; it does not directly measure GPU stall time or the exact percentage of memory congestion.
 
-The application is split into five Cargo packages:
+## Tuning guidance: change one thing, then retest
 
-- `gluj-bench-core` defines devices, benchmarks, results, metrics, cancellation, progress, providers, and the protocol.
-- `gluj-bench-cpu` contains optimized CPU topology discovery and bandwidth kernels.
-- `gluj-bench-gpu` contains Vulkan capability discovery, empirical cache analysis, GPU kernels, and host-device transfer measurements.
-- `gluj-bench-worker` provides hardware discovery, the CLI, and the standard-I/O protocol host.
-- `gluj-bench-ui` provides the desktop application and manages the worker as a child process.
+Guidance uses the **latest run**, not the historical best measurement. Noisy samples or uncertain evidence may require another run instead of a numerical suggestion.
 
-The protocol is documented in [docs/protocol.md](docs/protocol.md).
+**CPU:** stable, sustained memory-pressure evidence with multiple physical cores can suggest an exploratory trial at roughly 75% of the current core count. Rerun at the same largest aggregate dataset. Keep the reduction if throughput remains within 5% of the original result or improves; restore more cores if the loss is larger. The app does not measure fewer-core performance automatically or establish an optimal core count.
 
-## Windows prerequisites
+**GPU:** supported scaling evidence can suggest a further reduction to the current core-frequency limit. The trial is relative to the configuration already measured, including any existing limit. Adjust in small steps and rerun the same dataset, aiming for no more than 5% throughput loss. Memory-bandwidth estimates are explanatory gaps, not memory-clock targets.
 
-Install Rust with the official [rustup installer](https://rustup.rs/) or WinGet:
+Power use, temperatures and performance after a change are not measured by the suggestion. For another application, change its worker count or affinity manually and test its own workload. **Gluj-Bench never applies CPU/GPU clock, voltage or external-process affinity changes.**
+
+## Saved results and comparisons
+
+Results and settings are portable files beside the executables. Hardware metadata uses the Windows application-data folder:
+
+| File | Location | Purpose |
+| --- | --- | --- |
+| `results.json` | Beside the executables | Latest result per benchmark, hardware setup and allocation settings, up to 128 entries |
+| `settings.json` | Beside the executables | Allocation budgets, CPU core selection and activity presets |
+| `hardware-metadata.json` | `%APPDATA%/Gluj-Bench/` | Cached hardware metadata for startup and comparison context |
+
+Keep `results.json` and `settings.json` when updating or moving the app. The application folder must be writable to persist them. Hardware metadata is refreshed separately.
+
+Run a benchmark again, then choose a saved setup under **Compare with**. Compute rows show percentage **Change**; the memory display switches between **Latest**, **Best** and **Change**. A positive change means higher throughput. The displayed best measurement comes from compatible runs in the current session; the saved file is a compact latest-result history, not an unlimited archive of every run.
+
+Comparisons require compatible units, workload definitions and recorded settings, including CPU allocation and scaling budgets. Different allocations are not silently treated as equivalent. **Clear view** clears the displayed runs while preserving the saved file. Save/load errors appear on the results page.
+
+Detected component properties identify saved setups. RAM modules or timings not exposed by discovery cannot be distinguished reliably. Retesting can still compare against the results loaded when the app started.
+
+## Build from source
+
+The application uses **Rust and Slint** for the desktop UI. GPU execution uses **raw Vulkan through `ash`**, with embedded SPIR-V kernels. A separate worker process runs discovery and measurements.
+
+The workspace requires Rust 1.95 or newer. `rust-toolchain.toml` selects stable Rust, Clippy, rustfmt and the Windows GNU LLVM target. The packaging wrapper uses LLVM-MinGW for its compiler, linker and static runtime settings.
+
+Install the prerequisites in PowerShell, then reopen your terminal:
 
 ```powershell
-winget install --id Rustlang.Rustup
-```
-
-Run `rustup-init` if the installer does not start it automatically. The repository's `rust-toolchain.toml` selects the required Rust host and Windows target.
-
-Install the self-contained LLVM-MinGW toolchain:
-
-```powershell
+winget install --id Rustlang.Rustup --exact
 winget install --id MartinStorsjo.LLVM-MinGW.MSVCRT --exact
 ```
 
-Restart VS Code after installing the prerequisites, then verify:
+From the repository root:
 
 ```powershell
-rustc --version
-cargo --version
-```
-
-The project wrapper locates LLVM-MinGW automatically and builds statically linked application binaries. You do not need to configure a compiler, linker, SDK path, or dependency manager manually.
-
-## Run from VS Code
-
-1. Open the repository folder in VS Code.
-2. Install the recommended **rust-analyzer** and **CodeLLDB** extensions.
-3. Open **Run and Debug** and select **Gluj-Bench UI (Debug)**.
-4. Press `F5`.
-
-Every F5 launch runs the complete debug workspace build first and then starts the UI under CodeLLDB. `Ctrl+Shift+B` runs the same build task.
-
-## Command-line development
-
-Use the wrapper so Cargo receives the correct Windows target, linker, runtime, and static-link settings:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 build --workspace
-powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 test --workspace
+powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 build --workspace --locked
+powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 test --workspace --locked
 powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
 powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 run -p gluj-bench-ui
 ```
 
-Debug executables are written to:
+Wrapper builds place the executables in `target/x86_64-pc-windows-gnullvm/debug/`. Build the workspace first so the worker is beside the UI. The first build downloads dependencies. Precompiled SPIR-V files are included; ordinary builds do not require a shader compiler.
 
-```text
-target/x86_64-pc-windows-gnullvm/debug/
-```
+VS Code provides a **Gluj-Bench UI (Debug)** launch configuration that builds the workspace before starting the UI. Install the recommended rust-analyzer and CodeLLDB extensions for that workflow.
 
-The first build downloads and compiles the dependency graph. Later builds are incremental and substantially faster.
-
-To create the same Windows x64 archive used by GitHub Releases:
+### Package version 0.2.0
 
 ```powershell
-.\scripts\package-release.ps1 -Version 0.1.0
+.\scripts\package-release.ps1 -Version 0.2.0
 ```
 
-The archive and SHA-256 checksum are written to `dist/`. Maintainer instructions are in [RELEASING.md](RELEASING.md), notable changes in [CHANGELOG.md](CHANGELOG.md), and private vulnerability reporting guidance in [SECURITY.md](SECURITY.md).
+The script verifies the Cargo version, builds the release workspace, and creates the Windows x64 ZIP and SHA-256 checksum under `dist/`. Pass `-SkipBuild` only when the matching release binaries have already been built. The Windows icon and version metadata are embedded in the UI executable; no separate icon installation is required.
 
-## Worker CLI
+### Workspace layout
 
-The worker can be used independently:
+| Package | Responsibility |
+| --- | --- |
+| `gluj-bench-core` | Devices, benchmark definitions, results, sampling metadata, cancellation and protocol |
+| `gluj-bench-cpu` | Windows CPU topology, pinned compute/bandwidth kernels and CPU scaling profiles |
+| `gluj-bench-gpu` | Vulkan discovery, compute/matrix kernels, memory profiles and scaling analysis |
+| `gluj-bench-worker` | Isolated benchmark process, hardware discovery, CLI and JSON request host |
+| `gluj-bench-ui` | Slint interface, settings, graphs, result persistence and worker management |
 
-```text
-gluj-bench-worker devices [--json]
-gluj-bench-worker benchmarks [--json]
-gluj-bench-worker run <benchmark-id> [--json]
-gluj-bench-worker --stdio
+### Worker CLI
+
+```powershell
+.\gluj-bench-worker.exe devices --json
+.\gluj-bench-worker.exe benchmarks --json
+.\gluj-bench-worker.exe run cpu.performance.avx2.f32_fma.scaling --json
+.\gluj-bench-worker.exe --stdio
 ```
 
-Human-readable commands write normal output to stdout. With `--json`, stdout contains a versioned protocol response. In `--stdio` mode, stdout is reserved for newline-delimited JSON and diagnostics are written to stderr.
+The worker's standard-I/O interface uses versioned newline-delimited JSON requests, progress responses and cancellation. UI settings are sent as run options; direct CLI runs use backend defaults and do not read the UI's `settings.json`. See [the protocol documentation](docs/protocol.md) for the request format.
 
-## Current behavior
+## Project information
 
-- CPU, system memory, and compatible GPU devices are discovered at runtime.
-- Missing GPU support is nonfatal; CPU and memory remain available.
-- GPU devices are evaluated by backend capabilities, not manufacturer identity.
-- Duplicate backend views of the same adapter are consolidated and the UI provides an explicit GPU selector. GPU runs pass its `device_id` through protocol configuration.
-- GPU cache discovery sends a fixed amount of coalesced traffic through power-of-two working sets from 256 KiB to 512 MiB. A normal boundary requires repeatable samples, a stable preceding plateau, and a sustained 20% drop at two larger sizes; an outermost sustained collapse of at least 50% is retained as a lower-confidence last-level boundary even when the preceding region slopes near capacity.
-- Detected cache regions are displayed as **Estimated Effective L2** and **Estimated Effective L3**. They are behavioral inferences, not claims about physical cache topology; capacity intervals, confidence, thresholds, and the complete sweep are attached to result metadata.
-- Effective-cache and GPU-local kernels use coalesced 16-byte vector accesses with independent accumulators and sparse checksum writes. Cache reads use four vectors per invocation, streaming VRAM reads use sixty-four across eight dependency chains, streaming writes/copies use sixteen, and write/copy cache kernels retain one vector per invocation to keep small working sets highly parallel. GPU-local memory uses at least 256 MiB and four times the outer inferred cache boundary.
-- GPU copy bandwidth reports read-plus-write device-memory traffic for comparison with peak VRAM/cache bandwidth; useful copied payload is exactly half that reported rate and the convention is recorded in result metadata.
-- GPU-local operations run a discarded 750 ms sustained preconditioning workload before calibration and sampling so portable power management can raise core and memory clocks. The application does not force a vendor driver clock lock, and results explicitly record that distinction.
-- GPU shader benchmarks cover FP16, FP32, and FP64 register-resident vector arithmetic. `gpu.performance.fp32.scaling` additionally measures a memory-backed FP32 workload at nominal power-of-two targets from 256 KiB up to the selected VRAM budget, including a final aligned tier near that budget. `gpu.performance.matrix.fp16.scaling` streams dense FP16 cooperative-matrix operands from 256 KiB up to the selected VRAM budget on discrete GPUs, subject to device-memory and Vulkan binding limits, to expose cache-to-VRAM degradation under neural-network-style weight pressure. Both profiles respect the selected 20–80% allocation ceiling (25% by default); the integrated matrix profile also remains capped at one-eighth of shared device-local memory. Both profiles report exact aligned working sets, compute and effective traffic per tier, and the first statistically significant sustained drop below the small-set baseline. The matrix profile uses configurable tile reuse and is not presented as end-to-end LLM inference. Matrix benchmarks expose dense and sparse FP16, INT8, and FP8 families. Vulkan-reported MxNxK and numeric-type configurations directly gate the raw Vulkan cooperative-matrix runners; formats without a capability-verified path remain visible with their exact reason.
-- Precision classes are compared within the same execution domain. In particular, the RX 7900 XTX is specified for equal FP16-vector and FP32-vector peak throughput; its doubled FP16 figure belongs to the separate matrix path.
-- Host-to-device and device-to-host tests use a first-touched ring of three preallocated 64 MiB host-visible staging buffers, batched native buffer copies, and CPU wall-clock completion timing. Discrete adapters are marked `probable_pcie`, integrated adapters `shared_memory_or_uma`, and both classifications remain explicit inferences.
-- Overview, Benchmarks, and Results screens are present in the UI.
-- L1-L3 cache and system-RAM read, write, and copy bandwidth benchmarks run across all discovered physical cores when topology and working-set requirements can be satisfied.
-- Per-cache-instance working-set partitioning supports processors with multiple shared last-level caches without relying on manufacturer IDs.
-- Cache measurements use 40% of each discovered cache instance, divide that capacity only among cores in the instance's topology mask, and preload disjoint per-core buffers before timing. RAM measurements flush their working cache lines and rotate the sequential starting line before every timed sweep. Buffers are first-touched by their pinned owner core; preparation and cache flushing are excluded from elapsed time.
-- Read, write, and copy operations each target 2 seconds by default and report the median of five samples.
-- Physical-core workers remain the default. Protocol clients can request `thread_mode=logical_processors` for controlled SMT comparisons; cache capacity is divided between sibling workers so physical-core and logical-processor modes use the same aggregate footprint.
-- Cache copy bandwidth follows AIDA64-style read-plus-write traffic accounting; RAM copy continues to report useful payload bandwidth. Result metadata identifies the byte definition explicitly.
-- Cache SIMD kernels process eight vectors per iteration. Read kernels maintain eight independent accumulators to avoid serial load dependencies; write and copy kernels issue batched aligned operations to approach the available cache data-path throughput.
-- Missing cache levels remain visible and disabled with a capability reason.
-- Results include per-operation sample statistics and explicit byte-counting metadata.
-- Arithmetic CPU performance results use operation rates: OPS or KOPS below one million, MOPS from one million, and TOPS from one trillion operations per second; raw protocol values remain operations per second. Compression and decompression instead report decimal MB/s because they are byte-throughput workloads. Each result defines exactly what is counted.
-- Each performance workload records pinned-thread runnable time and a cache-resident versus large-working-set sensitivity probe where the workload has a data set. The UI reports `compute_bound` or `memory_bandwidth_bound` from that ratio and marks it as an inference. OS thread time cannot observe hardware memory-stall cycles directly, so Gluj-Bench does not present the proxy as a performance-counter measurement.
-- CPU performance workers precondition their kernels for 200 ms before synchronized samples. Memory-sensitivity diagnosis uses the ratio of medians from three 250 ms cache-resident samples and three 250 ms large-working-set samples instead of a single short probe.
-- Register kernels use eight independent dependency chains to expose available execution throughput. ASCII scanning uses AVX2 when available, and DEFLATE workers reuse compressor/decompressor state and preallocated output buffers so timed samples do not measure repeated allocator setup.
-- Arithmetic kernel revision 4 defines a comparison group for INT64, scalar FP32/FP64, AVX2/FMA FP32/FP64, and the single-thread INT64 result. Every member uses eight independent multiply-add chains and counts lane-level multiply and add operations consistently. Workload-specific tests such as AES, primes, and codecs remain outside this comparison group.
-- The ASCII workload scans fixed 64-byte records and reports strings per second rather than treating every byte as a generic operation.
-- The prime workload repeatedly runs a reusable Sieve of Eratosthenes over integers 2 through 1,000,000, verifies the known 78,498-prime population, and reports primes found per second.
+Gluj-Bench is actively developed. Measurements depend on the workload, driver, background activity, power state and configuration; benchmark definitions can change between versions. Compare matching configurations and review the recorded context when interpreting a result.
 
-## Planned benchmark work
+For changes, see [CHANGELOG.md](CHANGELOG.md). Report reproducible issues through [GitHub Issues](https://github.com/githubdood21/Gluj-Bench/issues), and follow [SECURITY.md](SECURITY.md) for security reports.
 
-Future milestones include additional portable codec and cryptographic workloads, broader safely exposed matrix formats, result export, and historical comparison views. Results always identify the operation, numeric data type, workload configuration, sample statistics, elapsed time, unit, and tested device; a generic operation-rate value without that context will not be reported.
-
-## License
-
-Gluj-Bench is available under the [MIT License](LICENSE).
+Gluj-Bench is licensed under the [MIT License](LICENSE) and provided without warranty.

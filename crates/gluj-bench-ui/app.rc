@@ -1,0 +1,25 @@
+// First icon group is used by Explorer for the executable and shortcuts.
+1 ICON "ui/icons/gluj-bench.ico"
+
+1 VERSIONINFO
+FILEVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,0
+PRODUCTVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Gluj-Bench Hardware Benchmarking"
+            VALUE "FileVersion", APP_VERSION_STRING
+            VALUE "ProductName", "Gluj-Bench"
+            VALUE "ProductVersion", APP_VERSION_STRING
+            VALUE "OriginalFilename", "gluj-bench-ui.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

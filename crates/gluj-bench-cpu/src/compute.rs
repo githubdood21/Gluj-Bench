@@ -843,15 +843,31 @@ fn run_parallel(
         instruction_path(definition.workload).into(),
     );
     workload_metadata.insert("thread_count".into(), locations.len().to_string());
-    workload_metadata.insert("thread_mode".into(), "logical_processors".into());
+    workload_metadata.insert(
+        "thread_mode".into(),
+        if crate::topology::explicit_core_limit(config)
+            || config
+                .options
+                .get("thread_mode")
+                .is_some_and(|s| s == "physical_cores")
+        {
+            "physical_cores"
+        } else {
+            "logical_processors"
+        }
+        .into(),
+    );
     workload_metadata.insert("warmup_ms".into(), (WARMUP_NS / 1_000_000).to_string());
     workload_metadata.insert("probe_samples".into(), PROBE_SAMPLES.to_string());
     workload_metadata.insert(
         "probe_duration_ms_per_sample".into(),
         (PROBE_NS / 1_000_000).to_string(),
     );
-    workload_metadata.insert("scope".into(), "aggregate_logical_processors".into());
-    workload_metadata.insert("affinity".into(), "one_worker_per_logical_processor".into());
+    workload_metadata.insert("scope".into(), "aggregate_selected_workers".into());
+    workload_metadata.insert(
+        "affinity".into(),
+        "one_worker_per_selected_processor".into(),
+    );
     workload_metadata.insert(
         "buffer_ownership".into(),
         "pinned_thread_first_touch".into(),
@@ -930,14 +946,7 @@ pub fn run(
         return Err(BenchmarkError::new("benchmark_unavailable", reason));
     }
     if definition.workload != Workload::SingleThread {
-        let mut locations: Vec<_> = topology.core_threads.values().flatten().copied().collect();
-        locations.sort_unstable();
-        locations.dedup();
-        let budget = gluj_bench_core::worker_budget(
-            locations.len(),
-            gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
-        );
-        locations.truncate(budget);
+        let locations = crate::topology::selected_workers(topology, config, true)?;
         if locations.is_empty() {
             return Err(BenchmarkError::new(
                 "topology_unavailable",

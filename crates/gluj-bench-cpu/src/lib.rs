@@ -1,5 +1,7 @@
 mod compute;
+mod compute_scaling;
 mod kernels;
+mod matrix_scaling;
 mod topology;
 
 use gluj_bench_core::{
@@ -180,18 +182,10 @@ impl CpuBandwidthProvider {
     }
 
     fn logical_mode(config: &BenchmarkConfig) -> bool {
-        config.options.get("thread_mode").map(String::as_str) == Some("logical_processors")
-    }
-
-    fn benchmark_locations(
-        topology: &CpuTopology,
-        config: &BenchmarkConfig,
-    ) -> Vec<ProcessorLocation> {
-        if Self::logical_mode(config) {
-            topology.core_threads.values().flatten().copied().collect()
-        } else {
-            topology.physical_cores.clone()
+        if topology::explicit_core_limit(config) {
+            return false;
         }
+        config.options.get("thread_mode").map(String::as_str) == Some("logical_processors")
     }
 
     fn ram_payload(&self, topology: &CpuTopology) -> Result<usize, String> {
@@ -353,11 +347,8 @@ impl CpuBandwidthProvider {
             Self::cache_layout(topology, level)
         }
         .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;
-        let budget = gluj_bench_core::worker_budget(
-            layout.len(),
-            gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
-        );
-        layout.truncate(budget);
+        let selected = topology::selected_workers(topology, config, false)?;
+        layout.retain(|(location, _)| selected.contains(location));
         let target = topology.representative_caches.get(&level).unwrap();
         let locations: Vec<_> = layout.iter().map(|(location, _)| *location).collect();
         let full_payload_sizes: Vec<_> = layout.iter().map(|(_, bytes)| *bytes).collect();
@@ -498,12 +489,7 @@ impl CpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let topology = self.topology.as_ref().map_err(Clone::clone)?;
-        let mut locations = Self::benchmark_locations(topology, config);
-        let budget = gluj_bench_core::worker_budget(
-            locations.len(),
-            gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
-        );
-        locations.truncate(budget);
+        let locations = topology::selected_workers(topology, config, false)?;
         let payload = self
             .ram_payload(topology)
             .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;
@@ -607,6 +593,14 @@ impl BenchmarkProvider for CpuBandwidthProvider {
             &self.cpu_device,
             self.topology.is_ok(),
         ));
+        items.push(compute_scaling::descriptor(
+            &self.cpu_device,
+            self.topology.is_ok(),
+        ));
+        items.push(compute_scaling::matrix_descriptor(
+            &self.cpu_device,
+            self.topology.is_ok(),
+        ));
         items
     }
     fn run(
@@ -617,6 +611,16 @@ impl BenchmarkProvider for CpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         Self::validate(config)?;
+        if benchmark_id == compute_scaling::ID || benchmark_id == matrix_scaling::ID {
+            return compute_scaling::run(
+                benchmark_id,
+                config,
+                cancellation,
+                progress,
+                &self.cpu_device,
+                self.topology.as_ref().map_err(Clone::clone)?,
+            );
+        }
         if benchmark_id.starts_with("cpu.performance.") {
             let topology = self.topology.as_ref().map_err(Clone::clone)?;
             return compute::run(

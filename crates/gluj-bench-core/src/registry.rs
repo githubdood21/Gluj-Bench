@@ -55,11 +55,18 @@ impl BenchmarkRegistry {
                         crate::workload_percent(config, key)?.to_string(),
                     );
                 }
-                if benchmark_id.ends_with(".scaling") {
+                if benchmark_id.starts_with("gpu.") && benchmark_id.ends_with(".scaling") {
                     result.workload_metadata.insert(
                         "vram_budget_percent".into(),
                         crate::vram_budget_percent(config)?.to_string(),
                     );
+                }
+                if benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory.") {
+                    if let Some(limit) = config.options.get("cpu_core_limit") {
+                        result
+                            .workload_metadata
+                            .insert("cpu_core_limit".into(), limit.clone());
+                    }
                 }
                 return Ok(result);
             }

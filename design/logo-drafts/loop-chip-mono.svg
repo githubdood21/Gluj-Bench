@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Gluj-Bench loop-chip logo draft"><path d="M50 103 A82 82 0 0 1 197 76" fill="none" stroke="#e5f2fa" stroke-width="11" stroke-linecap="round"/>
+<path d="M207 96 L184 87 L205 68 Z" fill="#e5f2fa"/>
+<path d="M206 153 A82 82 0 0 1 59 180" fill="none" stroke="#e5f2fa" stroke-width="11" stroke-linecap="round"/>
+<path d="M49 160 L72 169 L51 188 Z" fill="#e5f2fa"/><g fill="none" stroke="#e5f2fa" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+<rect x="94" y="94" width="68" height="68" rx="12"/>
+<path d="M116 84v10m24-10v10m-24 68v10m24-10v10M84 116h10m-10 24h10m68-24h10m-10 24h10"/>
+</g><rect x="113" y="113" width="30" height="30" rx="6" fill="#e5f2fa"/></svg>

@@ -9,7 +9,7 @@ pub(super) fn reference_config(config: &BenchmarkConfig) -> BenchmarkConfig {
 }
 
 pub(super) fn validate_reference(
-    mut initial: BenchmarkResult,
+    initial: BenchmarkResult,
     mut check: BenchmarkResult,
 ) -> BenchmarkResult {
     let before = initial.metrics[0].value;
@@ -19,15 +19,14 @@ pub(super) fn validate_reference(
     } else {
         f64::INFINITY
     };
-    let selected = if after > before {
-        &mut check
-    } else {
-        &mut initial
-    };
-    selected
+    check
         .workload_metadata
         .insert("compute_reference_drift_percent".into(), drift.to_string());
-    selected.clone()
+    check.workload_metadata.insert(
+        "compute_reference_selection".into(),
+        "latest_post_sweep".into(),
+    );
+    check
 }
 
 /// Compare against an empirical compute ceiling, not a manufacturer's theoretical peak.
@@ -59,6 +58,12 @@ pub(super) fn add_reference_analysis(
         "compute_reference_benchmark".into(),
         reference.benchmark_id.clone(),
     );
+    if let Some(selection) = reference
+        .workload_metadata
+        .get("compute_reference_selection")
+    {
+        metadata.insert("compute_reference_selection".into(), selection.clone());
+    }
     metadata.insert(
         "clock_analysis_revision".into(),
         "empirical-reference-1".into(),
@@ -287,6 +292,45 @@ mod tests {
             add_reference_analysis(&mut tiers, &mut meta, &reference, transition);
             assert!(!meta.contains_key("suggested_core_underclock_trial_percent"));
         }
+    }
+
+    #[test]
+    fn latest_lower_reference_drives_the_trial_instead_of_an_earlier_best() {
+        let reference = |value| BenchmarkResult {
+            benchmark_id: "gpu.performance.fp32".into(),
+            device_id: "gpu".into(),
+            elapsed_ns: 1,
+            metrics: vec![metric("throughput", value)],
+            device_metadata: BTreeMap::new(),
+            workload_metadata: BTreeMap::from([(
+                "bound_classification".into(),
+                "compute_bound".into(),
+            )]),
+        };
+        let latest = validate_reference(reference(100.0), reference(60.0));
+        assert_eq!(latest.metrics[0].value, 60.0);
+        assert_eq!(latest.metrics[0].statistics.median, 60.0);
+        assert_eq!(
+            latest.workload_metadata["compute_reference_selection"],
+            "latest_post_sweep"
+        );
+        assert_eq!(
+            latest.workload_metadata["compute_reference_drift_percent"],
+            "40"
+        );
+        let mut metrics = vec![
+            metric("working_set_1.compute", 90.0),
+            metric("working_set_2.compute", 50.0),
+        ];
+        let mut metadata = BTreeMap::new();
+        add_reference_analysis(&mut metrics, &mut metadata, &latest, true);
+        assert_eq!(metrics[0].value, 60.0);
+        assert_eq!(metadata["largest_compute_delta_percent"], "-16.67");
+        assert_eq!(
+            metadata["suggested_core_frequency_limit_reduction_percent"],
+            "10"
+        );
+        assert_eq!(metadata["compute_reference_selection"], "latest_post_sweep");
     }
 
     #[test]

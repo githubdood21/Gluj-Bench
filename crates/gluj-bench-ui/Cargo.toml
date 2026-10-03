@@ -16,4 +16,5 @@ serde.workspace = true
 slint.workspace = true
 
 [build-dependencies]
+embed-resource = "3.0.11"
 slint-build = "1.17.1"

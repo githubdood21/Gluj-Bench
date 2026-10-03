@@ -24,6 +24,68 @@ pub struct CpuTopology {
     pub caches: Vec<CacheDescriptor>,
 }
 
+/// An explicit core limit uses one pinned worker per physical core (no SMT siblings).
+/// Legacy requests retain their existing thread mode and percentage allocation.
+pub fn selected_workers(
+    topology: &CpuTopology,
+    config: &gluj_bench_core::BenchmarkConfig,
+    default_logical: bool,
+) -> Result<Vec<ProcessorLocation>, BenchmarkError> {
+    let limit = config
+        .options
+        .get("cpu_core_limit")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| {
+            BenchmarkError::new("invalid_option", "cpu_core_limit must be a whole number.")
+        })?
+        .unwrap_or(0);
+    if limit > 0 {
+        if limit > topology.physical_cores.len() {
+            return Err(BenchmarkError::new(
+                "invalid_option",
+                "CPU core limit exceeds the available physical cores.",
+            ));
+        }
+        return Ok(topology
+            .physical_cores
+            .iter()
+            .copied()
+            .take(limit)
+            .collect());
+    }
+    let logical = config
+        .options
+        .get("thread_mode")
+        .map(|mode| mode == "logical_processors")
+        .unwrap_or(default_logical);
+    let mut locations = if logical {
+        topology
+            .core_threads
+            .values()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        topology.physical_cores.clone()
+    };
+    locations.sort_unstable();
+    locations.dedup();
+    locations.truncate(gluj_bench_core::worker_budget(
+        locations.len(),
+        gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
+    ));
+    Ok(locations)
+}
+
+pub fn explicit_core_limit(config: &gluj_bench_core::BenchmarkConfig) -> bool {
+    config
+        .options
+        .get("cpu_core_limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|n| n > 0)
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -304,6 +366,47 @@ impl AffinityGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_core_allocation_excludes_smt_and_overrides_percentage() {
+        let first = ProcessorLocation { group: 0, index: 0 };
+        let second = ProcessorLocation { group: 1, index: 0 };
+        let topology = CpuTopology {
+            physical_cores: vec![first, second],
+            core_threads: BTreeMap::from([
+                (first, vec![first, ProcessorLocation { group: 0, index: 1 }]),
+                (
+                    second,
+                    vec![second, ProcessorLocation { group: 1, index: 1 }],
+                ),
+            ]),
+            representative: first,
+            representative_caches: BTreeMap::new(),
+            cache_targets: vec![],
+            caches: vec![],
+        };
+        let mut config = gluj_bench_core::BenchmarkConfig::default();
+        assert_eq!(selected_workers(&topology, &config, true).unwrap().len(), 4);
+        config
+            .options
+            .insert("cpu_worker_percent".into(), "50".into());
+        config.options.insert("cpu_core_limit".into(), "2".into());
+        assert_eq!(
+            selected_workers(&topology, &config, true).unwrap(),
+            vec![first, second]
+        );
+        config.options.insert("cpu_core_limit".into(), "1".into());
+        assert_eq!(
+            selected_workers(&topology, &config, false).unwrap(),
+            vec![first]
+        );
+        config.options.insert("cpu_core_limit".into(), "3".into());
+        assert!(selected_workers(&topology, &config, true).is_err());
+        config
+            .options
+            .insert("cpu_core_limit".into(), "oops".into());
+        assert!(selected_workers(&topology, &config, true).is_err());
+    }
 
     #[test]
     fn processor_location_orders_by_group_then_index() {
