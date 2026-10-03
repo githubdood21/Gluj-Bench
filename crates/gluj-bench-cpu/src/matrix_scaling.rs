@@ -114,26 +114,25 @@ unsafe fn multiply(
                 for row in (0..ROWS).step_by(8) {
                     let mut accumulators = [_mm256_set1_ps(0.0); 8];
                     if k_block > 0 {
-                        for lane in 0..8 {
-                            accumulators[lane] = unsafe {
+                        for (lane, accumulator) in accumulators.iter_mut().enumerate() {
+                            *accumulator = unsafe {
                                 _mm256_loadu_ps(c.as_ptr().add((row + lane) * n + column))
                             };
                         }
                     }
                     for k in k_block..(k_block + BLOCK_K).min(n) {
                         let weights = unsafe { _mm256_loadu_ps(b.as_ptr().add(k * n + column)) };
-                        for lane in 0..8 {
+                        for (lane, accumulator) in accumulators.iter_mut().enumerate() {
                             let input =
                                 _mm256_set1_ps(unsafe { *a.as_ptr().add((row + lane) * n + k) });
-                            accumulators[lane] =
-                                _mm256_fmadd_ps(input, weights, accumulators[lane]);
+                            *accumulator = _mm256_fmadd_ps(input, weights, *accumulator);
                         }
                     }
-                    for lane in 0..8 {
+                    for (lane, accumulator) in accumulators.iter().enumerate() {
                         unsafe {
                             _mm256_storeu_ps(
                                 c.as_mut_ptr().add((row + lane) * n + column),
-                                accumulators[lane],
+                                *accumulator,
                             );
                         }
                     }

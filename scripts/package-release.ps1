@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $ManifestPath = Join-Path $RepositoryRoot 'Cargo.toml'
 $Manifest = Get-Content -Raw -LiteralPath $ManifestPath
-$VersionMatch = [regex]::Match($Manifest, '(?m)^version = "([^"]+)"$')
+$VersionMatch = [regex]::Match($Manifest, '(?m)^version\s*=\s*"([^"]+)"\s*$')
 
 if (-not $VersionMatch.Success) {
     throw 'Unable to read the workspace version from Cargo.toml.'
@@ -45,6 +45,11 @@ try {
 
     New-Item -ItemType Directory -Force -Path $DistDirectory | Out-Null
     foreach ($path in @($StageDirectory, $ArchivePath, $ChecksumPath)) {
+        $ResolvedTarget = [IO.Path]::GetFullPath($path)
+        $ResolvedDist = [IO.Path]::GetFullPath($DistDirectory) + [IO.Path]::DirectorySeparatorChar
+        if (-not $ResolvedTarget.StartsWith($ResolvedDist, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Package target is outside the dist directory: $ResolvedTarget"
+        }
         if (Test-Path -LiteralPath $path) {
             Remove-Item -Recurse -Force -LiteralPath $path
         }
@@ -53,6 +58,10 @@ try {
 
     Copy-Item -LiteralPath $UiBinary, $WorkerBinary -Destination $StageDirectory
     Copy-Item -LiteralPath 'README.md', 'CHANGELOG.md', 'SECURITY.md' -Destination $StageDirectory
+    Copy-Item -LiteralPath 'SysInfo.png', 'Benchmarks.png', 'ScalingCompute.png' -Destination $StageDirectory
+    $LogoDirectory = Join-Path $StageDirectory 'design\logo-drafts'
+    New-Item -ItemType Directory -Force -Path $LogoDirectory | Out-Null
+    Copy-Item -LiteralPath 'design\logo-drafts\loop-chip-g-preview.png' -Destination $LogoDirectory
     if (Test-Path -LiteralPath 'LICENSE') {
         Copy-Item -LiteralPath 'LICENSE' -Destination $StageDirectory
     }

@@ -19,7 +19,7 @@ Version **0.2.0** focuses on understanding the hardware available to a workload.
 
 1. Download the [latest Windows x64 release](https://github.com/githubdood21/Gluj-Bench/releases/latest).
 2. Extract the entire ZIP into a writable folder. Keep `gluj-bench-ui.exe` and `gluj-bench-worker.exe` together.
-3. Launch `gluj-bench-ui.exe` and wait for the hardware scan to finish.
+3. Launch `gluj-bench-ui.exe` and wait for the hardware scan to finish. The app starts its worker in the background without opening a console window.
 4. Open **Settings** to choose your CPU allocation, GPU activity and scaling memory budgets.
 5. Open **Benchmarks**, select a category and benchmark, then run it or queue the available benchmarks in that category.
 6. Review **Benchmark Results**. Expand the explanations, scaling graphs or tuning measurements for more detail.

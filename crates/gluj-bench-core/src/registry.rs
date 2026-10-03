@@ -61,12 +61,12 @@ impl BenchmarkRegistry {
                         crate::vram_budget_percent(config)?.to_string(),
                     );
                 }
-                if benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory.") {
-                    if let Some(limit) = config.options.get("cpu_core_limit") {
-                        result
-                            .workload_metadata
-                            .insert("cpu_core_limit".into(), limit.clone());
-                    }
+                if (benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory."))
+                    && let Some(limit) = config.options.get("cpu_core_limit")
+                {
+                    result
+                        .workload_metadata
+                        .insert("cpu_core_limit".into(), limit.clone());
                 }
                 return Ok(result);
             }

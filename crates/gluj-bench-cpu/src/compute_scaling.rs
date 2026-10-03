@@ -154,18 +154,18 @@ unsafe fn vector_sweep(a: &[f32], b: &[f32], output: &mut [f32]) {
         // Eight independent vectors avoid measuring a single dependency chain.
         let mut values = [_mm256_set1_ps(0.0); 8];
         let mut multipliers = values;
-        for lane in 0..8 {
-            values[lane] = unsafe { _mm256_loadu_ps(a.as_ptr().add(offset + lane * 8)) };
+        for (lane, value) in values.iter_mut().enumerate() {
+            *value = unsafe { _mm256_loadu_ps(a.as_ptr().add(offset + lane * 8)) };
             multipliers[lane] = unsafe { _mm256_loadu_ps(b.as_ptr().add(offset + lane * 8)) };
         }
         for _ in 0..REUSE {
-            for lane in 0..8 {
-                values[lane] = _mm256_fmadd_ps(values[lane], multipliers[lane], addend);
+            for (lane, value) in values.iter_mut().enumerate() {
+                *value = _mm256_fmadd_ps(*value, multipliers[lane], addend);
             }
         }
-        for lane in 0..8 {
+        for (lane, value) in values.iter().enumerate() {
             unsafe {
-                _mm256_storeu_ps(output.as_mut_ptr().add(offset + lane * 8), values[lane]);
+                _mm256_storeu_ps(output.as_mut_ptr().add(offset + lane * 8), *value);
             }
         }
     }
@@ -616,6 +616,15 @@ fn transition_index(tiers: &[&Metric], baseline: f64) -> Option<usize> {
     })
 }
 
+fn allocation_budget(total: u64, available: u64, percent: Option<u32>, legacy_mib: u64) -> u64 {
+    match percent {
+        Some(p) => (total / 100 * p as u64)
+            .min(available / 5 * 4)
+            .min(available.saturating_sub(2 * 1024 * MIB)),
+        None => (legacy_mib * MIB).min(available / 8),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,7 +683,10 @@ mod tests {
             for (index, value) in data.output.iter().enumerate() {
                 let mut expected = data.a[index];
                 for _ in 0..REUSE {
-                    expected = expected.mul_add(data.b[index], 0.000_001);
+                    // These FP32 operands have an exact product and sum in FP64.
+                    // Round once to FP32 instead of relying on MinGW's fmaf runtime.
+                    expected = (f64::from(expected) * f64::from(data.b[index])
+                        + f64::from(0.000_001_f32)) as f32;
                 }
                 assert_eq!(*value, expected);
             }
@@ -712,14 +724,5 @@ mod tests {
             transition_index(&tiers.iter().collect::<Vec<_>>(), 100.0),
             None
         );
-    }
-}
-
-fn allocation_budget(total: u64, available: u64, percent: Option<u32>, legacy_mib: u64) -> u64 {
-    match percent {
-        Some(p) => (total / 100 * p as u64)
-            .min(available / 5 * 4)
-            .min(available.saturating_sub(2 * 1024 * MIB)),
-        None => (legacy_mib * MIB).min(available / 8),
     }
 }

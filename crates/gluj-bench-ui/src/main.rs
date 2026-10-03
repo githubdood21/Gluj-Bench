@@ -65,6 +65,13 @@ impl WorkerClient {
         let (sender, events) = mpsc::channel();
         let path = worker_path();
         let mut command = Command::new(&path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Keep the CLI-capable worker hidden when started by the desktop app.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         command
             .arg("--stdio")
             .stdin(Stdio::piped())
@@ -2026,15 +2033,13 @@ fn tuning_takeaway(result: &BenchmarkResult) -> String {
             .get("suggested_cpu_core_count_trial")
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|n| *n > 0)
-        {
-            if scaling_compute_tiers(result)
+            && scaling_compute_tiers(result)
                 .last()
                 .is_some_and(|(_, m)| consistent_metric(m))
-            {
-                return format!(
-                    "Try {cores} physical cores, then retest the same dataset for at most 5% throughput loss."
-                );
-            }
+        {
+            return format!(
+                "Try {cores} physical cores, then retest the same dataset for at most 5% throughput loss."
+            );
         }
         return if scaling_compute_tiers(result)
             .last()
@@ -2072,26 +2077,24 @@ fn tuning_takeaway(result: &BenchmarkResult) -> String {
                 .metrics
                 .iter()
                 .find(|m| m.name == "measured_compute_ceiling"),
-        ) {
-            if reference.value.is_finite()
-                && reference.value > 0.0
-                && largest.value.is_finite()
-                && largest.value > 0.0
-                && largest.value / reference.value < 0.85
-            {
-                let noisy = !consistent_metric(reference)
-                    || !consistent_metric(largest)
-                    || tiers
-                        .iter()
-                        .take(3)
-                        .max_by(|a, b| a.1.value.total_cmp(&b.1.value))
-                        .is_some_and(|(_, small)| !consistent_metric(small));
-                return if noisy {
-                    "Large throughput drop detected; rerun for consistent measurements before estimating a core-limit reduction.".into()
-                } else {
-                    "Large throughput drop detected; more memory-pressure evidence is needed before estimating a core-limit reduction.".into()
-                };
-            }
+        ) && reference.value.is_finite()
+            && reference.value > 0.0
+            && largest.value.is_finite()
+            && largest.value > 0.0
+            && largest.value / reference.value < 0.85
+        {
+            let noisy = !consistent_metric(reference)
+                || !consistent_metric(largest)
+                || tiers
+                    .iter()
+                    .take(3)
+                    .max_by(|a, b| a.1.value.total_cmp(&b.1.value))
+                    .is_some_and(|(_, small)| !consistent_metric(small));
+            return if noisy {
+                "Large throughput drop detected; rerun for consistent measurements before estimating a core-limit reduction.".into()
+            } else {
+                "Large throughput drop detected; more memory-pressure evidence is needed before estimating a core-limit reduction.".into()
+            };
         }
         "No clear core-limit headroom measured; rerun to confirm the result.".into()
     } else {
@@ -2326,15 +2329,17 @@ fn tuning_breakdown(result: &BenchmarkResult) -> String {
             .workload_metadata
             .get("allocation_budget_bytes")
             .and_then(|s| s.parse::<f64>().ok()),
-    ) {
-        if allocated.is_finite() && allocated >= 0.0 && budget.is_finite() && budget > 0.0 {
-            lines.push(format!(
-                "Test memory allocation: {} / {} selected budget ({:.1}%)",
-                format_binary_size(allocated),
-                format_binary_size(budget),
-                allocated / budget * 100.0
-            ));
-        }
+    ) && allocated.is_finite()
+        && allocated >= 0.0
+        && budget.is_finite()
+        && budget > 0.0
+    {
+        lines.push(format!(
+            "Test memory allocation: {} / {} selected budget ({:.1}%)",
+            format_binary_size(allocated),
+            format_binary_size(budget),
+            allocated / budget * 100.0
+        ));
     }
     if result.benchmark_id.starts_with("cpu.") {
         if let Some(workers) = result.workload_metadata.get("thread_count") {
