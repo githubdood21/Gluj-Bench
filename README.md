@@ -9,8 +9,6 @@
   <img src="design/logo-drafts/loop-chip-g-preview.png" alt="Gluj-Bench chip and retest-loop logo" width="112">
 </p>
 
-**Measure. Adjust. Retest.**
-
 Gluj-Bench is a free, vendor-neutral hardware benchmark for Windows. It measures CPU and GPU calculation throughput, cache and memory bandwidth, and how performance changes as a workload grows beyond cache into RAM or VRAM.
 
 Version **0.2.0** focuses on understanding the hardware available to a workload. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
@@ -143,6 +141,14 @@ Guidance uses the **latest run**, not the historical best measurement. Noisy sam
 **GPU:** supported scaling evidence can suggest a further reduction to the current core-frequency limit. The trial is relative to the configuration already measured, including any existing limit. Adjust in small steps and rerun the same dataset, aiming for no more than 5% throughput loss. Memory-bandwidth estimates are explanatory gaps, not memory-clock targets.
 
 Power use, temperatures and performance after a change are not measured by the suggestion. For another application, change its worker count or affinity manually and test its own workload. **Gluj-Bench never applies CPU/GPU clock, voltage or external-process affinity changes.**
+
+### Example use case: checking a GPU frequency limit
+
+A local LLM may generate tokens at a rate limited by memory bandwidth. Gluj-Bench can help investigate a similar compute/memory imbalance: run the **FP16 matrix compute scaling** test (or the **FP32 compute scaling profile**), inspect the throughput drop at larger datasets, then use the latest tuning guidance to choose a small core-frequency-limit trial. Rerun the same dataset and settings to check whether at least 95% of its original throughput remains.
+
+For illustration, an actual LLM workload might deliver **100 tokens/s at 400 W** without a limit and **95 tokens/s at 250 W** with a lower core-frequency limit and unchanged memory clock: 5% less throughput for 37.5% less power. Reported GPU utilization could stay at 100% even while compute waits for memory. These are example numbers, not Gluj-Bench measurements or predicted savings.
+
+Validate the change in the actual application: prompt processing can slow down because it often depends more on compute throughput. Gluj-Bench measures hardware benchmark kernels; it does not optimize LLMs, predict token speeds, measure power or apply clock changes. Note that prefill speeds will see a larger drop in perfomance by doing this, See NVIDIA's [prefill and decode explanation](https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/) for context.
 
 ## Saved results and comparisons
 
