@@ -1,4 +1,4 @@
-use super::{BenchmarkResult, ChartLabel, Color, Metric, format_binary_size};
+use super::{BenchmarkResult, ChartLabel, ChartPoint, Color, Metric, format_binary_size};
 
 pub(super) fn format_time(ns: f64) -> String {
     if ns.abs() < 1000.0 {
@@ -109,7 +109,14 @@ pub(super) fn note(result: &BenchmarkResult) -> String {
     text
 }
 
+#[cfg(test)]
 pub(super) fn chart(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>)> {
+    interactive_chart(result).map(|(svg, labels, _)| (svg, labels))
+}
+
+pub(super) fn interactive_chart(
+    result: &BenchmarkResult,
+) -> Option<(String, Vec<ChartLabel>, Vec<ChartPoint>)> {
     use std::fmt::Write;
     let points = super::scaling_compute_tiers(result)
         .into_iter()
@@ -139,9 +146,9 @@ pub(super) fn chart(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>
     let span = ((last.0 as f64).log2() - (first.0 as f64).log2()).max(1.0);
     let x = |bytes: u64| {
         if first.0 == last.0 {
-            475.0
+            490.0
         } else {
-            80.0 + ((bytes as f64).log2() - (first.0 as f64).log2()) / span * 790.0
+            110.0 + ((bytes as f64).log2() - (first.0 as f64).log2()) / span * 760.0
         }
     };
     let y = |ns: f64| 220.0 - ns / maximum * 160.0;
@@ -181,19 +188,20 @@ pub(super) fn chart(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>
     let mut svg = String::from(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="280" viewBox="0 0 900 280"><rect width="900" height="280" rx="10" fill="#101c29"/>"##,
     );
+    let mut hover_points = Vec::new();
     for tick in 0..=4 {
         let ns = maximum * tick as f64 / 4.0;
         writeln!(
             svg,
-            r##"<line x1="80" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#2b3d50"/>"##,
+            r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#2b3d50"/>"##,
             y(ns)
         )
         .unwrap();
         labels.push(label(
             0.0,
             (y(ns) - 9.0) as f32,
-            68.0,
-            format!("{:.2}", ns / scale),
+            100.0,
+            format!("{:.2} {unit}", ns / scale),
             13.0,
             neutral,
             2,
@@ -212,6 +220,21 @@ pub(super) fn chart(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>
     }
     for (bytes, (gpu, wall)) in &valid {
         for (metric, color) in [(*gpu, "#73dcca"), (*wall, "#edc778")] {
+            hover_points.push(super::chart_hover::point(
+                *bytes,
+                metric,
+                [x(*bytes), y(metric.value), 220.0],
+                (
+                    if color == "#73dcca" {
+                        "GPU execution per pass"
+                    } else {
+                        "End-to-end per pass"
+                    },
+                    scale,
+                    unit,
+                ),
+                if color == "#73dcca" { green } else { amber },
+            ));
             writeln!(
                 svg,
                 r#"<circle cx="{:.2}" cy="{:.2}" r="3.5" fill="{color}"/>"#,
@@ -269,7 +292,7 @@ pub(super) fn chart(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>
         1,
     ));
     svg.push_str("</svg>");
-    Some((svg, labels))
+    Some((svg, labels, hover_points))
 }
 
 #[cfg(test)]
@@ -359,7 +382,7 @@ mod tests {
         let (svg, labels) = chart(&result).unwrap();
         assert_eq!(svg.matches("<circle").count(), 2);
         assert!(labels.iter().any(|l| l.text == "Tested dataset"));
-        assert!(svg.contains("cx=\"475.00\""));
+        assert!(svg.contains("cx=\"490.00\""));
         assert_eq!(format_time(250.0), "250.0 ns");
         assert_eq!(format_time(2e6), "2.00 ms");
         assert_eq!(format_time(2e9), "2.00 s");

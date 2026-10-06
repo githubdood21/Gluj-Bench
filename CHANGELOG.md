@@ -6,12 +6,18 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 
 ### Added
 
+- Hover inspection for scaling and measured GPU timing graphs, with exact recorded values, sample ranges, dataset sizes and guides to both axes.
+
 - Measured GPU execution and end-to-end time per dataset pass for FP32 VRAM/RAM-offload and FP16 matrix scaling, with sample ranges, readable time units and recorded batch sizes. The busy/wait percentage model has been retired; throughput/reference comparisons retain their performance meaning.
 
 - One GPU FP32 system-RAM offload scaling test with a configurable 50%, 75%, or 100% RAM share and the remaining data in VRAM.
 - Nominal host-traffic graphs, per-tier RAM/VRAM placement, allocation safeguards, and untimed scalar-reference checks for RAM-offload results.
 
 ### Changed
+
+- Capped native desktop UI redraws at 60 FPS, reduced to 30 FPS while the worker is busy, using coalesced redraws and one-shot timers. Idle windows remain event-driven; benchmark execution and timing are unchanged.
+
+- Chart Y-axis ticks and hover labels include units. Hover guides follow the pointer throughout each plot, and data-point tooltips show a compact series/value/dataset summary.
 
 - Changed the project license for this revision to GPL-3.0-only and added a separate branding policy for independently distributed forks. Release archives include the license, project notice and branding policy. Earlier MIT releases retain their original permissions.
 

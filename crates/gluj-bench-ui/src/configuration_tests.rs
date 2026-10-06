@@ -213,6 +213,7 @@ fn render_configuration_previews() {
     let adapter = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(Headless(adapter.clone()))).unwrap();
     let window = MainWindow::new().unwrap();
+    window.on_chart_point_at(super::chart_hover::nearest);
     let mut app = fixture();
     let id = app.selected.clone().unwrap();
     let mut settings = app.settings.clone();
@@ -239,6 +240,11 @@ fn render_configuration_previews() {
         (2, 980, 680, "tuning-visuals-charts-min"),
         (2, 1280, 820, "latest-details"),
         (2, 980, 680, "latest-details-min"),
+        (2, 1280, 820, "chart-hover"),
+        (2, 980, 680, "chart-hover-min"),
+        (2, 1280, 820, "chart-guide"),
+        (2, 980, 680, "chart-guide-min"),
+        (2, 1280, 820, "timing-hover"),
     ] {
         app.page = page;
         if page == 2 {
@@ -360,7 +366,11 @@ fn render_configuration_previews() {
                 .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
                     position: slint::LogicalPosition::new(width as f32 - 100.0, 500.0),
                     delta_x: 0.0,
-                    delta_y: if name.starts_with("latest-details") {
+                    delta_y: if name.starts_with("chart-") {
+                        -850.0
+                    } else if name == "timing-hover" {
+                        -1350.0
+                    } else if name.starts_with("latest-details") {
                         -480.0
                     } else if name.starts_with("tuning-visuals") {
                         if name.contains("charts") {
@@ -375,14 +385,48 @@ fn render_configuration_previews() {
                     },
                 });
         }
+        if name.starts_with("chart-") || name == "timing-hover" {
+            let position = if name.starts_with("chart-guide") {
+                if width > 1000 {
+                    slint::LogicalPosition::new(800.0, 330.0)
+                } else {
+                    slint::LogicalPosition::new(650.0, 315.0)
+                }
+            } else if name == "timing-hover" {
+                slint::LogicalPosition::new(1042.0, 350.0)
+            } else if width > 1000 {
+                slint::LogicalPosition::new(564.0, 302.0)
+            } else {
+                slint::LogicalPosition::new(477.0, 286.0)
+            };
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+        }
         let mut pixels = vec![slint::Rgb8Pixel::default(); width as usize * height as usize];
         assert!(adapter.draw_if_needed(|renderer| {
             renderer.render(&mut pixels, width as usize);
         }));
         let mut image = format!("P6\n{width} {height}\n255\n").into_bytes();
-        for pixel in pixels {
+        for pixel in &pixels {
             image.extend_from_slice(&[pixel.r, pixel.g, pixel.b]);
         }
         fs::write(directory.join(format!("{name}.ppm")), image).unwrap();
+        if name.starts_with("chart-") || name == "timing-hover" {
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::PointerExited);
+            let mut cleared = vec![slint::Rgb8Pixel::default(); pixels.len()];
+            assert!(adapter.draw_if_needed(|renderer| {
+                renderer.render(&mut cleared, width as usize);
+            }));
+            assert!(
+                pixels
+                    .iter()
+                    .zip(cleared.iter())
+                    .any(|(a, b)| (a.r, a.g, a.b) != (b.r, b.g, b.b)),
+                "Hover guides must disappear when the pointer leaves"
+            );
+        }
     }
 }

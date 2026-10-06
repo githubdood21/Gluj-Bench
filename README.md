@@ -210,6 +210,8 @@ Detected component properties identify saved setups. RAM modules or timings not 
 
 The application uses **Rust and Slint** for the desktop UI. GPU execution uses **raw Vulkan through `ash`**, with embedded SPIR-V kernels. A separate worker process runs discovery and measurements.
 
+The desktop UI redraws only when needed, with a ceiling of 60 FPS normally and 30 FPS while the worker is busy. Pending redraws are coalesced into the latest frame; input remains responsive and an idle window does not repaint continuously. This pacing applies only to the UI, not benchmark workloads, sampling or measurement clocks.
+
 The workspace requires Rust 1.95 or newer. `rust-toolchain.toml` selects stable Rust, Clippy, rustfmt and the Windows GNU LLVM target. The packaging wrapper uses LLVM-MinGW for its compiler, linker and static runtime settings.
 
 Install the prerequisites in PowerShell, then reopen your terminal:

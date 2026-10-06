@@ -26,15 +26,28 @@ const HARDWARE_METADATA_CACHE_VERSION: u32 = 15;
 const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
 const BENCHMARK_SAMPLES: u32 = 5;
 
+mod chart_hover;
 #[cfg(test)]
 mod configuration_tests;
 mod gpu_timings;
+mod render_pacing;
 mod result_visuals;
 mod tuning_visuals;
 
 fn main() -> Result<(), slint::PlatformError> {
+    // The app-wide redraw filter requires the desktop winit backend.
+    // Slint still honors renderer selection (for example winit-software).
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .select()?;
     let window = MainWindow::new()?;
     let app = Rc::new(RefCell::new(App::new()));
+    let pacing_app = Rc::downgrade(&app);
+    render_pacing::install(&window, move || {
+        pacing_app
+            .upgrade()
+            .is_some_and(|app| app.borrow().active_request.is_some())
+    });
     App::wire(&window, &app);
     app.borrow_mut().request_startup_check();
     App::refresh(&window, &app.borrow());
@@ -470,6 +483,7 @@ impl App {
         app
     }
     fn wire(window: &MainWindow, app: &Rc<RefCell<Self>>) {
+        window.on_chart_point_at(chart_hover::nearest);
         let weak = Rc::downgrade(app);
         window.on_select_default_configuration(move |field, index| {
             if let Some(app) = weak.upgrade() {
@@ -2204,10 +2218,14 @@ fn result_row(
         });
     let facts = result_facts(result, primary);
     let profile = chart_tiers(result);
-    let (chart_svg, chart_labels) = scaling_chart_data(result).unwrap_or_default();
-    let (gpu_timing_svg, gpu_timing_labels) = gpu_timings::chart(result).unwrap_or_default();
+    let (chart_svg, chart_labels, chart_points) =
+        scaling_chart_interactive(result).unwrap_or_default();
+    let (gpu_timing_svg, gpu_timing_labels, gpu_timing_points) =
+        gpu_timings::interactive_chart(result).unwrap_or_default();
     let tuning = tuning_visuals::view(result);
     ResultRow {
+        profile_points: ModelRc::new(VecModel::from(chart_points)),
+        gpu_timing_points: ModelRc::new(VecModel::from(gpu_timing_points)),
         measurement_facts: ModelRc::new(VecModel::from(result_visuals::facts(result, primary))),
         measurement_bars: ModelRc::new(VecModel::from(result_visuals::bars(result, primary))),
         context_facts: ModelRc::new(VecModel::from(
@@ -3246,13 +3264,20 @@ fn chart_sample_range(metric: &Metric) -> (f64, f64) {
     }
 }
 
+#[cfg(test)]
 fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>)> {
+    scaling_chart_interactive(result).map(|(svg, labels, _)| (svg, labels))
+}
+
+fn scaling_chart_interactive(
+    result: &BenchmarkResult,
+) -> Option<(String, Vec<ChartLabel>, Vec<ChartPoint>)> {
     use std::fmt::Write;
     let tiers = chart_tiers(result);
     let (first, last) = (tiers.first()?, tiers.last()?);
     let low = (first.0 as f64).log2();
     let span = ((last.0 as f64).log2() - low).max(1.0);
-    let x = |bytes: u64| 80.0 + ((bytes as f64).log2() - low) / span * 790.0;
+    let x = |bytes: u64| 110.0 + ((bytes as f64).log2() - low) / span * 760.0;
     let reference = result.metrics.iter().find(|metric| {
         metric.name == "measured_compute_ceiling"
             && metric.unit == "operations/s"
@@ -3263,6 +3288,7 @@ fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabe
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420"><rect width="900" height="420" rx="10" fill="#101c29"/>"##,
     );
     let mut labels = Vec::new();
+    let mut hover_points = Vec::new();
     let label =
         |x: f32, y: f32, width: f32, text: String, font_size: f32, color: &str, alignment: i32| {
             ChartLabel {
@@ -3331,22 +3357,26 @@ fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabe
         let maximum = maximum * 1.08;
         let y = |value: f64| top + 120.0 * (1.0 - value / maximum);
         for tick in 0..=4 {
-            let position = 80.0 + 790.0 * tick as f64 / 4.0;
+            let position = 110.0 + 760.0 * tick as f64 / 4.0;
             writeln!(svg, r##"<line x1="{position:.2}" x2="{position:.2}" y1="{top:.2}" y2="{:.2}" stroke="#233346" stroke-dasharray="3 5"/>"##, top + 120.0).unwrap();
         }
         for tick in 0..=4 {
             let value = maximum * tick as f64 / 4.0;
             writeln!(
                 svg,
-                r##"<line x1="80" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#2b3d50"/>"##,
+                r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#2b3d50"/>"##,
                 y(value)
             )
             .unwrap();
             labels.push(label(
                 0.0,
                 (y(value) - 9.0) as f32,
-                68.0,
-                format!("{:.1}", value / scale),
+                100.0,
+                format!(
+                    "{:.1} {}",
+                    value / scale,
+                    if bandwidth { "GB/s" } else { "TOPS" }
+                ),
                 13.0,
                 "",
                 2,
@@ -3362,6 +3392,17 @@ fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabe
         }
         for (bytes, compute) in &tiers {
             if let Some(metric) = metric_at(*bytes, *compute) {
+                hover_points.push(chart_hover::point(
+                    *bytes,
+                    metric,
+                    [x(*bytes), y(metric.value), top + 120.0],
+                    (title, scale, if bandwidth { "GB/s" } else { "TOPS" }),
+                    if bandwidth {
+                        Color::from_rgb_u8(120, 169, 255)
+                    } else {
+                        Color::from_rgb_u8(115, 220, 202)
+                    },
+                ));
                 writeln!(
                     svg,
                     r#"<circle cx="{:.2}" cy="{:.2}" r="3.5" fill="{color}"/>"#,
@@ -3372,7 +3413,7 @@ fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabe
             }
         }
         if let Some(reference) = reference.filter(|_| !bandwidth) {
-            writeln!(svg, r##"<line x1="80" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#edc778" stroke-width="1.5" stroke-dasharray="6 5"/>"##, y(reference.value)).unwrap();
+            writeln!(svg, r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#edc778" stroke-width="1.5" stroke-dasharray="6 5"/>"##, y(reference.value)).unwrap();
             labels.push(label(
                 650.0,
                 (y(reference.value) - 22.0) as f32,
@@ -3430,7 +3471,7 @@ fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabe
         1,
     ));
     svg.push_str("</svg>");
-    Some((svg, labels))
+    Some((svg, labels, hover_points))
 }
 
 fn scaling_compute_tiers(result: &BenchmarkResult) -> Vec<(u64, &Metric)> {
@@ -4436,6 +4477,11 @@ mod tests {
         let row = result_row(&result, &[], &[]);
         use slint::Model;
         assert_eq!(row.profile_sizes.row_count(), 8);
+        assert_eq!(row.profile_points.row_count(), 16);
+        let hover = row.profile_points.row_data(15).unwrap();
+        assert_eq!(hover.display_value, "810 GB/s");
+        assert_eq!(hover.dataset_label, "8.00 GiB");
+        assert_eq!(hover.bottom, 352.0);
         assert_eq!(
             row.profile_sizes.row_data(0).unwrap().as_str(),
             "256.00 KiB"

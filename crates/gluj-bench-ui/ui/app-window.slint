@@ -11,6 +11,7 @@ export struct BenchmarkRow {
     unit: string, enabled: bool, selected: bool, hardware-ready: bool,
 }
 export struct ChartLabel { x: float, y: float, width: float, text: string, font-size: float, accent: color, alignment: int, }
+export struct ChartPoint { x: float, y: float, left: float, bottom: float, value-label: string, dataset-label: string, series: string, display-value: string, accent: color, }
 export struct TuningFact { label: string, value: string, detail: string, accent: color, }
 export struct TuningBar { label: string, value: string, ratio: float, minimum: float, maximum: float, range-visible: bool, accent: color, }
 export struct ResultRow {
@@ -20,8 +21,8 @@ export struct ResultRow {
     fact-one-label: string, fact-one-value: string, fact-two-label: string, fact-two-value: string,
     fact-three-label: string, fact-three-value: string, fact-four-label: string, fact-four-value: string,
     summary: string, diagnosis: string, details: string, description: string, description-tldr: string, everyday-use: string, metric-guide: string, tuning-guidance: string, tuning-tldr: string, tuning-stats: string, memory-pressure: string, tuning-title: string,
-    profile-chart: image, profile-labels: [ChartLabel], profile-sizes: [string], profile-statistics: [string],
-    gpu-timing-chart: image, gpu-timing-labels: [ChartLabel], gpu-timing-available: bool, gpu-timing-visible: bool, gpu-timing-note: string,
+    profile-chart: image, profile-labels: [ChartLabel], profile-points: [ChartPoint], profile-sizes: [string], profile-statistics: [string],
+    gpu-timing-chart: image, gpu-timing-labels: [ChartLabel], gpu-timing-points: [ChartPoint], gpu-timing-available: bool, gpu-timing-visible: bool, gpu-timing-note: string,
     tuning-facts-top: [TuningFact], tuning-facts-bottom: [TuningFact], tuning-bars: [TuningBar], tuning-allocation: [TuningBar], tuning-actions: [TuningFact], tuning-quality: string,
 }
 
@@ -30,7 +31,46 @@ export struct SummaryRow { title: string, metric: string, latest: string, best: 
 component SectionTitle inherits Text { color: #f4f7fb; font-size: 25px; font-weight: 700; }
 component Surface inherits Rectangle { background: #151b26; border-color: #293448; border-width: 1px; border-radius: 14px; }
 component Label inherits Text { color: #8f9caf; font-size: 11px; font-weight: 700; }
+component InteractiveChart inherits Rectangle {
+    in property <image> chart;
+    in property <[ChartLabel]> labels;
+    in property <[ChartPoint]> points;
+    in property <float> source-height;
+    pure callback pick-point(float, float, float, float) -> int;
+    private property <float> cursor-x: pointer.mouse-x / root.width * 900;
+    private property <float> cursor-y: pointer.mouse-y / root.height * root.source-height;
+    private property <float> plot-bottom: root.source-height == 420 ? (root.cursor-y >= 42 && root.cursor-y <= 162 ? 162 : root.cursor-y >= 232 && root.cursor-y <= 352 ? 352 : -1) : (root.cursor-y >= 60 && root.cursor-y <= 220 ? 220 : -1);
+    private property <bool> over-plot: pointer.has-hover && root.cursor-x >= 110 && root.cursor-x <= 870 && root.plot-bottom > 0;
+    private property <int> active: root.over-plot ? root.pick-point(pointer.mouse-x / 1px, pointer.mouse-y / 1px, root.width / 1px, root.height / 1px) : -1;
+    private property <ChartPoint> point: root.active >= 0 && root.active < root.points.length ? root.points[root.active] : {};
+    private property <float> guide-x: root.active >= 0 ? root.point.x : root.cursor-x;
+    private property <float> guide-y: root.active >= 0 ? root.point.y : root.cursor-y;
+    private property <float> guide-bottom: root.active >= 0 ? root.point.bottom : root.plot-bottom;
+    private property <color> guide-color: root.active >= 0 ? root.point.accent : #91b8c3;
+    height: self.width * root.source-height / 900;
+    vertical-stretch: 0;
+    Image { width: parent.width; height: parent.height; source: root.chart; image-fit: contain; }
+    for label in root.labels: Text { x: root.width * label.x / 900; y: root.height * label.y / root.source-height; width: root.width * label.width / 900; height: max(22px, root.height * 22 / root.source-height); text: label.text; color: label.accent; font-size: max(11px, root.width * label.font-size / 900); horizontal-alignment: label.alignment == 0 ? left : label.alignment == 1 ? center : right; }
+    if root.over-plot: Rectangle { x: root.width * 110 / 900; y: root.height * root.guide-y / root.source-height; width: root.width * (root.guide-x - 110) / 900; height: 1px; background: root.guide-color; }
+    if root.over-plot: Rectangle { x: root.width * root.guide-x / 900; y: root.height * root.guide-y / root.source-height; width: 1px; height: root.height * (root.guide-bottom - root.guide-y) / root.source-height; background: root.guide-color; }
+    if root.active >= 0: Rectangle { x: root.width * root.point.x / 900 - 5px; y: root.height * root.point.y / root.source-height - 5px; width: 10px; height: 10px; border-radius: 5px; background: root.point.accent; border-width: 2px; border-color: #ffffff; }
+    if root.active >= 0: Rectangle { x: 0px; y: max(0px, root.height * root.point.y / root.source-height - 11px); width: root.width * 108 / 900; height: 22px; background: #20364a; border-radius: 3px;
+        Text { text: root.point.value-label; color: root.point.accent; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+    }
+    if root.active >= 0: Rectangle { x: clamp(root.width * root.point.x / 900 - 75px, 0px, root.width - 150px); y: root.height * root.point.bottom / root.source-height + 4px; width: 150px; height: 23px; background: #20364a; border-radius: 3px;
+        Text { text: root.point.dataset-label; color: root.point.accent; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+    }
+    if root.active >= 0: tooltip := Rectangle { width: min(260px, root.width - 120px); height: tooltip-content.preferred-height; x: clamp(root.width * root.point.x / 900 + 12px, 80px, root.width - self.width - 8px); y: clamp(root.height * root.point.y / root.source-height - self.height - 12px, 4px, root.height - self.height - 4px); background: #172d3e; border-width: 1px; border-color: root.point.accent; border-radius: 7px;
+        tooltip-content := VerticalLayout { padding: 12px; spacing: 6px; alignment: start;
+            Text { text: root.point.series; color: #a5bec6; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; }
+            Text { text: root.point.display-value; color: root.point.accent; font-size: 20px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+            Text { text: root.point.dataset-label + " dataset"; color: #e6f4f2; font-size: 12px; vertical-stretch: 0; }
+        }
+    }
+    pointer := TouchArea { width: parent.width; height: parent.height; mouse-cursor: root.over-plot ? crosshair : default; }
+}
 export component MainWindow inherits Window {
+    pure callback chart-point-at([ChartPoint], float, float, float, float, float) -> int;
     title: "Gluj-Bench";
     in property <string> app-version;
     in property <bool> system-ready: false;
@@ -487,17 +527,17 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Label { text: "PERFORMANCE AS DATA GROWS"; color: #73dcca; }
-                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: chart-frame := Rectangle { height: self.width * 420 / 900; vertical-stretch: 0;
-                                        Image { width: parent.width; height: parent.height; source: root.selected-result.profile-chart; image-fit: contain; }
-                                        for label in root.selected-result.profile-labels: Text { x: chart-frame.width * label.x / 900; y: chart-frame.height * label.y / 420; width: chart-frame.width * label.width / 900; height: chart-frame.height * 22 / 420; text: label.text; color: label.accent; font-size: chart-frame.width * label.font-size / 900; horizontal-alignment: label.alignment == 0 ? left : label.alignment == 1 ? center : right; }
+                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: profile-interactive := InteractiveChart {
+                                        chart: root.selected-result.profile-chart; labels: root.selected-result.profile-labels; points: root.selected-result.profile-points; source-height: 420;
+                                        pick-point(x, y, width, height) => { return root.chart-point-at(root.selected-result.profile-points, x, y, width, height, 420); }
                                     }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: "Points show median throughput; shading shows sample minimum–maximum. Dashed line: this run’s compute reference. Dataset sizes use a logarithmic scale."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: ComboBox { model: root.selected-result.profile-sizes; current-index: root.profile-index; selected(value) => { root.profile-selection = self.current-index; } }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: root.selected-result.profile-statistics[root.profile-index]; color: #c2cede; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded && root.selected-result.gpu-timing-visible: Label { text: "MEASURED GPU TIMINGS · LOWER IS FASTER"; color: #edc778; }
-                                    if root.result-details-expanded && root.selected-result.gpu-timing-available: timing-frame := Rectangle { height: self.width * 280 / 900; vertical-stretch: 0;
-                                        Image { width: parent.width; height: parent.height; source: root.selected-result.gpu-timing-chart; image-fit: contain; }
-                                        for label in root.selected-result.gpu-timing-labels: Text { x: timing-frame.width * label.x / 900; y: timing-frame.height * label.y / 280; width: timing-frame.width * label.width / 900; height: timing-frame.height * 22 / 280; text: label.text; color: label.accent; font-size: max(11px, timing-frame.width * label.font-size / 900); horizontal-alignment: label.alignment == 0 ? left : label.alignment == 1 ? center : right; }
+                                    if root.result-details-expanded && root.selected-result.gpu-timing-available: timing-interactive := InteractiveChart {
+                                        chart: root.selected-result.gpu-timing-chart; labels: root.selected-result.gpu-timing-labels; points: root.selected-result.gpu-timing-points; source-height: 280;
+                                        pick-point(x, y, width, height) => { return root.chart-point-at(root.selected-result.gpu-timing-points, x, y, width, height, 280); }
                                     }
                                     if root.result-details-expanded && root.selected-result.gpu-timing-visible: Text { text: root.selected-result.gpu-timing-note; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded: Label { text: "WHAT THIS TEST MEASURES"; }
