@@ -352,12 +352,16 @@ pub fn run(
     }
     let maximum = allocation_budget(system.total_memory(), available, ram_percent, requested_mib);
 
-    let tiers = if matrix {
+    let (maximum, single_dataset) = gluj_bench_core::configured_dataset(config, maximum)?;
+    let mut tiers = if matrix {
         crate::matrix_scaling::sizes(maximum, locations.len())
     } else {
         sizes(maximum, locations.len())
     };
-    if tiers.len() < 3 {
+    if single_dataset {
+        tiers = tiers.last().copied().into_iter().collect();
+    }
+    if tiers.len() < if single_dataset { 1 } else { 3 } {
         return Err(BenchmarkError::new(
             "insufficient_memory",
             "Not enough free RAM for a CPU scaling sweep.",

@@ -524,8 +524,13 @@ fn run_fp16_matrix_scaling(
         memory_limit = memory_limit.min(record.vulkan.device_local_memory_bytes / 8);
     }
     let maximum = binding_limit.min(memory_limit);
-    let requested_sizes = matrix_profile_sizes(maximum);
-    if requested_sizes.len() < 3 {
+    let (maximum, single_dataset) = gluj_bench_core::configured_dataset(config, maximum)?;
+    let requested_sizes = if single_dataset {
+        vec![maximum]
+    } else {
+        matrix_profile_sizes(maximum)
+    };
+    if requested_sizes.len() < if single_dataset { 1 } else { 3 } {
         return Err(BenchmarkError::new(
             "insufficient_gpu_memory",
             "At least three FP16 operand-size tiers are required for a matrix scaling profile.",
@@ -544,6 +549,8 @@ fn run_fp16_matrix_scaling(
         .into_iter()
         .map(|size| harness.actual_working_set(size))
         .collect::<Vec<_>>();
+    let mut sizes = sizes;
+    sizes.dedup();
     let reuse_count = config
         .options
         .get("matrix_tile_reuse")
@@ -557,6 +564,8 @@ fn run_fp16_matrix_scaling(
     let target_seconds =
         gluj_bench_core::gpu_burst_duration(std::time::Duration::from_secs_f64(target_seconds))
             .as_secs_f64();
+    let mut timing_metrics = Vec::new();
+    let mut timing_batches = Vec::new();
     let mut raw_points = Vec::with_capacity(sizes.len());
     for (index, working_set) in sizes.iter().copied().enumerate() {
         ensure_not_cancelled(cancellation)?;
@@ -577,13 +586,26 @@ fn run_fp16_matrix_scaling(
         let traffic = harness.traffic_bytes_per_dispatch(working_set) as f64;
         let mut compute_values = Vec::with_capacity(sample_count as usize);
         let mut bandwidth_values = Vec::with_capacity(sample_count as usize);
+        let mut gpu_times = Vec::with_capacity(sample_count as usize);
+        let mut end_to_end_times = Vec::with_capacity(sample_count as usize);
         for _ in 0..sample_count {
             ensure_not_cancelled(cancellation)?;
+            let sample_started = Instant::now();
             let elapsed_ns = harness.measure(working_set, reuse_count, iterations)?;
+            let end_to_end_ns = sample_started.elapsed().as_secs_f64() * 1e9;
+            gpu_times.push(crate::timing::per_pass(elapsed_ns, iterations));
+            end_to_end_times.push(crate::timing::per_pass(end_to_end_ns, iterations));
             let seconds = elapsed_ns / 1e9;
             compute_values.push(operations * iterations as f64 / seconds);
             bandwidth_values.push(traffic * iterations as f64 / seconds);
         }
+        crate::timing::append_metrics(
+            &mut timing_metrics,
+            working_set,
+            &gpu_times,
+            &end_to_end_times,
+        );
+        timing_batches.push(format!("{working_set}:{iterations}"));
         raw_points.push((
             working_set,
             statistics(&compute_values),
@@ -632,6 +654,7 @@ fn run_fp16_matrix_scaling(
             statistics: point.bandwidth.clone(),
         });
     }
+    metrics.extend(timing_metrics);
     if let Some(index) = transition_index {
         metrics.push(Metric {
             name: "bandwidth_transition_working_set".into(),
@@ -641,6 +664,16 @@ fn run_fp16_matrix_scaling(
         });
     }
     let mut metadata = matrix_metadata(record, kind, shape);
+    metadata.insert(
+        "gpu_timing_method".into(),
+        "gpu_timestamp_and_host_elapsed_per_pass_v1".into(),
+    );
+    metadata.insert(
+        "gpu_timing_definition".into(),
+        gluj_bench_core::GPU_TIMING_EXPLANATION.into(),
+    );
+    metadata.insert("gpu_timing_batch_passes".into(), timing_batches.join(","));
+    metadata.insert("gpu_timing_samples_paired".into(), "true".into());
     insert_clock_policy(&mut metadata);
     metadata.insert(
         "execution_domain".into(),

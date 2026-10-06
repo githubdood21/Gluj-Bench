@@ -6,6 +6,12 @@ const PROFILE_SPV: &[u8] = include_bytes!("../shaders/spv/compute_profile_fp32.s
 const BYTES_PER_ELEMENT: u64 = 48;
 const OPERATIONS_PER_LOOP_PER_ELEMENT: u64 = 64;
 
+struct Region {
+    elements: u32,
+    first_set: usize,
+    first_buffer: usize,
+}
+
 struct Buffer {
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -14,6 +20,7 @@ struct Buffer {
 pub(super) struct VulkanComputeProfileHarness {
     _entry: Entry,
     instance: ash::Instance,
+    physical_device: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
@@ -25,9 +32,10 @@ pub(super) struct VulkanComputeProfileHarness {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     query_pool: vk::QueryPool,
-    input_a: Buffer,
-    input_b: Buffer,
-    output: Buffer,
+    buffers: Vec<Buffer>,
+    regions: Vec<Region>,
+    element_alignment: u64,
+    offload_percent: u32,
     timestamp_period_ns: f64,
     timestamp_valid_bits: u32,
     pub maximum_working_set_bytes: u64,
@@ -36,23 +44,37 @@ pub(super) struct VulkanComputeProfileHarness {
 impl VulkanComputeProfileHarness {
     pub fn new(record: &AdapterRecord, requested_working_set: u64) -> Result<Self, BenchmarkError> {
         // SAFETY: every Vulkan handle is owned by the returned harness and destroyed by Drop.
-        unsafe { Self::new_inner(record, requested_working_set) }
+        unsafe { Self::new_inner(record, requested_working_set, 0) }
+    }
+
+    pub fn new_with_offload(
+        record: &AdapterRecord,
+        requested_working_set: u64,
+        offload_percent: u32,
+    ) -> Result<Self, BenchmarkError> {
+        if ![50, 75, 100].contains(&offload_percent) {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "RAM offload must be 50, 75, or 100 percent.",
+            ));
+        }
+        // SAFETY: the harness owns all resources, including partially constructed resources.
+        unsafe { Self::new_inner(record, requested_working_set, offload_percent) }
     }
 
     unsafe fn new_inner(
         record: &AdapterRecord,
         requested_working_set: u64,
+        offload_percent: u32,
     ) -> Result<Self, BenchmarkError> {
         let element_count =
             requested_working_set / BYTES_PER_ELEMENT / WORKGROUP_SIZE * WORKGROUP_SIZE;
-        let per_buffer_size = element_count * 16;
         if element_count < WORKGROUP_SIZE || element_count > u32::MAX as u64 {
             return Err(BenchmarkError::new(
                 "invalid_working_set",
                 "The compute-profile working set is outside the supported shader index range.",
             ));
         }
-        let maximum_working_set_bytes = element_count * BYTES_PER_ELEMENT;
         let entry = unsafe { Entry::load() }
             .map_err(|problem| error("vulkan_loader_unavailable", problem))?;
         let app = c"Gluj-Bench";
@@ -79,7 +101,8 @@ impl VulkanComputeProfileHarness {
             };
         let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
         let elements_per_chunk = chunk_element_limit(
-            limits.max_compute_work_group_count[0],
+            limits.max_compute_work_group_count[0]
+                .min((limits.max_storage_buffer_range as u64 / 16 / WORKGROUP_SIZE) as u32),
             limits.min_storage_buffer_offset_alignment,
         );
         if elements_per_chunk == 0 {
@@ -89,7 +112,18 @@ impl VulkanComputeProfileHarness {
                 "The device cannot dispatch an aligned compute-profile chunk.",
             ));
         }
-        let chunks = dispatch_chunks(element_count as u32, elements_per_chunk);
+        let element_alignment = WORKGROUP_SIZE.max(limits.min_storage_buffer_offset_alignment / 16);
+        // All offload profiles use identical tier alignment; mixed shares stay exact.
+        let total_alignment = element_alignment * if offload_percent > 0 { 4 } else { 1 };
+        let element_count = element_count / total_alignment * total_alignment;
+        if element_count == 0 {
+            unsafe { instance.destroy_instance(None) };
+            return Err(BenchmarkError::new(
+                "invalid_working_set",
+                "Working set is too small for aligned RAM/VRAM regions.",
+            ));
+        }
+        let maximum_working_set_bytes = element_count * BYTES_PER_ELEMENT;
         let priorities = [1.0_f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(record.vulkan.compute_queue_family)
@@ -108,13 +142,63 @@ impl VulkanComputeProfileHarness {
             }
         };
         let queue = unsafe { device.get_device_queue(record.vulkan.compute_queue_family, 0) };
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
-        let input_a =
-            unsafe { create_buffer(&instance, &device, physical_device, per_buffer_size, usage) }?;
-        let input_b =
-            unsafe { create_buffer(&instance, &device, physical_device, per_buffer_size, usage) }?;
-        let output =
-            unsafe { create_buffer(&instance, &device, physical_device, per_buffer_size, usage) }?;
+        // Construct the owner before allocating children. Drop also handles setup failures.
+        let mut harness = Self {
+            _entry: entry,
+            instance,
+            physical_device,
+            device,
+            queue,
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_layout: vk::DescriptorSetLayout::null(),
+            descriptor_sets: Vec::new(),
+            elements_per_chunk,
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            query_pool: vk::QueryPool::null(),
+            buffers: Vec::new(),
+            regions: Vec::new(),
+            element_alignment: total_alignment,
+            offload_percent,
+            timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
+            timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
+            maximum_working_set_bytes,
+        };
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::TRANSFER_SRC;
+        let counts = region_elements(element_count as u32, offload_percent);
+        let mut chunks = Vec::new();
+        for (region_index, count) in counts.into_iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let region = Region {
+                elements: count,
+                first_set: chunks.len(),
+                first_buffer: harness.buffers.len(),
+            };
+            for _ in 0..3 {
+                harness.buffers.push(unsafe {
+                    create_buffer(
+                        &harness.instance,
+                        &harness.device,
+                        physical_device,
+                        count as u64 * 16,
+                        usage,
+                        region_index == 0 && offload_percent > 0,
+                    )
+                }?);
+            }
+            chunks.extend(
+                dispatch_chunks(count, elements_per_chunk)
+                    .into_iter()
+                    .map(|(offset, count)| (region.first_buffer, offset, count)),
+            );
+            harness.regions.push(region);
+        }
         let bindings = [0_u32, 1, 2].map(|binding| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
@@ -122,163 +206,150 @@ impl VulkanComputeProfileHarness {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         });
-        let descriptor_layout = unsafe {
-            device.create_descriptor_set_layout(
+        harness.descriptor_layout = unsafe {
+            harness.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_descriptor_layout_failed", problem))?;
-        let set_layouts = [descriptor_layout];
+        .map_err(|p| error("vulkan_descriptor_layout_failed", p))?;
+        let set_layouts = [harness.descriptor_layout];
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
             .size(16)];
-        let pipeline_layout = unsafe {
-            device.create_pipeline_layout(
+        harness.pipeline_layout = unsafe {
+            harness.device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
                     .push_constant_ranges(&push_ranges),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_pipeline_layout_failed", problem))?;
+        .map_err(|p| error("vulkan_pipeline_layout_failed", p))?;
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(3 * chunks.len() as u32)];
-        let descriptor_pool = unsafe {
-            device.create_descriptor_pool(
+        harness.descriptor_pool = unsafe {
+            harness.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(chunks.len() as u32)
                     .pool_sizes(&pool_sizes),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_descriptor_pool_failed", problem))?;
-        let chunk_layouts = vec![descriptor_layout; chunks.len()];
-        let descriptor_sets = unsafe {
-            device.allocate_descriptor_sets(
+        .map_err(|p| error("vulkan_descriptor_pool_failed", p))?;
+        let chunk_layouts = vec![harness.descriptor_layout; chunks.len()];
+        harness.descriptor_sets = unsafe {
+            harness.device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
+                    .descriptor_pool(harness.descriptor_pool)
                     .set_layouts(&chunk_layouts),
             )
         }
-        .map_err(|problem| error("vulkan_descriptor_set_failed", problem))?;
-        // Each set exposes a non-overlapping slice, so the existing shader's local
-        // index can address large working sets without exceeding dispatch limits.
-        for (&descriptor_set, &(offset, count)) in descriptor_sets.iter().zip(&chunks) {
-            let buffer_infos = [input_a.handle, input_b.handle, output.handle].map(|buffer| {
+        .map_err(|p| error("vulkan_descriptor_set_failed", p))?;
+        for (&set, &(first, offset, count)) in harness.descriptor_sets.iter().zip(&chunks) {
+            let infos = [0, 1, 2].map(|index| {
                 vk::DescriptorBufferInfo::default()
-                    .buffer(buffer)
+                    .buffer(harness.buffers[first + index].handle)
                     .offset(offset as u64 * 16)
                     .range(count as u64 * 16)
             });
             let writes = [0_u32, 1, 2].map(|binding| {
                 vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
+                    .dst_set(set)
                     .dst_binding(binding)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&buffer_infos[binding as usize]))
+                    .buffer_info(std::slice::from_ref(&infos[binding as usize]))
             });
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            unsafe { harness.device.update_descriptor_sets(&writes, &[]) };
         }
         let words = shader_words()?;
         let shader = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            harness
+                .device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
         }
-        .map_err(|problem| error("vulkan_shader_module_failed", problem))?;
+        .map_err(|p| error("vulkan_shader_module_failed", p))?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(c"main");
-        let pipeline_result = unsafe {
-            device.create_compute_pipelines(
+        let pipeline = unsafe {
+            harness.device.create_compute_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default()
                     .stage(stage)
-                    .layout(pipeline_layout)],
+                    .layout(harness.pipeline_layout)],
                 None,
             )
         };
-        unsafe { device.destroy_shader_module(shader, None) };
-        let pipeline = pipeline_result
-            .map_err(|(_, problem)| error("vulkan_compute_pipeline_failed", problem))?[0];
-        let query_pool = unsafe {
-            device.create_query_pool(
+        unsafe { harness.device.destroy_shader_module(shader, None) };
+        harness.pipeline = match pipeline {
+            Ok(pipelines) => pipelines[0],
+            Err((pipelines, problem)) => {
+                for pipeline in pipelines {
+                    unsafe { harness.device.destroy_pipeline(pipeline, None) };
+                }
+                return Err(error("vulkan_compute_pipeline_failed", problem));
+            }
+        };
+        harness.query_pool = unsafe {
+            harness.device.create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(2),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_query_pool_failed", problem))?;
-        let command_pool = unsafe {
-            device.create_command_pool(
+        .map_err(|p| error("vulkan_query_pool_failed", p))?;
+        harness.command_pool = unsafe {
+            harness.device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .queue_family_index(record.vulkan.compute_queue_family)
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_command_pool_failed", problem))?;
-        let command_buffer = unsafe {
-            device.allocate_command_buffers(
+        .map_err(|p| error("vulkan_command_pool_failed", p))?;
+        harness.command_buffer = unsafe {
+            harness.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(command_pool)
+                    .command_pool(harness.command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
         }
-        .map_err(|problem| error("vulkan_command_buffer_failed", problem))?[0];
-        let harness = Self {
-            _entry: entry,
-            instance,
-            device,
-            queue,
-            command_pool,
-            command_buffer,
-            descriptor_pool,
-            descriptor_layout,
-            descriptor_sets,
-            elements_per_chunk,
-            pipeline_layout,
-            pipeline,
-            query_pool,
-            input_a,
-            input_b,
-            output,
-            timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
-            timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
-            maximum_working_set_bytes,
-        };
-        harness.initialize(per_buffer_size)?;
+        .map_err(|p| error("vulkan_command_buffer_failed", p))?[0];
+        harness.initialize()?;
         Ok(harness)
     }
 
-    fn initialize(&self, per_buffer_size: u64) -> Result<(), BenchmarkError> {
-        // SAFETY: buffers have TRANSFER_DST usage and no benchmark submission is in flight.
+    fn initialize(&self) -> Result<(), BenchmarkError> {
+        // SAFETY: buffers have TRANSFER_DST usage and no submission is in flight.
         unsafe {
             self.begin()?;
-            self.device.cmd_fill_buffer(
+            for region in &self.regions {
+                for index in 0..3 {
+                    self.device.cmd_fill_buffer(
+                        self.command_buffer,
+                        self.buffers[region.first_buffer + index].handle,
+                        0,
+                        region.elements as u64 * 16,
+                        if index == 2 { 0 } else { 0x3f00_0000 },
+                    );
+                }
+            }
+            self.device.cmd_pipeline_barrier(
                 self.command_buffer,
-                self.input_a.handle,
-                0,
-                per_buffer_size,
-                0x3f00_0000,
-            );
-            self.device.cmd_fill_buffer(
-                self.command_buffer,
-                self.input_b.handle,
-                0,
-                per_buffer_size,
-                0x3f00_0000,
-            );
-            self.device.cmd_fill_buffer(
-                self.command_buffer,
-                self.output.handle,
-                0,
-                per_buffer_size,
-                0,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)],
+                &[],
+                &[],
             );
             self.submit()?;
         }
@@ -286,10 +357,11 @@ impl VulkanComputeProfileHarness {
     }
 
     pub fn actual_working_set(&self, requested: u64) -> u64 {
-        let elements =
-            (requested.min(self.maximum_working_set_bytes) / BYTES_PER_ELEMENT / WORKGROUP_SIZE)
-                * WORKGROUP_SIZE;
-        elements.max(WORKGROUP_SIZE) * BYTES_PER_ELEMENT
+        let elements = (requested.min(self.maximum_working_set_bytes)
+            / BYTES_PER_ELEMENT
+            / self.element_alignment)
+            * self.element_alignment;
+        elements.max(self.element_alignment) * BYTES_PER_ELEMENT
     }
 
     pub fn operations_per_dispatch(&self, working_set: u64, loop_count: u32) -> u64 {
@@ -300,6 +372,127 @@ impl VulkanComputeProfileHarness {
         working_set
     }
 
+    /// Check the first and last output of both memory regions outside the timed samples.
+    pub fn validate_output(&self, working_set: u64, loop_count: u32) -> Result<(), BenchmarkError> {
+        let counts = region_elements(
+            (working_set / BYTES_PER_ELEMENT) as u32,
+            self.offload_percent,
+        );
+        let counts = counts
+            .into_iter()
+            .filter(|count| *count > 0)
+            .collect::<Vec<_>>();
+        // SAFETY: the selected physical device belongs to our instance; the readback allocation
+        // is host-visible, and every submission completes before mapping or destroying it.
+        unsafe {
+            let readback = create_buffer(
+                &self.instance,
+                &self.device,
+                self.physical_device,
+                64,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                true,
+            )?;
+            let result = (|| {
+                self.begin()?;
+                self.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)],
+                    &[],
+                    &[],
+                );
+                for (index, (region, count)) in self.regions.iter().zip(&counts).enumerate() {
+                    let copies = [
+                        vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset: index as u64 * 32,
+                            size: 16,
+                        },
+                        vk::BufferCopy {
+                            src_offset: (*count as u64 - 1) * 16,
+                            dst_offset: index as u64 * 32 + 16,
+                            size: 16,
+                        },
+                    ];
+                    self.device.cmd_copy_buffer(
+                        self.command_buffer,
+                        self.buffers[region.first_buffer + 2].handle,
+                        readback.handle,
+                        &copies,
+                    );
+                }
+                self.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                    &[],
+                    &[],
+                );
+                self.submit()?;
+                let mapped = self
+                    .device
+                    .map_memory(
+                        readback.memory,
+                        0,
+                        vk::WHOLE_SIZE,
+                        vk::MemoryMapFlags::empty(),
+                    )
+                    .map_err(|p| error("vulkan_readback_map_failed", p))?;
+                let invalidate =
+                    self.device
+                        .invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                            .memory(readback.memory)
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)]);
+                let values = if invalidate.is_ok() {
+                    let mut values = [0_f32; 16];
+                    std::ptr::copy_nonoverlapping(
+                        mapped.cast::<f32>(),
+                        values.as_mut_ptr(),
+                        values.len(),
+                    );
+                    values
+                } else {
+                    [f32::NAN; 16]
+                };
+                self.device.unmap_memory(readback.memory);
+                invalidate.map_err(|p| error("vulkan_readback_invalidate_failed", p))?;
+                for (region, count) in counts.iter().enumerate() {
+                    for (sample, index) in [0, (count - 1) % self.elements_per_chunk]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let expected = expected_output(index, loop_count);
+                        for lane in 0..4 {
+                            let value = values[region * 8 + sample * 4 + lane];
+                            if !value.is_finite()
+                                || (value - expected).abs() > expected.abs().max(1.0) * 0.0001
+                            {
+                                return Err(BenchmarkError::new(
+                                    "gpu_result_validation_failed",
+                                    "FP32 offload output did not match the scalar FMA reference.",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            self.device.destroy_buffer(readback.handle, None);
+            self.device.free_memory(readback.memory, None);
+            result
+        }
+    }
+
     pub fn measure(
         &self,
         working_set: u64,
@@ -307,7 +500,22 @@ impl VulkanComputeProfileHarness {
         iterations: u32,
     ) -> Result<f64, BenchmarkError> {
         let element_count = (working_set / BYTES_PER_ELEMENT) as u32;
-        let chunks = dispatch_chunks(element_count, self.elements_per_chunk);
+        let counts = region_elements(element_count, self.offload_percent);
+        let active_counts = counts
+            .into_iter()
+            .filter(|count| *count > 0)
+            .collect::<Vec<_>>();
+        let chunks = self
+            .regions
+            .iter()
+            .zip(active_counts)
+            .flat_map(|(region, count)| {
+                dispatch_chunks(count, self.elements_per_chunk)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, (_, count))| (region.first_set + index, count))
+            })
+            .collect::<Vec<_>>();
         // SAFETY: the command buffer and all referenced handles are owned by this harness.
         unsafe {
             self.begin()?;
@@ -325,7 +533,17 @@ impl VulkanComputeProfileHarness {
                 self.pipeline,
             );
             for _ in 0..iterations {
-                for (index, &(_, count)) in chunks.iter().enumerate() {
+                // Repeated dispatches write the same outputs: order their writes explicitly.
+                self.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[],
+                );
+                for &(index, count) in &chunks {
                     self.device.cmd_bind_descriptor_sets(
                         self.command_buffer,
                         vk::PipelineBindPoint::COMPUTE,
@@ -427,7 +645,7 @@ impl Drop for VulkanComputeProfileHarness {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
-            for buffer in [&self.input_a, &self.input_b, &self.output] {
+            for buffer in &self.buffers {
                 self.device.destroy_buffer(buffer.handle, None);
                 self.device.free_memory(buffer.memory, None);
             }
@@ -437,12 +655,46 @@ impl Drop for VulkanComputeProfileHarness {
     }
 }
 
+pub(super) fn host_memory_type(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+) -> Option<u32> {
+    (0..properties.memory_type_count).find(|index| {
+        let ty = properties.memory_types[*index as usize];
+        bits & (1 << index) != 0
+            && ty
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && !properties.memory_heaps[ty.heap_index as usize]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    })
+}
+
+fn region_elements(elements: u32, offload_percent: u32) -> [u32; 2] {
+    let host = (elements as u64 * offload_percent as u64 / 100) as u32;
+    [host, elements - host]
+}
+
+fn expected_output(index: u32, loop_count: u32) -> f32 {
+    let perturbation = ((index ^ 0x9e37_79b9) & 255) as f32 * 0.000001;
+    let mut values = [0.5 + perturbation, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57];
+    let multiplier = 0.5_f32 * 0.000002 + 0.999999;
+    for _ in 0..loop_count {
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = value.mul_add(multiplier, (index + 1) as f32 * 0.000001);
+        }
+    }
+    values.into_iter().sum()
+}
+
 unsafe fn create_buffer(
     instance: &ash::Instance,
     device: &ash::Device,
     physical_device: vk::PhysicalDevice,
     size: u64,
     usage: vk::BufferUsageFlags,
+    host: bool,
 ) -> Result<Buffer, BenchmarkError> {
     let handle = unsafe {
         device.create_buffer(
@@ -453,33 +705,51 @@ unsafe fn create_buffer(
             None,
         )
     }
-    .map_err(|problem| error("vulkan_buffer_failed", problem))?;
+    .map_err(|p| error("vulkan_buffer_failed", p))?;
     let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
     let properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let memory_type = (0..properties.memory_type_count)
-        .find(|index| {
+    let memory_type = if host {
+        host_memory_type(&properties, requirements.memory_type_bits)
+    } else {
+        (0..properties.memory_type_count).find(|index| {
             requirements.memory_type_bits & (1 << index) != 0
                 && properties.memory_types[*index as usize]
                     .property_flags
                     .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
         })
-        .ok_or_else(|| {
-            BenchmarkError::new(
-                "vulkan_device_memory_unavailable",
-                "No device-local memory type can back the compute-profile buffers.",
-            )
-        })?;
-    let memory = unsafe {
+    };
+    let Some(memory_type) = memory_type else {
+        unsafe { device.destroy_buffer(handle, None) };
+        return Err(BenchmarkError::new(
+            "vulkan_memory_type_unavailable",
+            if host {
+                "No host-visible buffer-compatible memory type on a separate system-RAM heap. BAR-mapped VRAM is excluded."
+            } else {
+                "No device-local memory type can back the compute-profile buffers."
+            },
+        ));
+    };
+    let memory = match unsafe {
         device.allocate_memory(
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_type),
             None,
         )
+    } {
+        Ok(memory) => memory,
+        Err(problem) => {
+            unsafe { device.destroy_buffer(handle, None) };
+            return Err(error("vulkan_memory_allocation_failed", problem));
+        }
+    };
+    if let Err(problem) = unsafe { device.bind_buffer_memory(handle, memory, 0) } {
+        unsafe {
+            device.destroy_buffer(handle, None);
+            device.free_memory(memory, None);
+        }
+        return Err(error("vulkan_buffer_bind_failed", problem));
     }
-    .map_err(|problem| error("vulkan_memory_allocation_failed", problem))?;
-    unsafe { device.bind_buffer_memory(handle, memory, 0) }
-        .map_err(|problem| error("vulkan_buffer_bind_failed", problem))?;
     Ok(Buffer { handle, memory })
 }
 
@@ -570,6 +840,67 @@ mod tests {
     fn accounting_matches_shader_contract() {
         assert_eq!(BYTES_PER_ELEMENT, 48);
         assert_eq!(OPERATIONS_PER_LOOP_PER_ELEMENT, 64);
+    }
+
+    #[test]
+    fn offload_selection_excludes_bar_vram_and_respects_buffer_memory_bits() {
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 2,
+            memory_type_count: 3,
+            ..Default::default()
+        };
+        properties.memory_heaps[0] = vk::MemoryHeap {
+            size: 8 << 30,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        properties.memory_heaps[1] = vk::MemoryHeap {
+            size: 32 << 30,
+            flags: vk::MemoryHeapFlags::empty(),
+        };
+        properties.memory_types[0] = vk::MemoryType {
+            heap_index: 0,
+            property_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        };
+        properties.memory_types[1] = vk::MemoryType {
+            heap_index: 0,
+            property_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL
+                | vk::MemoryPropertyFlags::HOST_VISIBLE,
+        };
+        properties.memory_types[2] = vk::MemoryType {
+            heap_index: 1,
+            property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE,
+        };
+        assert_eq!(host_memory_type(&properties, 0b111), Some(2));
+        assert_eq!(host_memory_type(&properties, 0b011), None);
+        properties.memory_heaps[1].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+        assert_eq!(host_memory_type(&properties, u32::MAX), None);
+    }
+
+    #[test]
+    fn every_aligned_offload_tier_has_exact_split_and_complete_dispatch_coverage() {
+        for alignment in [256, 4096] {
+            for quarters in [1, 13, 8192] {
+                let elements = alignment * 4 * quarters;
+                for percent in [0, 50, 75, 100] {
+                    let [host, local] = region_elements(elements, percent);
+                    assert_eq!(host + local, elements);
+                    assert_eq!(host as u64 * 100, elements as u64 * percent as u64);
+                    for count in [host, local] {
+                        assert_eq!(count % alignment, 0);
+                        let limit = alignment * 7;
+                        let chunks = dispatch_chunks(count, limit);
+                        assert_eq!(chunks.iter().map(|(_, count)| count).sum::<u32>(), count);
+                        assert!(
+                            chunks
+                                .iter()
+                                .all(|(offset, count)| offset % alignment == 0 && *count <= limit)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(expected_output(0, 64).is_finite());
+        assert!(expected_output(255, 64) > 4.0);
     }
 
     #[test]

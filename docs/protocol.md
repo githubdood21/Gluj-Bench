@@ -34,6 +34,28 @@ Matrix families include dense FP16, INT8, and FP8 plus their `gpu.performance.ma
 
 FP8 and structured-sparse rows remain visible but disabled unless a capability-verified implementation exists; dense KHR support is never treated as evidence of sparse acceleration. Results use `operations/s`; vector FMA and matrix multiply-accumulate both count multiplication and addition as separate operations.
 
+### FP32 system-RAM offload profiles
+
+`gpu.performance.fp32.offload.scaling` uses the FP32 scaling kernel with a configurable `ram_offload_percent`: 50, 75 (default), or 100. The share applies to **all input and output bytes**, allocated on a separate host-visible, non-device-local Vulkan heap. Other test arrays use device-local memory. At 100% the test arrays use no VRAM. The test requires a discrete GPU, timestamp support, and compatible host-memory types; BAR-mapped VRAM and shared-memory integrated GPUs are excluded. Previously saved results with percentage-specific IDs are migrated by the UI to the consolidated ID with their percentage preserved.
+
+
+```json
+{"protocol":2,"id":"ram-offload","command":"run","arguments":{"benchmark_id":"gpu.performance.fp32.offload.scaling","target_duration_ms":2000,"samples":5,"options":{"device_id":"gpu:vulkan:<device-uuid>","ram_budget_percent":"20","vram_budget_percent":"25","gpu_activity_percent":"75","ram_offload_percent":"75","dataset_mode":"single","dataset_bytes":"268435456"}}}
+```
+
+`ram_budget_percent` accepts 20–80 (default 20), limiting the host region to that share of installed RAM, the host heap, 80% of available RAM, and available RAM minus 2 GiB, with another 16 MiB reserved for allocation overhead. Any VRAM region respects `vram_budget_percent`, also reserving 16 MiB. `max_working_set_bytes` is an optional total-dataset cap, at least 262144 bytes; it also applies to the ordinary FP32 scaling profile. Sweeps must allow at least three tiers; single-dataset mode requires one valid aligned tier. All offload percentages use the same quarter-region alignment, preserving exact shares and matching tier sizes when their allocation caps match. `arithmetic_iterations` retains the existing FP32 scaling behavior (default 64, clamped to 1–1024).
+
+All CPU/GPU compute scaling tests accept `dataset_mode` (`automatic`, `sweep`, or `single`; default automatic). Explicit sweep/single modes require `dataset_bytes` of at least 262144 bytes within the allocation/device limit. An oversized explicit request returns `dataset_exceeds_budget`, with the allowed size. Kernel alignment and matrix shapes can round the actual tested size downward. CPU sizes aggregate workers; GPU FP16 matrix sizes count operands. Results record `dataset_mode` and `requested_dataset_bytes` alongside actual tier names. Single mode produces one tier and does not claim a measured size-dependent memory-pressure transition.
+
+Alongside `working_set_<bytes>.compute`, `.bandwidth`, and `.reference_delta`, each tier includes `.host_bandwidth`: total effective traffic multiplied by the RAM share. It counts nominal RAM input reads plus output writes over GPU timestamp time. Repeated accesses may hit GPU caches; it is not measured PCIe traffic. CPU work, setup fills, output validation and GPU pacing intervals are excluded from timestamps.
+
+GPU compute scaling profiles return `working_set_<bytes>.gpu_execution_time` and `.end_to_end_time`, in `ns`, with measured per-sample statistics. Each sample records a Vulkan GPU timestamp duration and a paired host elapsed duration around the complete measurement call. Both are divided by the calibrated number of complete dataset passes in that sample batch. Host timing includes command recording, submission, completion, query-result retrieval and GPU activity pacing; GPU timestamp timing excludes host overhead and pacing. Setup, warmup and reference runs are excluded.
+
+Metadata records `gpu_timing_method` (`gpu_timestamp_and_host_elapsed_per_pass_v1`), `gpu_timing_definition`, `gpu_timing_batch_passes` (`dataset bytes:passes per sample` tuples), and `gpu_timing_samples_paired` (`true`). Batch lengths may vary across datasets. These are execution/end-to-end durations, not separate memory-stall durations. The old `.gpu_busy_estimate` / `.gpu_wait_estimate` metrics and `gpu_busy_wait_*` metadata are no longer generated. The UI hides retired estimates from older records and requires a rerun for timing graphs. Throughput/reference comparisons remain performance ratios. CPU profiles are unchanged.
+
+
+Metadata records `ram_offload_percent`, `ram_budget_percent`, `host_allocation_budget_bytes`, `host_allocated_test_buffer_bytes`, `device_allocated_test_buffer_bytes`, `host_memory_placement`, `offload_profile_revision`, and `offload_tier_bytes` (`total:host:local` tuples). `result_validation` confirms first/last output checks for each region at the largest tier. Explicit allocation does not simulate automatic VRAM overflow or page migration. Qualitative tuning guidance recommends exploring a lower GPU core-frequency limit or reducing application batch size/concurrent GPU jobs, then retesting. It keeps the RAM offload share fixed for frequency comparisons and does not generate a numerical clock-reduction estimate. GPU activity pacing is excluded from TOPS, so application-level completion time must be checked for workload reductions. Protocol version remains 2.
+
 The worker accepts one active run, emits an acceptance response, zero or more progress responses, and one terminal result or error using the run request ID:
 
 ```json

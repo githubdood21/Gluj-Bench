@@ -61,6 +61,21 @@ impl BenchmarkRegistry {
                         crate::vram_budget_percent(config)?.to_string(),
                     );
                 }
+                if benchmark_id.ends_with(".scaling") {
+                    result.workload_metadata.insert(
+                        "dataset_mode".into(),
+                        config
+                            .options
+                            .get("dataset_mode")
+                            .cloned()
+                            .unwrap_or_else(|| "automatic".into()),
+                    );
+                    if let Some(bytes) = config.options.get("dataset_bytes") {
+                        result
+                            .workload_metadata
+                            .insert("requested_dataset_bytes".into(), bytes.clone());
+                    }
+                }
                 if (benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory."))
                     && let Some(limit) = config.options.get("cpu_core_limit")
                 {

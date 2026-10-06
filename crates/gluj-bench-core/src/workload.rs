@@ -60,6 +60,47 @@ pub fn vram_budget_bytes(total: u64, percent: u32) -> u64 {
     (total / 100).saturating_mul(u64::from(percent))
 }
 
+/// Resolve an explicit scaling dataset before allocation. A request must fit the budget;
+/// kernel alignment/shape rounding is reported separately in the result's actual tier size.
+pub fn configured_dataset(
+    config: &BenchmarkConfig,
+    limit: u64,
+) -> Result<(u64, bool), BenchmarkError> {
+    let mode = config
+        .options
+        .get("dataset_mode")
+        .map(String::as_str)
+        .unwrap_or("automatic");
+    if mode == "automatic" {
+        return Ok((limit, false));
+    }
+    if !["sweep", "single"].contains(&mode) {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Dataset mode must be automatic, sweep, or single.",
+        ));
+    }
+    let bytes = config
+        .options
+        .get("dataset_bytes")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|bytes| *bytes >= 256 * 1024)
+        .ok_or_else(|| {
+            BenchmarkError::new("invalid_config", "Choose a dataset of at least 256 KiB.")
+        })?;
+    if bytes > limit {
+        return Err(BenchmarkError::new(
+            "dataset_exceeds_budget",
+            format!(
+                "Requested dataset is {:.2} MiB, but the current allocation budgets/device limits allow {:.2} MiB. Reduce the dataset or increase the relevant budget.",
+                bytes as f64 / 1048576.0,
+                limit as f64 / 1048576.0
+            ),
+        ));
+    }
+    Ok((bytes, mode == "single"))
+}
+
 thread_local! {
     static GPU_PACING: RefCell<Option<(u32, CancellationToken)>> = const { RefCell::new(None) };
 }
@@ -136,6 +177,38 @@ pub fn pace_gpu(active: Duration) -> Result<(), BenchmarkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_datasets_are_single_or_sweeps_and_never_silently_clamped() {
+        let mut config = BenchmarkConfig::default();
+        assert_eq!(
+            configured_dataset(&config, 1024 * 1024).unwrap(),
+            (1024 * 1024, false)
+        );
+        config
+            .options
+            .insert("dataset_mode".into(), "single".into());
+        assert!(configured_dataset(&config, 1024 * 1024).is_err());
+        config
+            .options
+            .insert("dataset_bytes".into(), "524288".into());
+        assert_eq!(
+            configured_dataset(&config, 1024 * 1024).unwrap(),
+            (524288, true)
+        );
+        config.options.insert("dataset_mode".into(), "sweep".into());
+        assert_eq!(
+            configured_dataset(&config, 1024 * 1024).unwrap(),
+            (524288, false)
+        );
+        assert_eq!(
+            configured_dataset(&config, 262144).unwrap_err().code,
+            "dataset_exceeds_budget"
+        );
+        config
+            .options
+            .insert("dataset_mode".into(), "unknown".into());
+        assert!(configured_dataset(&config, 1024 * 1024).is_err());
+    }
     #[test]
     fn reduced_modes_leave_workers_free_and_add_proportional_idle_time() {
         assert_eq!(worker_budget(16, 75), 12);

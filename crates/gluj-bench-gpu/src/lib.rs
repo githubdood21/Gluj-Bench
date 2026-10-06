@@ -2,6 +2,7 @@ mod analysis;
 mod compute;
 mod cooperative_matrix;
 mod scaling;
+mod timing;
 mod vulkan;
 mod vulkan_bandwidth;
 mod vulkan_compute_profile;
@@ -974,6 +975,7 @@ mod tests {
                 "gpu.performance.fp32",
                 "gpu.performance.fp64",
                 "gpu.performance.fp32.scaling",
+                "gpu.performance.fp32.offload.scaling",
                 cooperative_matrix::FP16_MATRIX_ID,
                 cooperative_matrix::FP16_MATRIX_SCALING_ID,
                 cooperative_matrix::INT8_MATRIX_ID,

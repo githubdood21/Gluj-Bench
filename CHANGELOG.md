@@ -4,6 +4,24 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 
 ## [Unreleased]
 
+### Added
+
+- Measured GPU execution and end-to-end time per dataset pass for FP32 VRAM/RAM-offload and FP16 matrix scaling, with sample ranges, readable time units and recorded batch sizes. The busy/wait percentage model has been retired; throughput/reference comparisons retain their performance meaning.
+
+- One GPU FP32 system-RAM offload scaling test with a configurable 50%, 75%, or 100% RAM share and the remaining data in VRAM.
+- Nominal host-traffic graphs, per-tier RAM/VRAM placement, allocation safeguards, and untimed scalar-reference checks for RAM-offload results.
+
+### Changed
+
+- Latest-measurement details now show throughput, sample range and variation cards, sample-spread bars, and workload context. Raw measurements are collapsible; GPU timing notices are limited to scaling tests.
+
+- Tuning details now use measurement cards, throughput comparison bars, allocation bars, a measurement-quality notice, and a retest checklist. Full technical reasoning remains available in a separate disclosure.
+
+- RAM-offload tuning guidance suggests exploring a lower GPU core-frequency limit or smaller GPU work batches, with throughput retesting and application-level validation.
+
+- Added persisted global scaling defaults and session-only per-test overrides, with automatic sweeps, user-sized sweeps, and single-dataset sampling. Queued runs capture effective settings and target hardware. Legacy offload result IDs migrate with their percentage preserved.
+- FP32 GPU scaling now explicitly orders initialization and repeated output writes, respects per-descriptor storage-buffer limits, and cleans up partial Vulkan setup failures. Saved comparisons distinguish the updated profile revision.
+
 ## [0.2.0] - 2026-10-03
 
 ### Added

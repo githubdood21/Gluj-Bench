@@ -1,4 +1,4 @@
-import { Button, ComboBox, ProgressIndicator, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ProgressIndicator, ScrollView } from "std-widgets.slint";
 
 export struct DeviceFact { label: string, value: string, }
 export struct DeviceRow {
@@ -11,13 +11,18 @@ export struct BenchmarkRow {
     unit: string, enabled: bool, selected: bool, hardware-ready: bool,
 }
 export struct ChartLabel { x: float, y: float, width: float, text: string, font-size: float, accent: color, alignment: int, }
+export struct TuningFact { label: string, value: string, detail: string, accent: color, }
+export struct TuningBar { label: string, value: string, ratio: float, minimum: float, maximum: float, range-visible: bool, accent: color, }
 export struct ResultRow {
+    measurement-facts: [TuningFact], measurement-bars: [TuningBar], context-facts: [DeviceFact],
     title: string, device: string, elapsed: string, primary-name: string,
     primary-value: string, sample-count: string,
     fact-one-label: string, fact-one-value: string, fact-two-label: string, fact-two-value: string,
     fact-three-label: string, fact-three-value: string, fact-four-label: string, fact-four-value: string,
     summary: string, diagnosis: string, details: string, description: string, description-tldr: string, everyday-use: string, metric-guide: string, tuning-guidance: string, tuning-tldr: string, tuning-stats: string, memory-pressure: string, tuning-title: string,
     profile-chart: image, profile-labels: [ChartLabel], profile-sizes: [string], profile-statistics: [string],
+    gpu-timing-chart: image, gpu-timing-labels: [ChartLabel], gpu-timing-available: bool, gpu-timing-visible: bool, gpu-timing-note: string,
+    tuning-facts-top: [TuningFact], tuning-facts-bottom: [TuningFact], tuning-bars: [TuningBar], tuning-allocation: [TuningBar], tuning-actions: [TuningFact], tuning-quality: string,
 }
 
 export struct SummaryRow { title: string, metric: string, latest: string, best: string, runs: string, section: int, bandwidth: bool, read-latest: string, write-latest: string, copy-latest: string, read-best: string, write-best: string, copy-best: string, delta: string, read-delta: string, write-delta: string, copy-delta: string, }
@@ -35,6 +40,33 @@ export component MainWindow inherits Window {
     background: #0b0f16;
 
     in-out property <int> page: 0;
+    in property <string> default-dataset-mode;
+    in property <string> default-dataset-text;
+    in property <bool> default-dataset-custom;
+    in property <string> default-dataset-error;
+    in property <string> default-offload-name;
+    callback select-default-configuration(string, int);
+    callback edit-default-dataset(string);
+    in property <bool> test-override-enabled;
+    in property <bool> test-is-cpu;
+    in property <bool> test-is-gpu;
+    in property <bool> test-is-scaling;
+    in property <bool> test-is-offload;
+    in property <bool> test-has-ram;
+    in property <bool> test-dataset-custom;
+    in property <bool> test-configuration-valid;
+    in property <string> test-configuration-summary;
+    in property <string> test-cpu-name;
+    in property <string> test-gpu-name;
+    in property <string> test-core-name;
+    in property <string> test-ram-name;
+    in property <string> test-vram-name;
+    in property <string> test-offload-name;
+    in property <string> test-dataset-mode;
+    in property <string> test-dataset-text;
+    callback toggle-test-override(bool);
+    callback select-test-configuration(string, int);
+    callback edit-test-dataset(string);
     in-out property <string> vram-budget-name;
     callback select-vram-budget(int);
     in-out property <string> ram-budget-name;
@@ -62,6 +94,7 @@ export component MainWindow inherits Window {
     in-out property <string> selected-benchmark-details;
     in-out property <bool> lab-details-expanded: false;
     in-out property <bool> tuning-details-expanded: false;
+    private property <bool> tuning-notes-expanded: false;
     in-out property <string> selected-benchmark-availability: "";
     in-out property <bool> selected-benchmark-enabled: false;
     in-out property <[DeviceRow]> devices: [];
@@ -233,7 +266,10 @@ export component MainWindow inherits Window {
                             }
                         } }
                     } }
-                    Surface { horizontal-stretch: 2; min-width: 260px; VerticalLayout { padding: 18px; spacing: 14px;
+                    Surface { horizontal-stretch: 2; min-width: 300px; VerticalLayout { padding: 18px; spacing: 14px;
+                        configuration-scroll := ScrollView { viewport-width: self.width; vertical-stretch: 1;
+                            viewport-height: max(self.visible-height, configuration-content.preferred-height);
+                            configuration-content := VerticalLayout { width: configuration-scroll.visible-width - 16px; height: self.preferred-height; spacing: 12px; alignment: start;
                         Label { text: "BENCHMARK DETAILS"; } Text { text: root.selected-benchmark-name; color: #f4f7fb; font-size: 21px; font-weight: 700; wrap: word-wrap; }
                         Text { text: root.selected-benchmark-description; color: #9fabbd; font-size: 12px; wrap: word-wrap; }
                         Button { text: root.lab-details-expanded ? "▾ About this test" : "▸ About this test"; clicked => { root.lab-details-expanded = !root.lab-details-expanded; } }
@@ -243,13 +279,52 @@ export component MainWindow inherits Window {
                         }
                         Text { text: root.selected-benchmark-availability; color: root.selected-benchmark-enabled ? #65d9ba : #f3ba67; font-size: 11px; wrap: word-wrap; }
                         Rectangle { height: 1px; background: #293448; } Label { text: "TARGET HARDWARE"; }
-                        if root.show-gpu-selector && root.gpu-adapters.length > 0: ComboBox { model: root.gpu-adapters; current-value: root.selected-gpu-name; selected(value) => { root.select-gpu(self.current-index); } }
+                        if root.show-gpu-selector && root.gpu-adapters.length > 0: ComboBox { enabled: !root.running; model: root.gpu-adapters; current-value: root.selected-gpu-name; selected(value) => { root.select-gpu(self.current-index); } }
                         if !root.show-gpu-selector: Text { text: root.target-hardware-name; color: #f4f7fb; font-size: 14px; font-weight: 600; wrap: word-wrap; }
                         Text { text: root.target-hardware-description; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
-                        Text { text: root.load-description; color: #a5bce0; font-size: 11px; wrap: word-wrap; }
-                        Rectangle { vertical-stretch: 1; }
+                        Rectangle { height: 1px; background: #293448; }
+                        Label { text: "RUN CONFIGURATION"; }
+                        Text { text: root.test-configuration-summary; color: root.test-configuration-valid ? #a5bce0 : #f3ba67; font-size: 12px; wrap: word-wrap; }
+                        HorizontalLayout { spacing: 8px; vertical-stretch: 0; CheckBox { text: ""; width: 22px; height: 22px; checked: root.test-override-enabled; enabled: !root.running && root.selected-benchmark-enabled; toggled => { root.toggle-test-override(self.checked); } } Text { text: "Override global settings for this test"; color: #dbe7f5; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; } }
+                        if root.test-override-enabled: VerticalLayout { spacing: 8px; vertical-stretch: 0; height: self.preferred-height;
+                            Text { text: "Applies only to this test in this session. Turn off to use the current global defaults."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                            if root.test-is-offload: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "INPUT / OUTPUT DATA IN SYSTEM RAM"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["50% system RAM", "75% system RAM", "100% system RAM"]; current-value: root.test-offload-name; enabled: !root.running; selected(value) => { root.select-test-configuration("offload", self.current-index); } }
+                            }
+                            if root.test-is-scaling: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "DATASET MODE"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Automatic (allocation budget)", "Sweep up to chosen size", "Test one chosen size"]; current-value: root.test-dataset-mode; enabled: !root.running; selected(value) => { root.select-test-configuration("dataset", self.current-index); } }
+                                Label { text: "DATASET SIZE · MiB"; }
+                                LineEdit { height: 36px; vertical-stretch: 0; text: root.test-dataset-text; enabled: !root.running && root.test-dataset-custom; edited => { root.edit-test-dataset(self.text); } }
+                                Text { text: "MiB uses binary units; 1024 MiB = 1 GiB. Actual sizes follow buffer alignment or matrix shape. A size above the allocation budget needs a smaller dataset or larger budget."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                            }
+                            if root.test-is-cpu: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "CPU WORKER ALLOCATION"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.test-cpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cpu", self.current-index); } }
+                                Label { text: "CPU PHYSICAL CORES"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: root.cpu-core-options; current-value: root.test-core-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cores", self.current-index); } }
+                                Text { text: "An exact count overrides the worker percentage; single-thread tests still use one worker."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                            }
+                            if root.test-is-gpu: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "GPU ACTIVITY"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.test-gpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("gpu", self.current-index); } }
+                            }
+                            if root.test-has-ram: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "RAM ALLOCATION BUDGET"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["20% of RAM", "25% of RAM", "30% of RAM", "40% of RAM", "50% of RAM", "60% of RAM", "70% of RAM", "80% of RAM"]; current-value: root.test-ram-name; enabled: !root.running; selected(value) => { root.select-test-configuration("ram", self.current-index); } }
+                            }
+                            if root.test-is-gpu && root.test-is-scaling: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "VRAM ALLOCATION BUDGET"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["20% of VRAM", "25% of VRAM", "30% of VRAM", "40% of VRAM", "50% of VRAM", "60% of VRAM", "70% of VRAM", "80% of VRAM"]; current-value: root.test-vram-name; enabled: !root.running; selected(value) => { root.select-test-configuration("vram", self.current-index); } }
+                            }
+
+
+                        }
+                        } }
+
                         if root.running: VerticalLayout { spacing: 10px; Label { text: "BENCHMARK IN PROGRESS"; color: #60e4c1; } Text { text: root.progress-message; color: #f4f7fb; font-size: 13px; wrap: word-wrap; } ProgressIndicator { progress: root.progress; } Text { text: root.queued-count > 0 ? "Queue: " + root.queued-count + " benchmark(s) remaining" : "Final benchmark in progress"; color: #9facbd; font-size: 11px; } Button { text: "Cancel benchmark"; clicked => { root.cancel(); } } }
-                        if !root.running: VerticalLayout { spacing: 10px; Text { text: "5 repeated samples · selected intensity controls apply"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run benchmark"; primary: true; enabled: root.selected-benchmark-enabled; clicked => { root.run-selected(); } } Button { text: "Run all in this category"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
+                        if !root.running: VerticalLayout { spacing: 10px; Text { text: "5 repeated samples · configuration above applies to this test"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run benchmark"; primary: true; enabled: root.selected-benchmark-enabled && root.test-configuration-valid; clicked => { root.run-selected(); } } Button { text: "Run all in this category"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
                     } }
                 }
                 if root.page == 3: settings-scroll := ScrollView {
@@ -259,7 +334,21 @@ export component MainWindow inherits Window {
                     height: self.preferred-height; padding-bottom: 24px;
                     width: settings-scroll.visible-width - 16px; spacing: 16px; alignment: start;
                     SectionTitle { text: "Settings"; }
-                    Text { text: "Choose how much work the tests ask your system to do."; color: #8f9caf; font-size: 13px; wrap: word-wrap; }
+                    Text { text: "Global defaults apply to every test. On Benchmarks, enable an override to customize one selected test."; color: #8f9caf; font-size: 13px; wrap: word-wrap; }
+                    Surface { height: max(260px, scaling-defaults.preferred-height + 36px); vertical-stretch: 0;
+                        scaling-defaults := VerticalLayout { padding: 18px; spacing: 10px;
+                            Text { text: "Scaling test defaults"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
+                            Label { text: "DATASET MODE · CPU AND GPU SCALING"; }
+                            ComboBox { model: ["Automatic (allocation budget)", "Sweep up to chosen size", "Test one chosen size"]; current-value: root.default-dataset-mode; enabled: !root.running; selected(value) => { root.select-default-configuration("dataset", self.current-index); } }
+                            Label { text: "DATASET SIZE · MiB"; }
+                            LineEdit { text: root.default-dataset-text; enabled: !root.running && root.default-dataset-custom; edited => { root.edit-default-dataset(self.text); } }
+                            if root.default-dataset-error != "": Text { text: root.default-dataset-error; color: #f3ba67; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "Automatic sweeps toward the allocation budget. Sweep tests growing datasets up to your chosen size. Test one chosen size measures a single dataset. 1024 MiB = 1 GiB. Actual sizes follow buffer alignment or matrix shape; oversized requests report the available limit. Fixed-size tests keep their workload-defined datasets."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                            Label { text: "GPU RAM OFFLOAD · SHARE OF INPUT / OUTPUT DATA"; }
+                            ComboBox { model: ["50% system RAM", "75% system RAM", "100% system RAM"]; current-value: root.default-offload-name; enabled: !root.running; selected(value) => { root.select-default-configuration("offload", self.current-index); } }
+                            Text { text: "Applies to FP32 system-RAM offload scaling. The remainder uses VRAM; at 100%, all test arrays use system RAM. Allocation budgets below limit how much data can be tested."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
                     Surface { height: max(190px, settings-panel-1.preferred-height + 36px); vertical-stretch: 0; settings-panel-1 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "CPU worker allocation"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
                         ComboBox { model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.cpu-intensity-name; enabled: !root.running; selected(value) => { root.select-cpu-intensity(self.current-index); } }
@@ -271,9 +360,9 @@ export component MainWindow inherits Window {
                         Text { text: "Choose an exact number of physical cores for multithreaded CPU tests, with one worker per core. This overrides the percentage preset above. Automatic applies that preset to physical cores. Single-thread tests still use one worker. Fewer cores may ease contention and reduce heat or power use; retest to check throughput."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(190px, settings-panel-3.preferred-height + 36px); vertical-stretch: 0; settings-panel-3 := VerticalLayout { padding: 18px; spacing: 10px;
-                        Text { text: "CPU scaling RAM budget"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
+                        Text { text: "Scaling test RAM budget"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
                         ComboBox { model: ["20% of RAM", "25% of RAM", "30% of RAM", "40% of RAM", "50% of RAM", "60% of RAM", "70% of RAM", "80% of RAM"]; current-value: root.ram-budget-name; enabled: !root.running; selected(value) => { root.select-ram-budget(self.current-index); } }
-                        Text { text: "Maximum combined buffers for CPU vector and matrix scaling, as a share of installed RAM. The test also caps allocation at 80% of currently available RAM and leaves at least 2 GiB available. Actual matrix sizes may be smaller. Larger budgets take longer and can reduce responsiveness. Cache and ordinary RAM bandwidth tests keep their own dataset sizes."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "Caps CPU vector/matrix buffers and the system-RAM region of GPU offload profiles, as a share of installed RAM. The test also caps allocation at 80% of currently available RAM and leaves at least 2 GiB available. Actual matrix sizes may be smaller. Larger budgets take longer and can reduce responsiveness. Cache and ordinary RAM bandwidth tests keep their own dataset sizes."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(190px, settings-panel-4.preferred-height + 36px); vertical-stretch: 0; settings-panel-4 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "GPU activity pacing"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
@@ -283,7 +372,7 @@ export component MainWindow inherits Window {
                     Surface { height: max(190px, settings-panel-5.preferred-height + 36px); vertical-stretch: 0; settings-panel-5 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "Scaling test VRAM budget"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
                         ComboBox { model: ["20% of VRAM", "25% of VRAM", "30% of VRAM", "40% of VRAM", "50% of VRAM", "60% of VRAM", "70% of VRAM", "80% of VRAM"]; current-value: root.vram-budget-name; enabled: !root.running; selected(value) => { root.select-vram-budget(self.current-index); } }
-                        Text { text: "Caps total test-buffer allocation for FP32 and FP16 matrix scaling profiles, with space reserved for outputs and allocation overhead. Both profiles sweep up to the selected budget. Larger budgets explore bigger data sets but leave less room for apps. Driver limits can lower the actual size; integrated matrix tests use an additional shared-memory cap."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "Caps device-local test-buffer allocation for GPU FP32 and FP16 matrix scaling, including the VRAM region of RAM-offload profiles, with space reserved for outputs and allocation overhead. Both profiles sweep up to the selected budget. Larger budgets explore bigger data sets but leave less room for apps. Driver limits can lower the actual size; integrated matrix tests use an additional shared-memory cap."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(160px, settings-note.preferred-height + 32px); vertical-stretch: 0; background: #292318; border-color: #635239; settings-note := VerticalLayout { padding: 16px; spacing: 8px;
                         Label { text: "HOW THIS AFFECTS YOUR RESULTS"; color: #f3ba67; }
@@ -350,7 +439,7 @@ export component MainWindow inherits Window {
                                         if !row.bandwidth: Text { text: row.delta; color: #a5bce0; font-size: 11px; width: 64px; horizontal-alignment: right; vertical-alignment: center; }
                                         Text { text: row.runs; color: #8f9caf; font-size: 11px; width: 38px; horizontal-alignment: right; vertical-alignment: center; }
                                     }
-                                    row-touch := TouchArea { mouse-cursor: pointer; clicked => { root.tuning-details-expanded = false; root.profile-selection = -1; root.profile-raw-expanded = false; root.select-result-row(index); } }
+                                    row-touch := TouchArea { mouse-cursor: pointer; clicked => { root.tuning-details-expanded = false; root.tuning-notes-expanded = false; root.profile-selection = -1; root.profile-raw-expanded = false; root.select-result-row(index); } }
                                 }
                             }
                         }
@@ -370,24 +459,56 @@ export component MainWindow inherits Window {
                                     Text { text: root.comparison-note; color: #a5bce0; font-size: 11px; wrap: word-wrap; }
                                     Text { text: root.selected-result.summary; color: #73dcca; font-size: 13px; font-weight: 600; wrap: word-wrap; }
                                     Button { text: root.result-details-expanded ? "▾ Benchmark details & measurements" : "▸ Benchmark details & measurements"; clicked => { root.toggle-result-details(); } }
+                                    if root.result-details-expanded: measurement-row := HorizontalLayout { spacing: 10px; vertical-stretch: 0;
+                                        for fact in root.selected-result.measurement-facts: Rectangle { width: (measurement-row.width - 20px) / 3; height: max(110px, measurement-card.preferred-height + 24px); vertical-stretch: 0; background: #10242b; border-radius: 9px;
+                                            measurement-card := VerticalLayout { padding: 12px; spacing: 7px; alignment: start;
+                                                Text { text: fact.label; color: #91b8c3; font-size: 11px; font-weight: 600; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.value; color: fact.accent; font-size: 19px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.detail; color: #a5bec6; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
+                                            }
+                                        }
+                                    }
+                                    if root.result-details-expanded && root.selected-result.measurement-bars.length > 0: Label { text: "MEASURED SAMPLE SPREAD"; color: #73dcca; }
+                                    if root.result-details-expanded: VerticalLayout { spacing: 8px; height: self.preferred-height; vertical-stretch: 0;
+                                        for bar in root.selected-result.measurement-bars: VerticalLayout { spacing: 4px; height: self.preferred-height; vertical-stretch: 0;
+                                            HorizontalLayout { Text { text: bar.label; color: #bdcdd2; font-size: 12px; } Text { text: bar.value; color: #78a9ff; font-size: 13px; horizontal-alignment: right; } }
+                                            Rectangle { height: 12px; background: #0a1b23; border-radius: 4px; vertical-stretch: 0;
+                                                Rectangle { x: 0px; y: 0px; width: parent.width * bar.ratio; height: parent.height; background: bar.accent; border-radius: 4px; }
+                                            }
+                                        }
+                                    }
+                                    if root.result-details-expanded && root.selected-result.measurement-bars.length > 0: Text { text: "Minimum, median and maximum across repeated samples, on one scale. These describe throughput variation within this run."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
+                                    if root.result-details-expanded: context-row := HorizontalLayout { spacing: 8px; vertical-stretch: 0;
+                                        for fact in root.selected-result.context-facts: Rectangle { width: (context-row.width - 24px) / 4; height: max(80px, context-card.preferred-height + 20px); vertical-stretch: 0; background: #1b3040; border-radius: 8px;
+                                            context-card := VerticalLayout { padding: 10px; spacing: 6px; alignment: start;
+                                                Text { text: fact.label; color: #91b8c3; font-size: 10px; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.value; color: #dbe3ee; font-size: 13px; font-weight: 600; wrap: word-wrap; vertical-stretch: 0; }
+                                            }
+                                        }
+                                    }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Label { text: "PERFORMANCE AS DATA GROWS"; color: #73dcca; }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: chart-frame := Rectangle { height: self.width * 420 / 900; vertical-stretch: 0;
                                         Image { width: parent.width; height: parent.height; source: root.selected-result.profile-chart; image-fit: contain; }
                                         for label in root.selected-result.profile-labels: Text { x: chart-frame.width * label.x / 900; y: chart-frame.height * label.y / 420; width: chart-frame.width * label.width / 900; height: chart-frame.height * 22 / 420; text: label.text; color: label.accent; font-size: chart-frame.width * label.font-size / 900; horizontal-alignment: label.alignment == 0 ? left : label.alignment == 1 ? center : right; }
                                     }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: "Points show median throughput; shading shows sample minimum–maximum. Dashed line: this run’s compute reference. Dataset sizes use a logarithmic scale."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
-                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: ComboBox { model: root.selected-result.profile-sizes; current-value: root.selected-result.profile-sizes[root.profile-index]; selected(value) => { root.profile-selection = self.current-index; } }
+                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: ComboBox { model: root.selected-result.profile-sizes; current-index: root.profile-index; selected(value) => { root.profile-selection = self.current-index; } }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: root.selected-result.profile-statistics[root.profile-index]; color: #c2cede; font-size: 11px; wrap: word-wrap; }
+                                    if root.result-details-expanded && root.selected-result.gpu-timing-visible: Label { text: "MEASURED GPU TIMINGS · LOWER IS FASTER"; color: #edc778; }
+                                    if root.result-details-expanded && root.selected-result.gpu-timing-available: timing-frame := Rectangle { height: self.width * 280 / 900; vertical-stretch: 0;
+                                        Image { width: parent.width; height: parent.height; source: root.selected-result.gpu-timing-chart; image-fit: contain; }
+                                        for label in root.selected-result.gpu-timing-labels: Text { x: timing-frame.width * label.x / 900; y: timing-frame.height * label.y / 280; width: timing-frame.width * label.width / 900; height: timing-frame.height * 22 / 280; text: label.text; color: label.accent; font-size: max(11px, timing-frame.width * label.font-size / 900); horizontal-alignment: label.alignment == 0 ? left : label.alignment == 1 ? center : right; }
+                                    }
+                                    if root.result-details-expanded && root.selected-result.gpu-timing-visible: Text { text: root.selected-result.gpu-timing-note; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded: Label { text: "WHAT THIS TEST MEASURES"; }
                                     if root.result-details-expanded: Text { text: root.selected-result.description; color: #c2cede; font-size: 12px; wrap: word-wrap; }
                                     if root.result-details-expanded: Label { text: "WHERE IT CAN HELP"; }
                                     if root.result-details-expanded: Text { text: root.selected-result.everyday-use; color: #c2cede; font-size: 12px; wrap: word-wrap; }
                                     if root.result-details-expanded: Label { text: "HOW TO READ THE METRICS"; }
                                     if root.result-details-expanded: Text { text: root.selected-result.metric-guide; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
-                                    if root.result-details-expanded: Text { text: root.selected-result.fact-one-label + ": " + root.selected-result.fact-one-value; color: #9db1c8; font-size: 10px; wrap: word-wrap; }
-                                    if root.result-details-expanded: Text { text: root.selected-result.diagnosis; color: #b9c7d8; font-size: 10px; wrap: word-wrap; }
-                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Button { text: root.profile-raw-expanded ? "▾ Raw measurements" : "▸ Raw measurements"; clicked => { root.profile-raw-expanded = !root.profile-raw-expanded; } }
-                                    if root.result-details-expanded && (root.selected-result.profile-sizes.length == 0 || root.profile-raw-expanded): Text { text: root.selected-result.details; color: #8f9caf; font-size: 10px; wrap: word-wrap; }
+                                    if root.result-details-expanded: Text { text: root.selected-result.diagnosis; color: #b9c7d8; font-size: 12px; wrap: word-wrap; }
+                                    if root.result-details-expanded: Button { text: root.profile-raw-expanded ? "▾ Raw measurements & metadata" : "▸ Raw measurements & metadata"; clicked => { root.profile-raw-expanded = !root.profile-raw-expanded; } }
+                                    if root.result-details-expanded && root.profile-raw-expanded: Text { text: root.selected-result.details; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                                 }
                         }
                     }
@@ -399,11 +520,63 @@ export component MainWindow inherits Window {
                             Text { text: root.selected-result.tuning-title; color: #83efda; font-size: 14px; font-weight: 700; }
                                 tuning-content := VerticalLayout { height: self.preferred-height; vertical-stretch: 0; padding-bottom: 12px; spacing: 8px; alignment: start;
                                     Text { text: root.selected-result.tuning-tldr; color: #dbe8ee; font-size: 12px; font-weight: 600; wrap: word-wrap; }
-                                    if root.selected-result.memory-pressure != "": Text { text: root.selected-result.memory-pressure; color: #a5d9d1; font-size: 11px; wrap: word-wrap; }
-                                    Button { text: root.tuning-details-expanded ? "▾ Measurements & reasoning" : "▸ Measurements & reasoning"; clicked => { root.tuning-details-expanded = !root.tuning-details-expanded; } }
-                                    if root.tuning-details-expanded: Text { text: root.selected-result.tuning-stats; color: #a5d9d1; font-size: 11px; wrap: word-wrap; }
-                                    if root.tuning-details-expanded: Text { text: root.selected-result.tuning-guidance; color: #dbe8ee; font-size: 12px; wrap: word-wrap; }
-                                    if root.tuning-details-expanded && root.selected-result.tuning-title == "TUNING SUGGESTIONS": Text { text: "These metrics include your existing clock limits. Trial suggestions are relative to your current setup."; color: #9db9bd; font-size: 11px; wrap: word-wrap; }
+                                    if !root.tuning-details-expanded && root.selected-result.memory-pressure != "": Text { text: root.selected-result.memory-pressure; color: #a5d9d1; font-size: 11px; wrap: word-wrap; }
+                                    Button { text: root.tuning-details-expanded ? "▾ Hide visual breakdown" : "▸ Show visual breakdown"; clicked => { root.tuning-details-expanded = !root.tuning-details-expanded; root.tuning-notes-expanded = false; } }
+                                    if root.tuning-details-expanded: VerticalLayout { spacing: 12px; height: self.preferred-height; vertical-stretch: 0; alignment: start;
+                                    tuning-top-row := HorizontalLayout { spacing: 10px; vertical-stretch: 0;
+                                        for fact in root.selected-result.tuning-facts-top: Rectangle { width: (tuning-top-row.width - 20px) / 3; horizontal-stretch: 0; vertical-stretch: 0; height: max(118px, tuning-top-content.preferred-height + 24px); background: #10242b; border-radius: 9px;
+                                            tuning-top-content := VerticalLayout { padding: 12px; spacing: 7px; alignment: start;
+                                                Text { text: fact.label; color: #91b8c3; font-size: 11px; font-weight: 600; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.value; color: fact.accent; font-size: 20px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.detail; color: #a5bec6; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
+                                            }
+                                        }
+                                    }
+                                    tuning-bottom-row := HorizontalLayout { spacing: 10px; vertical-stretch: 0;
+                                        for fact in root.selected-result.tuning-facts-bottom: Rectangle { width: (tuning-bottom-row.width - 20px) / 3; horizontal-stretch: 0; vertical-stretch: 0; height: max(118px, tuning-bottom-content.preferred-height + 24px); background: #10242b; border-radius: 9px;
+                                            tuning-bottom-content := VerticalLayout { padding: 12px; spacing: 7px; alignment: start;
+                                                Text { text: fact.label; color: #91b8c3; font-size: 11px; font-weight: 600; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.value; color: fact.accent; font-size: 20px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: fact.detail; color: #a5bec6; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
+                                            }
+                                        }
+                                    }
+                                    if root.selected-result.tuning-quality != "": Rectangle { height: max(54px, quality-text.preferred-height + 24px); vertical-stretch: 0; background: #303026; border-radius: 8px;
+                                        quality-text := Text { x: 12px; y: 12px; width: parent.width - 24px; height: self.preferred-height; text: root.selected-result.tuning-quality; color: #edc778; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                    if root.selected-result.tuning-bars.length > 0: Label { text: "THROUGHPUT COMPARISON"; color: #83efda; }
+                                    for bar in root.selected-result.tuning-bars: VerticalLayout { spacing: 5px; height: self.preferred-height; vertical-stretch: 0;
+                                        HorizontalLayout { vertical-stretch: 0; Text { text: bar.label; color: #bdcdd2; font-size: 12px; wrap: word-wrap; } Text { text: bar.value; color: bar.accent; font-size: 13px; font-weight: 700; horizontal-alignment: right; } }
+                                        rate-track := Rectangle { height: 16px; vertical-stretch: 0; background: #0a1b23; border-radius: 5px; clip: true;
+                                            Rectangle { x: 0px; y: 0px; width: parent.width * bar.ratio; height: parent.height; background: bar.accent; border-radius: 5px; }
+                                            if bar.range-visible: Rectangle { x: parent.width * bar.minimum; y: 7px; width: max(2px, parent.width * (bar.maximum - bar.minimum)); height: 2px; background: #e6f4f2; }
+                                        }
+                                    }
+                                    if root.selected-result.tuning-bars.length > 0: Text { text: "Each bar shows measured throughput on the same scale; thin markers show sample minimum–maximum. This is a performance comparison."; color: #91aeb8; font-size: 11px; wrap: word-wrap; }
+                                    if root.selected-result.tuning-allocation.length > 0: Label { text: "TEST BUFFER ALLOCATION"; color: #83efda; }
+                                    for bar in root.selected-result.tuning-allocation: VerticalLayout { spacing: 5px; height: self.preferred-height; vertical-stretch: 0;
+                                        Text { text: bar.label; color: #bdcdd2; font-size: 12px; }
+                                        Text { text: bar.value; color: bar.accent; font-size: 13px; wrap: word-wrap; }
+                                        Rectangle { height: 14px; vertical-stretch: 0; background: #0a1b23; border-radius: 5px; clip: true;
+                                            Rectangle { x: 0px; y: 0px; width: parent.width * bar.ratio; height: parent.height; background: bar.accent; border-radius: 5px; }
+                                        }
+                                    }
+                                    if root.selected-result.tuning-actions.length > 0: Label { text: "RETEST CHECKLIST"; color: #83efda; }
+                                    tuning-action-row := HorizontalLayout { spacing: 10px; vertical-stretch: 0;
+                                        for action in root.selected-result.tuning-actions: Rectangle { width: (tuning-action-row.width - 20px) / 3; horizontal-stretch: 0; vertical-stretch: 0; height: max(154px, action-content.preferred-height + 24px); background: #10242b; border-radius: 9px;
+                                            action-content := VerticalLayout { padding: 12px; spacing: 8px; alignment: start;
+                                                Text { text: action.label; color: action.accent; font-size: 11px; font-weight: 700; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: action.value; color: #dbe8ee; font-size: 13px; wrap: word-wrap; vertical-stretch: 0; }
+                                                Text { text: action.detail; color: #91aeb8; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
+                                            }
+                                        }
+                                    }
+                                    Button { text: root.tuning-notes-expanded ? "▾ Hide technical notes" : "▸ Technical notes and full reasoning"; clicked => { root.tuning-notes-expanded = !root.tuning-notes-expanded; } }
+                                    if root.tuning-notes-expanded: Text { text: root.selected-result.tuning-stats; color: #a5d9d1; font-size: 11px; wrap: word-wrap; }
+                                    if root.tuning-notes-expanded: Text { text: root.selected-result.tuning-guidance; color: #dbe8ee; font-size: 12px; wrap: word-wrap; }
+                                    if root.tuning-notes-expanded: Text { text: "Trial suggestions are relative to your current setup. Power and temperatures after a change are not measured."; color: #9db9bd; font-size: 11px; wrap: word-wrap; }
+                                    }
+
                                 }
                         }
                     }

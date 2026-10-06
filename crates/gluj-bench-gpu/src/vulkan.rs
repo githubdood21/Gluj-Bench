@@ -23,6 +23,7 @@ pub(super) struct VulkanAdapterInfo {
     pub shader_float64: bool,
     pub max_storage_buffer_range: u64,
     pub device_local_memory_bytes: u64,
+    pub host_memory_heap_bytes: u64,
     pub extensions: BTreeSet<String>,
     pub cooperative: CooperativeSupport,
 }
@@ -142,6 +143,15 @@ fn discover_with_instance(
             .map(|heap| heap.size)
             .sum();
 
+        let host_memory_heap_bytes =
+            crate::vulkan_compute_profile::host_memory_type(&memory_properties, u32::MAX)
+                .map(|index| {
+                    memory_properties.memory_heaps
+                        [memory_properties.memory_types[index as usize].heap_index as usize]
+                        .size
+                })
+                .unwrap_or(0);
+
         // SAFETY: physical_device belongs to instance.
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
@@ -197,6 +207,7 @@ fn discover_with_instance(
             shader_float64,
             max_storage_buffer_range: properties.limits.max_storage_buffer_range as u64,
             device_local_memory_bytes,
+            host_memory_heap_bytes,
             extensions,
             cooperative,
         });

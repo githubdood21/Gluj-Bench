@@ -76,6 +76,7 @@ Descriptions and tuning guidance start with a short takeaway. Expand their dropd
 | GPU bandwidth | Estimated effective cache bandwidth, GPU-accessible memory read/write/copy bandwidth, and host-device transfers |
 | GPU performance | Register-resident FP16, FP32 and FP64 vector throughput; supported dense FP16 and INT8 matrix calculations |
 | GPU scaling | Memory-backed FP32 vector and dense FP16 matrix profiles across increasing working sets |
+| GPU RAM offload | FP32 vector scaling with 50%, 75%, or 100% of input/output data in system RAM |
 
 FP8 and sparse matrix families are also represented in capability discovery. Their rows remain disabled when a compatible, verified runner is unavailable; dense matrix support alone does not imply sparse acceleration.
 
@@ -96,7 +97,7 @@ Settings save beside the executable and apply to the next run. Controls are lock
 | --- | --- | --- |
 | CPU worker allocation | Gentle 50%, Balanced 75% (default), Full 100% | In Automatic mode, selects that share of physical CPU cores, with at least one worker |
 | CPU physical cores | Automatic (default), or an exact count | Uses one pinned worker per selected physical core, excluding SMT siblings; an exact count overrides the percentage preset |
-| CPU scaling RAM budget | 20-80% of installed RAM; default 20% | Limits combined buffers for CPU vector and matrix scaling |
+| Scaling test RAM budget | 20-80% of installed RAM; default 20% | Limits CPU scaling buffers and the system-RAM region of GPU offload profiles |
 | GPU activity pacing | Gentle 50%, Balanced 75% (default), Full 100% | Adds cancellable idle intervals between GPU submissions; reduced modes also target shorter batches |
 | GPU scaling VRAM budget | 20-80% of reported GPU memory; default 25% | Limits test-buffer allocation for GPU scaling profiles |
 
@@ -131,6 +132,43 @@ Matrix GB/s counts effective accesses within the kernel, including data served r
 The FP32 vector profile streams progressively larger memory-backed arrays. The dense FP16 matrix profile streams cooperative-matrix operands with reuse. Both work toward the selected VRAM budget and report the actual aligned size reached, subject to device limits.
 
 Their effective traffic can include cache-served data. A throughput drop as the working set grows suggests memory pressure for that workload; it does not directly measure GPU stall time or the exact percentage of memory congestion.
+
+### Measured GPU execution and end-to-end timings
+
+Expanded GPU compute scaling results show **Measured time per dataset pass — lower is faster** for FP32 VRAM scaling, FP32 system-RAM offload, and FP16 matrix scaling. The graph works for growing datasets and a single chosen size. Its two lines are:
+
+- **GPU execution:** a measured Vulkan timestamp interval, including GPU computation and memory stalls.
+- **End-to-end (includes pacing):** the measured host-clock duration of the full sample, including command recording, submission, waiting for completion, result retrieval and deliberate activity pauses.
+
+Timings use readable ns, µs, ms or seconds. Points show sample medians; shading shows sample minimum–maximum. Lower time is faster for the same dataset and settings; larger datasets contain more work, so use the throughput graph to compare processing rates. Each measured sample executes a calibrated batch of full dataset passes, and both timings are divided by the number of passes. The dataset selector shows the actual timings, sample statistics and recorded batch size. Batch lengths can change across datasets, so submission costs may be amortized differently. Setup, warmup and compute-reference measurements are excluded.
+
+**Throughput retained vs compute reference** remains a performance comparison in the selected-dataset statistics. It is not interpreted as GPU utilization or waiting time. The busy/wait percentage model has been retired. Neither of the new timing lines isolates time waiting for data. [Vulkan timestamp documentation](https://docs.vulkan.org/samples/latest/samples/api/timestamp_queries/README.html) describes the execution interval measurement.
+
+Older saved results keep their throughput data and ask for a rerun to obtain measured timing data. Retired busy/wait estimates are hidden when loading those results. CPU graphs remain unchanged.
+
+### Global defaults and per-test overrides
+
+**Settings** stores global defaults. The selected benchmark shows its effective **Run configuration** before running. Enable **Override global settings for this test** to change its applicable CPU/GPU activity, physical cores, RAM/VRAM budgets, RAM offload share, and scaling dataset. Overrides are kept per test for this session; turn the override off to return to the current global defaults. A queued run captures its settings and target GPU when queued. **Run all in this category** uses each test's effective configuration.
+
+Scaling tests have three dataset modes:
+
+- **Automatic (allocation budget):** the existing growing-dataset sweep toward the allowed allocation.
+- **Sweep up to chosen size:** a growing-dataset sweep with your chosen maximum.
+- **Test one chosen size:** samples one dataset instead of a sweep.
+
+Enter the chosen size as a whole number of **MiB**; 1024 MiB is 1 GiB. Buffers align downward to the kernel's supported alignment or matrix shape, and results show the actual tested size. CPU datasets aggregate all workers; GPU FP16 matrix sizes count operand data. Explicit sizes above the RAM/VRAM or device limit return an explanatory error instead of silently selecting a smaller dataset. Fixed-size cache/bandwidth and register-only compute tests retain their workload-defined datasets.
+
+### GPU scaling with data offloaded to system RAM
+
+Under **GPU performance**, choose **FP32 system-RAM offload scaling**. Its RAM share is configurable at 50%, 75%, or 100% (default 75%). The GPU calculates directly on buffers backed by system RAM for the selected share; the remaining data uses VRAM. The percentage applies to both inputs and outputs at every aligned dataset size. At 100%, all test arrays reside in system RAM. Vulkan objects and the separate register-resident reference still have their own implementation overhead.
+
+This test requires a discrete GPU with timestamps and a separate host-visible memory heap. CPU-mappable VRAM exposed through BAR is excluded. Integrated GPUs with shared memory stay unsupported for this PCIe offload test.
+
+The **Scaling test RAM budget** limits the host region, with available-memory headroom and allocation overhead reserved. The VRAM budget limits any remaining device-local region. Storage-buffer limits can reduce the tested range. Compare the **same dataset size** and arithmetic settings across RAM offload percentages; different shares can reach different maximum allocations.
+
+Results show compute throughput and **nominal host traffic** versus dataset size. Expanded statistics show the RAM/VRAM split. Host traffic counts two input reads and one output write for the RAM region divided by GPU timestamp duration. GPU caches can serve repeated accesses, so this is effective kernel traffic, not a physical PCIe bus-counter measurement. It reflects the host-memory path, interconnect, GPU cache and shader together; CPU calculation and timed staging copies are excluded.
+
+Explicit placement models offloaded data without exhausting VRAM. It does not reproduce driver eviction, page migration, or an application's complete offload pipeline. The largest tier's first and last outputs in each region are checked against a scalar FP32 reference outside the timed samples. Tuning guidance suggests exploratory trials with a lower GPU core-frequency limit or smaller application batches/fewer concurrent GPU jobs. Keep the offload share fixed when checking a frequency change, and retest throughput. GPU activity pacing adds idle time excluded from TOPS; evaluate application completion time and responsiveness when reducing queued GPU work.
 
 ## Tuning guidance: change one thing, then retest
 

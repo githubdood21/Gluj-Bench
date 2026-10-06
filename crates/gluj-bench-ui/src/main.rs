@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -22,9 +22,15 @@ use std::{
 
 slint::include_modules!();
 
-const HARDWARE_METADATA_CACHE_VERSION: u32 = 13;
+const HARDWARE_METADATA_CACHE_VERSION: u32 = 15;
 const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
 const BENCHMARK_SAMPLES: u32 = 5;
+
+#[cfg(test)]
+mod configuration_tests;
+mod gpu_timings;
+mod result_visuals;
+mod tuning_visuals;
 
 fn main() -> Result<(), slint::PlatformError> {
     let window = MainWindow::new()?;
@@ -177,7 +183,9 @@ struct App {
     settings_writable: bool,
     result_component: usize,
     result_selection: usize,
-    queue: VecDeque<String>,
+    queue: VecDeque<QueuedRun>,
+    run_overrides: BTreeMap<String, TestOverride>,
+    dataset_text: String,
     active_request: Option<String>,
     progress: f32,
     progress_message: String,
@@ -205,6 +213,9 @@ struct AppSettings {
     vram_budget_percent: u32,
     ram_budget_percent: u32,
     cpu_core_limit: u32,
+    dataset_mode: usize,
+    dataset_mib: u64,
+    ram_offload_percent: u32,
 }
 impl Default for AppSettings {
     fn default() -> Self {
@@ -214,9 +225,149 @@ impl Default for AppSettings {
             vram_budget_percent: 25,
             ram_budget_percent: 20,
             cpu_core_limit: 0,
+            dataset_mode: 0,
+            dataset_mib: 256,
+            ram_offload_percent: 75,
         }
     }
 }
+#[derive(Clone)]
+struct TestOverride {
+    settings: AppSettings,
+    dataset_text: String,
+}
+
+#[derive(Clone)]
+struct QueuedRun {
+    benchmark_id: String,
+    settings: AppSettings,
+    gpu_id: Option<String>,
+    physical_cores: u32,
+}
+
+const DATASET_NAMES: [&str; 3] = [
+    "Automatic (allocation budget)",
+    "Sweep up to chosen size",
+    "Test one chosen size",
+];
+const DATASET_MODES: [&str; 3] = ["automatic", "sweep", "single"];
+const OFFLOAD_PERCENT: [u32; 3] = [50, 75, 100];
+
+fn validated_run_settings(
+    settings: &AppSettings,
+    text: &str,
+    id: &str,
+) -> Result<AppSettings, String> {
+    let mut settings = settings.clone();
+    if id.ends_with(".scaling") && settings.dataset_mode != 0 {
+        settings.dataset_mib = text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=1_048_576).contains(n))
+            .ok_or_else(|| {
+                "Dataset size must be a whole number from 1 to 1,048,576 MiB.".to_owned()
+            })?;
+    }
+    Ok(settings)
+}
+
+fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
+    let settings = &run.settings;
+    let id = &run.benchmark_id;
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "vram_budget_percent".into(),
+        settings.vram_budget_percent.to_string().into(),
+    );
+    options.insert(
+        "cpu_worker_percent".into(),
+        INTENSITY_PERCENT[settings.cpu_intensity].to_string().into(),
+    );
+    options.insert(
+        "gpu_activity_percent".into(),
+        INTENSITY_PERCENT[settings.gpu_intensity].to_string().into(),
+    );
+    if id.starts_with("cpu.") || id.starts_with("memory.") {
+        let cores = if settings.cpu_core_limit == 0 {
+            (run.physical_cores * INTENSITY_PERCENT[settings.cpu_intensity] / 100).max(1)
+        } else {
+            settings.cpu_core_limit.min(run.physical_cores).max(1)
+        };
+        options.insert("cpu_core_limit".into(), cores.to_string().into());
+        options.insert("thread_mode".into(), "physical_cores".into());
+        if settings.cpu_core_limit > 0 {
+            options.insert("cpu_worker_percent".into(), "100".into());
+        }
+    }
+    if cpu_scaling(id) || gpu_offload(id) {
+        options.insert(
+            "ram_budget_percent".into(),
+            settings.ram_budget_percent.to_string().into(),
+        );
+    }
+    if gpu_offload(id) {
+        options.insert(
+            "ram_offload_percent".into(),
+            settings.ram_offload_percent.to_string().into(),
+        );
+    }
+    if id.ends_with(".scaling") {
+        options.insert(
+            "dataset_mode".into(),
+            DATASET_MODES[settings.dataset_mode].into(),
+        );
+        if settings.dataset_mode != 0 {
+            options.insert(
+                "dataset_bytes".into(),
+                (settings.dataset_mib * 1024 * 1024).to_string().into(),
+            );
+        }
+    }
+    if id.starts_with("gpu.")
+        && let Some(device) = &run.gpu_id
+    {
+        options.insert("device_id".into(), device.clone().into());
+    }
+    options
+}
+
+fn configuration_summary(settings: &AppSettings, id: &str) -> String {
+    let mut parts = Vec::new();
+    if id.starts_with("gpu.") {
+        parts.push(format!(
+            "GPU activity {}%",
+            INTENSITY_PERCENT[settings.gpu_intensity]
+        ));
+        if id.ends_with(".scaling") {
+            parts.push(format!("VRAM budget {}%", settings.vram_budget_percent));
+        }
+    } else {
+        parts.push(if settings.cpu_core_limit == 0 {
+            format!(
+                "CPU workers {}% (automatic cores)",
+                INTENSITY_PERCENT[settings.cpu_intensity]
+            )
+        } else {
+            format!("{} physical cores", settings.cpu_core_limit)
+        });
+    }
+    if cpu_scaling(id) || gpu_offload(id) {
+        parts.push(format!("RAM budget {}%", settings.ram_budget_percent));
+    }
+    if gpu_offload(id) {
+        parts.push(format!("{}% RAM offload", settings.ram_offload_percent));
+    }
+    if id.ends_with(".scaling") {
+        parts.push(match settings.dataset_mode {
+            1 => format!("Sweep up to {} MiB", settings.dataset_mib),
+            2 => format!("One dataset: {} MiB", settings.dataset_mib),
+            _ => "Automatic dataset sweep".into(),
+        });
+    }
+    parts.join(" · ")
+}
+
 const INTENSITY_PERCENT: [u32; 3] = [50, 75, 100];
 const INTENSITY_NAMES: [&str; 3] = ["Gentle · 50%", "Balanced · 75%", "Full · 100%"];
 const VRAM_BUDGET_OPTIONS: [u32; 8] = [20, 25, 30, 40, 50, 60, 70, 80];
@@ -238,6 +389,9 @@ fn load_settings(path: &std::path::Path) -> Result<AppSettings, String> {
         || settings.gpu_intensity >= 3
         || !(20..=80).contains(&settings.vram_budget_percent)
         || !(20..=80).contains(&settings.ram_budget_percent)
+        || settings.dataset_mode > 2
+        || !(1..=1_048_576).contains(&settings.dataset_mib)
+        || !OFFLOAD_PERCENT.contains(&settings.ram_offload_percent)
     {
         return Err("invalid intensity setting".into());
     }
@@ -270,6 +424,8 @@ impl App {
             result_component: 0,
             result_selection: 0,
             queue: VecDeque::new(),
+            run_overrides: BTreeMap::new(),
+            dataset_text: "256".into(),
             active_request: None,
             progress: 0.,
             progress_message: String::new(),
@@ -297,6 +453,7 @@ impl App {
                 );
             }
         }
+        app.dataset_text = app.settings.dataset_mib.to_string();
         match load_results(&results_path()) {
             Ok(results) => {
                 app.results = results.clone();
@@ -313,6 +470,53 @@ impl App {
         app
     }
     fn wire(window: &MainWindow, app: &Rc<RefCell<Self>>) {
+        let weak = Rc::downgrade(app);
+        window.on_select_default_configuration(move |field, index| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut()
+                    .edit_configuration(false, field.as_str(), index);
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_edit_default_dataset(move |text| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut().edit_dataset(false, text.to_string());
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_toggle_test_override(move |enabled| {
+            if let Some(app) = weak.upgrade() {
+                let mut app = app.borrow_mut();
+                if app.active_request.is_some() {
+                    return;
+                }
+                if let Some(id) = app.selected.clone() {
+                    if enabled {
+                        let configuration = TestOverride {
+                            settings: app.settings.clone(),
+                            dataset_text: app.dataset_text.clone(),
+                        };
+                        app.run_overrides.entry(id).or_insert(configuration);
+                    } else {
+                        app.run_overrides.remove(&id);
+                    }
+                    app.ui_dirty = true;
+                }
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_select_test_configuration(move |field, index| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut()
+                    .edit_configuration(true, field.as_str(), index);
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_edit_test_dataset(move |text| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut().edit_dataset(true, text.to_string());
+            }
+        });
         let app_weak = Rc::downgrade(app);
         window.on_select_cpu_intensity(move |index| {
             if let Some(app) = app_weak.upgrade() {
@@ -507,6 +711,88 @@ impl App {
         }
         self.ui_dirty = true;
     }
+    fn effective_settings(&self, id: &str) -> Result<AppSettings, String> {
+        let (settings, text) = self
+            .run_overrides
+            .get(id)
+            .map(|config| (&config.settings, config.dataset_text.as_str()))
+            .unwrap_or((&self.settings, self.dataset_text.as_str()));
+        validated_run_settings(settings, text, id)
+    }
+    fn edit_configuration(&mut self, local: bool, field: &str, index: i32) {
+        if self.active_request.is_some() || index < 0 {
+            return;
+        }
+        let cores = self.physical_core_count();
+        let settings = if local {
+            let Some(config) = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.run_overrides.get_mut(id))
+            else {
+                return;
+            };
+            &mut config.settings
+        } else {
+            &mut self.settings
+        };
+        match field {
+            "cpu" if index < 3 => settings.cpu_intensity = index as usize,
+            "gpu" if index < 3 => settings.gpu_intensity = index as usize,
+            "cores" if index as u32 <= cores => settings.cpu_core_limit = index as u32,
+            "ram" if index < 8 => settings.ram_budget_percent = VRAM_BUDGET_OPTIONS[index as usize],
+            "vram" if index < 8 => {
+                settings.vram_budget_percent = VRAM_BUDGET_OPTIONS[index as usize]
+            }
+            "dataset" if index < 3 => settings.dataset_mode = index as usize,
+            "offload" if index < 3 => {
+                settings.ram_offload_percent = OFFLOAD_PERCENT[index as usize]
+            }
+            _ => return,
+        }
+        if local {
+            self.ui_dirty = true;
+        } else {
+            self.persist_settings();
+        }
+    }
+    fn edit_dataset(&mut self, local: bool, text: String) {
+        if self.active_request.is_some() {
+            return;
+        }
+        let valid = text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=1_048_576).contains(n));
+        if local {
+            if let Some(config) = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.run_overrides.get_mut(id))
+            {
+                config.dataset_text = text;
+                if let Some(mib) = valid {
+                    config.settings.dataset_mib = mib;
+                }
+            }
+        } else {
+            self.dataset_text = text;
+            if let Some(mib) = valid {
+                self.settings.dataset_mib = mib;
+                self.persist_settings();
+            }
+        }
+        self.ui_dirty = true;
+    }
+    fn queued_run(&self, id: &str) -> Result<QueuedRun, String> {
+        Ok(QueuedRun {
+            benchmark_id: id.into(),
+            settings: self.effective_settings(id)?,
+            gpu_id: self.selected_gpu_id.clone(),
+            physical_cores: self.physical_core_count(),
+        })
+    }
     fn request_startup_check(&mut self) {
         let id = self.next_id("fingerprint");
         if let Err(problem) = self
@@ -576,68 +862,39 @@ impl App {
             .unwrap_or(1)
             .max(1)
     }
-    fn selected_cpu_cores(&self) -> u32 {
-        let count = self.physical_core_count();
-        if self.settings.cpu_core_limit == 0 {
-            (count * INTENSITY_PERCENT[self.settings.cpu_intensity] / 100).max(1)
-        } else {
-            self.settings.cpu_core_limit.min(count)
-        }
-    }
     fn start_next(&mut self) {
         if self.active_request.is_some() {
             return;
         }
-        let Some(benchmark_id) = self.queue.pop_front() else {
+        let Some(run) = self.queue.pop_front() else {
             return;
         };
+        let benchmark_id = &run.benchmark_id;
         let id = self.next_id("run");
-        let mut options = serde_json::Map::new();
-        options.insert(
-            "vram_budget_percent".into(),
-            self.settings.vram_budget_percent.to_string().into(),
-        );
-        options.insert(
-            "cpu_worker_percent".into(),
-            INTENSITY_PERCENT[self.settings.cpu_intensity]
-                .to_string()
-                .into(),
-        );
-        options.insert(
-            "gpu_activity_percent".into(),
-            INTENSITY_PERCENT[self.settings.gpu_intensity]
-                .to_string()
-                .into(),
-        );
-        if benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory.") {
-            options.insert(
-                "cpu_core_limit".into(),
-                self.selected_cpu_cores().to_string().into(),
-            );
-            options.insert("thread_mode".into(), "physical_cores".into());
-            options.insert(
-                "ram_budget_percent".into(),
-                self.settings.ram_budget_percent.to_string().into(),
-            );
-            if self.settings.cpu_core_limit > 0 {
-                options.insert("cpu_worker_percent".into(), "100".into());
-            }
-        }
-        if benchmark_id.starts_with("gpu.")
-            && let Some(device_id) = &self.selected_gpu_id
-        {
-            options.insert("device_id".into(), Value::String(device_id.clone()));
-        }
+        let options = run_options(&run);
         match self.worker.send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": "run", "arguments": {"benchmark_id": benchmark_id, "target_duration_ms": BENCHMARK_TARGET_DURATION_MS, "samples": BENCHMARK_SAMPLES, "options": options}})) { Ok(()) => { self.active_request = Some(id); self.progress = 0.; self.progress_message = format!("Starting {benchmark_id}"); self.status = "Benchmark running…".into(); }, Err(problem) => { self.status = problem; self.queue.clear(); } }
     }
     fn run_selected(&mut self) {
+        if self.active_request.is_some() {
+            return;
+        }
         if let Some(id) = self.selected.clone() {
             self.queue.clear();
-            self.queue.push_back(id);
+            match self.queued_run(&id) {
+                Ok(run) => self.queue.push_back(run),
+                Err(error) => {
+                    self.status = error;
+                    self.ui_dirty = true;
+                    return;
+                }
+            }
             self.start_next();
         }
     }
     fn run_all(&mut self) {
+        if self.active_request.is_some() {
+            return;
+        }
         let mut items: Vec<_> = self
             .benchmarks
             .iter()
@@ -645,7 +902,18 @@ impl App {
             .cloned()
             .collect();
         items.sort_by_key(|b| b.display_order);
-        self.queue = items.into_iter().map(|b| b.id).collect();
+        let runs = items
+            .iter()
+            .map(|b| self.queued_run(&b.id))
+            .collect::<Result<VecDeque<_>, _>>();
+        match runs {
+            Ok(runs) => self.queue = runs,
+            Err(error) => {
+                self.status = error;
+                self.ui_dirty = true;
+                return;
+            }
+        }
         self.start_next();
     }
     fn cancel(&mut self) {
@@ -809,7 +1077,65 @@ impl App {
             core_options[app.settings.cpu_core_limit.min(app.physical_core_count()) as usize]
                 .clone(),
         );
-        window.set_cpu_core_options(ModelRc::new(VecModel::from(core_options)));
+        window.set_cpu_core_options(ModelRc::new(VecModel::from(core_options.clone())));
+        window.set_default_dataset_mode(DATASET_NAMES[app.settings.dataset_mode].into());
+        window.set_default_dataset_text(app.dataset_text.clone().into());
+        window.set_default_dataset_custom(app.settings.dataset_mode != 0);
+        window.set_default_offload_name(
+            format!("{}% system RAM", app.settings.ram_offload_percent).into(),
+        );
+        window.set_default_dataset_error(
+            validated_run_settings(&app.settings, &app.dataset_text, "global.scaling")
+                .err()
+                .unwrap_or_default()
+                .into(),
+        );
+        let selected_id = app.selected.as_deref().unwrap_or("");
+        let local = app.run_overrides.get(selected_id);
+        let settings = local.map(|c| &c.settings).unwrap_or(&app.settings);
+        window.set_test_override_enabled(local.is_some());
+        window
+            .set_test_is_cpu(selected_id.starts_with("cpu.") || selected_id.starts_with("memory."));
+        window.set_test_is_gpu(selected_id.starts_with("gpu."));
+        window.set_test_is_scaling(selected_id.ends_with(".scaling"));
+        window.set_test_is_offload(gpu_offload(selected_id));
+        window.set_test_has_ram(cpu_scaling(selected_id) || gpu_offload(selected_id));
+        window.set_test_cpu_name(INTENSITY_NAMES[settings.cpu_intensity].into());
+        window.set_test_gpu_name(INTENSITY_NAMES[settings.gpu_intensity].into());
+        window.set_test_core_name(if settings.cpu_core_limit == 0 {
+            core_options[0].clone()
+        } else {
+            core_options[settings.cpu_core_limit.min(app.physical_core_count()) as usize].clone()
+        });
+        window.set_test_ram_name(format!("{}% of RAM", settings.ram_budget_percent).into());
+        window.set_test_vram_name(format!("{}% of VRAM", settings.vram_budget_percent).into());
+        window
+            .set_test_offload_name(format!("{}% system RAM", settings.ram_offload_percent).into());
+        window.set_test_dataset_mode(DATASET_NAMES[settings.dataset_mode].into());
+        window.set_test_dataset_custom(settings.dataset_mode != 0);
+        window.set_test_dataset_text(
+            local
+                .map(|c| c.dataset_text.clone())
+                .unwrap_or_else(|| app.dataset_text.clone())
+                .into(),
+        );
+        let effective = app.effective_settings(selected_id);
+        window.set_test_configuration_valid(effective.is_ok());
+        window.set_test_configuration_summary(
+            match effective {
+                Ok(settings) => format!(
+                    "{} · {}",
+                    if local.is_some() {
+                        "Test override"
+                    } else {
+                        "Global defaults"
+                    },
+                    configuration_summary(&settings, selected_id)
+                ),
+                Err(error) => error,
+            }
+            .into(),
+        );
         window.set_cpu_intensity_name(INTENSITY_NAMES[app.settings.cpu_intensity].into());
         window.set_gpu_intensity_name(INTENSITY_NAMES[app.settings.gpu_intensity].into());
         window.set_settings_status(app.settings_status.clone().into());
@@ -1205,9 +1531,31 @@ fn load_results(path: &std::path::Path) -> Result<Vec<BenchmarkResult>, String> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(error) => return Err(error.to_string()),
     };
-    let file: ResultsFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let mut file: ResultsFile = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if file.version != 1 {
         return Err("unsupported results file version".into());
+    }
+    for result in &mut file.results {
+        // Retire the old pseudo-utilization fields while preserving actual measurements.
+        result.metrics.retain(|m| {
+            !m.name.ends_with(".gpu_busy_estimate") && !m.name.ends_with(".gpu_wait_estimate")
+        });
+        result
+            .workload_metadata
+            .retain(|key, _| !key.starts_with("gpu_busy_wait_"));
+
+        if let Some(percent) = match result.benchmark_id.as_str() {
+            "gpu.performance.fp32.offload50.scaling" => Some(50),
+            "gpu.performance.fp32.offload75.scaling" => Some(75),
+            "gpu.performance.fp32.offload100.scaling" => Some(100),
+            _ => None,
+        } {
+            result.benchmark_id = "gpu.performance.fp32.offload.scaling".into();
+            result
+                .workload_metadata
+                .entry("ram_offload_percent".into())
+                .or_insert_with(|| percent.to_string());
+        }
     }
     Ok(file.results)
 }
@@ -1294,6 +1642,12 @@ fn remember_result(saved: &mut Vec<BenchmarkResult>, result: &BenchmarkResult) {
         old.benchmark_id != result.benchmark_id
             || result_component_key(old) != result_component_key(result)
             || result_load_signature(old) != result_load_signature(result)
+            || old.workload_metadata.get("ram_offload_percent")
+                != result.workload_metadata.get("ram_offload_percent")
+            || old.workload_metadata.get("dataset_mode")
+                != result.workload_metadata.get("dataset_mode")
+            || old.workload_metadata.get("requested_dataset_bytes")
+                != result.workload_metadata.get("requested_dataset_bytes")
     });
     saved.push(result.clone());
     // Keep one latest result per workload/setup, with a bounded portable archive.
@@ -1315,7 +1669,7 @@ fn comparison_metric<'a>(
         .filter(|old| {
             old.benchmark_id == current.benchmark_id
                 && component_family(old) == component_family(current)
-                && result_load_signature(old) == result_load_signature(current)
+                && same_run_configuration(old, current)
                 && key.is_none_or(|key| result_component_key(old) == key)
                 && [
                     "data_type",
@@ -1326,7 +1680,10 @@ fn comparison_metric<'a>(
                     "copy_byte_definition",
                     "clock_analysis_revision",
                     "arithmetic_iterations",
+                    "compute_profile_revision",
                     "matrix_tile_reuse",
+                    "ram_offload_percent",
+                    "offload_profile_revision",
                 ]
                 .iter()
                 .all(|key| old.workload_metadata.get(*key) == current.workload_metadata.get(*key))
@@ -1433,7 +1790,7 @@ fn result_load_signature(result: &BenchmarkResult) -> (u32, u32, u32, u32) {
     } else {
         0
     };
-    let ram = if cpu && cpu_scaling(&result.benchmark_id) {
+    let ram = if (cpu && cpu_scaling(&result.benchmark_id)) || gpu_offload(&result.benchmark_id) {
         result
             .workload_metadata
             .get("ram_budget_percent")
@@ -1472,6 +1829,27 @@ fn result_settings_note(result: &BenchmarkResult) -> String {
             note.push_str(&format!(" {limit}"));
         }
     }
+    if gpu_offload(&result.benchmark_id) {
+        if let Some(percent) = result.workload_metadata.get("ram_offload_percent") {
+            note.push_str(&format!(" RAM offload: {percent}% of input/output data. Nominal host traffic includes cache-served accesses; it is not measured PCIe bus traffic."));
+        }
+        for (key, label) in [
+            ("host_allocated_test_buffer_bytes", "RAM buffers"),
+            ("device_allocated_test_buffer_bytes", "VRAM buffers"),
+        ] {
+            if let Some(bytes) = metadata_size(result, key) {
+                note.push_str(&format!(" {label}: {bytes}."));
+            }
+        }
+    }
+    if let Some(mode) = result.workload_metadata.get("dataset_mode") {
+        note.push_str(&format!(" Dataset mode: {mode}."));
+        if let Some(bytes) = metadata_size(result, "requested_dataset_bytes") {
+            note.push_str(&format!(
+                " Requested dataset: {bytes}; actual tested sizes are aligned to the kernel shape."
+            ));
+        }
+    }
     note
 }
 
@@ -1502,7 +1880,11 @@ fn component_results<'a>(
         .filter(|r| result_component_key(r) == device_id)
     {
         if let Some(group) = groups.iter_mut().find(|g| {
-            g[0].benchmark_id == result.benchmark_id && g[0].device_id == result.device_id
+            g[0].benchmark_id == result.benchmark_id
+                && g[0].device_id == result.device_id
+                && (!gpu_offload(&result.benchmark_id)
+                    || g[0].workload_metadata.get("ram_offload_percent")
+                        == result.workload_metadata.get("ram_offload_percent"))
         }) {
             group.push(result);
         } else {
@@ -1530,6 +1912,29 @@ fn result_section(result: &BenchmarkResult) -> i32 {
     }
 }
 
+fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bool {
+    result_load_signature(left) == result_load_signature(right)
+        && [
+            "ram_offload_percent",
+            "requested_dataset_bytes",
+            "arithmetic_iterations",
+            "matrix_tile_reuse",
+            "compute_profile_revision",
+        ]
+        .iter()
+        .all(|key| left.workload_metadata.get(*key) == right.workload_metadata.get(*key))
+        && left
+            .workload_metadata
+            .get("dataset_mode")
+            .map(String::as_str)
+            .unwrap_or("automatic")
+            == right
+                .workload_metadata
+                .get("dataset_mode")
+                .map(String::as_str)
+                .unwrap_or("automatic")
+}
+
 fn best_primary<'a>(group: &[&'a BenchmarkResult]) -> Option<&'a Metric> {
     let latest = featured_metric(group.first()?)?;
     // Capacity and inferred transition sizes are context, not performance scores.
@@ -1538,7 +1943,7 @@ fn best_primary<'a>(group: &[&'a BenchmarkResult]) -> Option<&'a Metric> {
     }
     group
         .iter()
-        .filter(|r| result_load_signature(r) == result_load_signature(group[0]))
+        .filter(|r| same_run_configuration(r, group[0]))
         .filter_map(|r| featured_metric(r))
         .filter(|m| m.name == latest.name && m.unit == latest.unit && m.value.is_finite())
         .max_by(|a, b| a.value.total_cmp(&b.value))
@@ -1551,7 +1956,7 @@ fn bandwidth_score(group: &[&BenchmarkResult], operation: &str, best: bool) -> S
     let metric = if best {
         group
             .iter()
-            .filter(|r| result_load_signature(r) == result_load_signature(group[0]))
+            .filter(|r| same_run_configuration(r, group[0]))
             .flat_map(|result| result.metrics.iter())
             .filter(matching)
             .max_by(|a, b| a.value.total_cmp(&b.value))
@@ -1720,6 +2125,15 @@ fn result_row(
         .find(|benchmark| benchmark.id == result.benchmark_id)
         .map(|benchmark| benchmark.name.as_str())
         .unwrap_or(result.benchmark_id.as_str());
+    let title = if gpu_offload(&result.benchmark_id) {
+        result
+            .workload_metadata
+            .get("ram_offload_percent")
+            .map(|percent| format!("{title} · {percent}% RAM"))
+            .unwrap_or_else(|| title.to_owned())
+    } else {
+        title.to_owned()
+    };
     let diagnosis = if result.benchmark_id.ends_with(".scaling") {
         match (
             result
@@ -1761,6 +2175,9 @@ fn result_row(
     let metric_details = result
         .metrics
         .iter()
+        .filter(|m| {
+            !m.name.ends_with(".gpu_busy_estimate") && !m.name.ends_with(".gpu_wait_estimate")
+        })
         .map(|metric| {
             format!(
                 "{}: {} (min {}, max {}, {} samples)",
@@ -1788,7 +2205,34 @@ fn result_row(
     let facts = result_facts(result, primary);
     let profile = chart_tiers(result);
     let (chart_svg, chart_labels) = scaling_chart_data(result).unwrap_or_default();
+    let (gpu_timing_svg, gpu_timing_labels) = gpu_timings::chart(result).unwrap_or_default();
+    let tuning = tuning_visuals::view(result);
     ResultRow {
+        measurement_facts: ModelRc::new(VecModel::from(result_visuals::facts(result, primary))),
+        measurement_bars: ModelRc::new(VecModel::from(result_visuals::bars(result, primary))),
+        context_facts: ModelRc::new(VecModel::from(
+            facts
+                .iter()
+                .map(|(label, value)| DeviceFact {
+                    label: label.as_str().into(),
+                    value: value.as_str().into(),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        tuning_facts_top: ModelRc::new(VecModel::from(tuning.top)),
+        tuning_facts_bottom: ModelRc::new(VecModel::from(tuning.bottom)),
+        tuning_bars: ModelRc::new(VecModel::from(tuning.bars)),
+        tuning_allocation: ModelRc::new(VecModel::from(tuning.allocation)),
+        tuning_actions: ModelRc::new(VecModel::from(tuning.actions)),
+        tuning_quality: tuning.quality.into(),
+        gpu_timing_available: !gpu_timing_svg.is_empty(),
+        gpu_timing_visible: result.benchmark_id.starts_with("gpu.")
+            && result.benchmark_id.ends_with(".scaling"),
+        gpu_timing_chart: slint::Image::load_from_svg_data(gpu_timing_svg.as_bytes())
+            .ok()
+            .unwrap_or_default(),
+        gpu_timing_labels: ModelRc::new(VecModel::from(gpu_timing_labels)),
+        gpu_timing_note: gpu_timings::note(result).into(),
         tuning_title: "TUNING SUGGESTIONS".into(),
         profile_chart: slint::Image::load_from_svg_data(chart_svg.as_bytes())
             .ok()
@@ -1811,13 +2255,32 @@ fn result_row(
                         format_metric(compute.statistics.maximum, &compute.unit),
                         compute.statistics.sample_count
                     );
+                    text.push_str(&gpu_timings::details(result, *bytes, compute));
                     if let Some(bandwidth) = chart_bandwidth(result, *bytes) {
                         text.push_str(&format!(
-                            "\nEffective traffic: {} (min {}, max {}; {} samples)",
+                            "\n{}: {} (min {}, max {}; {} samples)",
+                            if gpu_offload(&result.benchmark_id) {
+                                "Nominal host traffic (cache included)"
+                            } else {
+                                "Effective traffic"
+                            },
                             format_metric(bandwidth.value, &bandwidth.unit),
                             format_metric(bandwidth.statistics.minimum, &bandwidth.unit),
                             format_metric(bandwidth.statistics.maximum, &bandwidth.unit),
                             bandwidth.statistics.sample_count
+                        ));
+                    }
+                    if gpu_offload(&result.benchmark_id)
+                        && let Some(percent) = result
+                            .workload_metadata
+                            .get("ram_offload_percent")
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .filter(|p| *p <= 100)
+                    {
+                        text.push_str(&format!(
+                            "\nPlacement: {} RAM + {} VRAM",
+                            format_binary_size((*bytes * percent / 100) as f64),
+                            format_binary_size((*bytes * (100 - percent) / 100) as f64)
                         ));
                     }
                     if let Some(shape) = cpu_matrix_tier_shape(result, *bytes) {
@@ -1833,12 +2296,17 @@ fn result_row(
         tuning_tldr: tuning_takeaway(result).into(),
         tuning_stats: tuning_breakdown(result).into(),
         memory_pressure: memory_pressure_summary(result).into(),
-        tuning_guidance: result
-            .workload_metadata
-            .get("tuning_guidance")
-            .map(String::as_str)
-            .unwrap_or("")
-            .into(),
+        tuning_guidance: if gpu_offload(&result.benchmark_id) {
+            // Apply current advice to older saved offload results as well.
+            gluj_bench_core::GPU_OFFLOAD_TUNING_GUIDANCE
+        } else {
+            result
+                .workload_metadata
+                .get("tuning_guidance")
+                .map(String::as_str)
+                .unwrap_or("")
+        }
+        .into(),
         title: title.into(),
         description: test_description(&result.benchmark_id).into(),
         everyday_use: test_usage(&result.benchmark_id).into(),
@@ -1929,6 +2397,8 @@ fn test_lab_details(benchmark: &BenchmarkDescriptor) -> String {
         details.push_str("\n\nREADING THE MATRIX PROFILE\nEach CPU worker multiplies A[32,K] by B[K,N] to produce C[32,N], with K=N growing from 32 as the dataset increases. Dataset size includes all input and output matrices across selected workers. The blocked AVX2/FMA kernel reuses weight data across 32 rows. The RAM budget setting applies to total buffers and leaves available-memory headroom. Exact core allocation uses one worker per physical core. Changing workers also changes per-worker matrix dimensions; inspect shapes and aggregate dataset sizes when comparing.\n\nREADING THE METRICS\nTOPS counts 2×M×N×K floating-point operations per complete product. GB/s counts scalar input reads, vector weight reads, and output reads/writes within the cache blocks. Reused data can be served by cache, so effective GB/s can exceed physical RAM bandwidth. Arithmetic intensity here uses those kernel accesses, not just each matrix's unique bytes. Compare this matrix profile with its own small-data baseline; its reuse differs from the vector test.");
     } else if benchmark.id == "cpu.performance.avx2.f32_fma.scaling" {
         details.push_str("\n\nREADING THE SCALING PROFILE\nThe test compares increasingly large FP32 arrays with the current run's register-only AVX2/FMA reference. Dataset size is the total of two input arrays and one output array across all selected CPU workers; each worker handles an equal, separate share. The RAM budget setting limits total allocation and leaves available-memory headroom. Exact core allocation uses one worker per physical core. Compare at the same largest tested dataset size when changing cores.\n\nMEMORY PRESSURE\nTOPS counts multiply and add operations; GB/s counts two input reads and one output write. The kernel performs 16 FMAs per value to keep the compute-to-data ratio fixed. Effective traffic excludes write allocation and cache-line writeback, so it is not physical RAM-bus utilization. Sustained slowdown suggests cache or RAM pressure; exact cache boundaries and stall time are not measured.");
+    } else if gpu_offload(&benchmark.id) {
+        details.push_str("\n\nREADING RAM OFFLOAD\nThe percentage applies to all input and output bytes, with aligned RAM and VRAM regions. The GPU directly accesses system RAM; BAR-mapped VRAM is excluded. Each tier reports total effective traffic plus nominal host traffic in the expanded measurements. Cache reuse can reduce actual bus traffic. This does not force VRAM exhaustion or measure page migration. Compare identical datasets and arithmetic iterations using different RAM offload percentages.");
     } else if benchmark.id.ends_with(".scaling") {
         details.push_str("\n\nREADING THE SCALING PROFILE\nThe test measures a small compute reference and progressively larger data sets up to your VRAM budget, subject to available memory. The table shows throughput at the largest tested data set and its change against the current run's reference. Any core-limit suggestion is a trial: change the limit yourself, rerun with the same settings and data-set size, and aim for no more than 0–5% throughput loss from your original run.");
         details.push_str("\n\nMEMORY PRESSURE\nThe tuning box compares small and large data sets and shows effective test traffic in GB/s. A sustained slowdown suggests memory pressure, but it does not measure the exact percentage of time the GPU waits for memory. Cache reuse can make effective test traffic differ from physical VRAM traffic. Noisy samples require a repeat measurement before estimating a core-limit reduction.");
@@ -1947,6 +2417,9 @@ fn test_takeaway(id: &str) -> &'static str {
         }
         "cpu.performance.avx2.f32_fma.scaling" => {
             "Shows how CPU vector throughput changes as FP32 data grows beyond cache into RAM."
+        }
+        _ if gpu_offload(id) => {
+            "Measures GPU calculation speed with your chosen share of data in system RAM. Choose the offload percentage and dataset in Settings or override them for this test."
         }
         "gpu.performance.fp32.scaling" => {
             "Shows how larger data sets affect graphics-card calculation throughput."
@@ -1994,6 +2467,16 @@ fn test_takeaway(id: &str) -> &'static str {
     }
 }
 
+fn gpu_offload(id: &str) -> bool {
+    matches!(
+        id,
+        "gpu.performance.fp32.offload.scaling"
+            | "gpu.performance.fp32.offload50.scaling"
+            | "gpu.performance.fp32.offload75.scaling"
+            | "gpu.performance.fp32.offload100.scaling"
+    )
+}
+
 fn cpu_scaling(id: &str) -> bool {
     id.starts_with("cpu.performance.") && id.ends_with(".scaling")
 }
@@ -2027,6 +2510,9 @@ fn cpu_matrix_tier_shape(result: &BenchmarkResult, bytes: u64) -> Option<String>
 }
 
 fn tuning_takeaway(result: &BenchmarkResult) -> String {
+    if gpu_offload(&result.benchmark_id) {
+        return gluj_bench_core::GPU_OFFLOAD_TUNING_TAKEAWAY.into();
+    }
     if cpu_scaling(&result.benchmark_id) {
         if let Some(cores) = result
             .workload_metadata
@@ -2445,6 +2931,9 @@ fn test_description(id: &str) -> &'static str {
         "gpu.performance.fp64" => {
             "FP64 uses 64-bit decimal numbers for greater precision. This test measures parallel calculations that need more numerical accuracy. Hardware support and speed vary widely between graphics cards."
         }
+        _ if gpu_offload(id) => {
+            "The GPU reads two FP32 input arrays and writes an output array directly on a separate system-RAM heap for the selected offload share. The remaining share uses VRAM. Each dataset preserves the selected split. No CPU computation or timed RAM-to-VRAM staging copy is used. Small sets can benefit from GPU cache; nominal host traffic is not a PCIe bus-counter measurement. This models explicit offload rather than automatic driver eviction. The RAM budget limits the host region; the VRAM budget limits the remaining region. At 100%, all test arrays use system RAM."
+        }
         "gpu.performance.fp32.scaling" => {
             "First measures FP32 calculation speed with most work kept in GPU registers, creating a measured compute ceiling rather than a theoretical peak. It then repeats calculations with increasingly large data sets up to your VRAM budget, showing the performance gap as memory traffic grows."
         }
@@ -2546,6 +3035,9 @@ fn test_usage(id: &str) -> &'static str {
         }
         "gpu.performance.matrix.fp16.scaling" => {
             "Useful for understanding neural-network calculations, including processing an AI prompt and working with larger model weights. Small sets benefit from cache; larger sets depend more on VRAM. This measures one building block of AI performance; model design, batch size, and software also affect how quickly an AI app responds."
+        }
+        _ if gpu_offload(id) => {
+            "Useful for exploring the cost of GPU access to offloaded data. Compare the same dataset across the three offload shares and inspect nominal host traffic in the expanded measurements. The CPU memory controller, interconnect, PCIe link, GPU caches and shader all affect this result; it does not isolate pure PCIe bandwidth or predict complete application speed."
         }
         "gpu.performance.fp32.scaling" => {
             "Useful context for graphics or compute tasks whose data grows beyond fast cache. A drop in this profile shows how this workload responds to more memory traffic; other applications can reuse data differently."
@@ -2667,7 +3159,9 @@ fn scaling_facts(result: &BenchmarkResult) -> [(String, String); 4] {
         (
             if cpu_scaling(&result.benchmark_id) {
                 "AVX2 FP32 REFERENCE".into()
-            } else if result.benchmark_id == "gpu.performance.fp32.scaling" {
+            } else if result.benchmark_id == "gpu.performance.fp32.scaling"
+                || gpu_offload(&result.benchmark_id)
+            {
                 "FP32 VECTOR REFERENCE".into()
             } else {
                 "FP16 MATRIX REFERENCE".into()
@@ -2724,8 +3218,13 @@ fn chart_tiers(result: &BenchmarkResult) -> Vec<(u64, &Metric)> {
 }
 
 fn chart_bandwidth(result: &BenchmarkResult, bytes: u64) -> Option<&Metric> {
+    let name = if gpu_offload(&result.benchmark_id) {
+        "host_bandwidth"
+    } else {
+        "bandwidth"
+    };
     result.metrics.iter().find(|metric| {
-        metric.name == format!("working_set_{bytes}.bandwidth")
+        metric.name == format!("working_set_{bytes}.{name}")
             && metric.unit == "bytes/s"
             && metric.value.is_finite()
             && metric.value > 0.0
@@ -2783,7 +3282,17 @@ fn scaling_chart_data(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabe
         };
     for (bandwidth, top, color, title, scale) in [
         (false, 42.0, "#73dcca", "Compute throughput · TOPS", 1e12),
-        (true, 232.0, "#78a9ff", "Effective test traffic · GB/s", 1e9),
+        (
+            true,
+            232.0,
+            "#78a9ff",
+            if gpu_offload(&result.benchmark_id) {
+                "Nominal host traffic · GB/s (cache included)"
+            } else {
+                "Effective test traffic · GB/s"
+            },
+            1e9,
+        ),
     ] {
         let metric_at = |bytes, compute| {
             if bandwidth {
@@ -2983,7 +3492,9 @@ fn result_summary(result: &BenchmarkResult) -> String {
             });
             let reference_label = if cpu_scaling(&result.benchmark_id) {
                 "AVX2 FP32"
-            } else if result.benchmark_id == "gpu.performance.fp32.scaling" {
+            } else if result.benchmark_id == "gpu.performance.fp32.scaling"
+                || gpu_offload(&result.benchmark_id)
+            {
                 "FP32 vector"
             } else {
                 "FP16 matrix"
@@ -3087,6 +3598,7 @@ fn save_metadata_cache(
 }
 fn format_metric(value: f64, unit: &str) -> String {
     match unit {
+        "ns" => gpu_timings::format_time(value),
         "bytes" => format_binary_size(value),
         "bytes/s" => format!("{:.2} GB/s", value / 1e9),
         "operations/s" if value.abs() >= 1e9 => {
@@ -3126,7 +3638,7 @@ fn display_metric_name(name: &str) -> String {
     if name == "measured_compute_ceiling" {
         return "Measured compute ceiling".into();
     }
-    if name == "cache_resident_compute" {
+    if name == "cache_resident_compute" || name == "small_set_compute" {
         return "Small-working-set compute baseline".into();
     }
     if name == "bandwidth_transition_working_set" {
@@ -3139,6 +3651,9 @@ fn display_metric_name(name: &str) -> String {
         let label = match kind {
             "compute" => "compute",
             "reference_delta" => "delta vs compute reference",
+            "host_bandwidth" => "nominal host traffic (cache included)",
+            "gpu_execution_time" => "GPU execution time per pass",
+            "end_to_end_time" => "End-to-end time per pass",
             _ => "effective traffic",
         };
         return format!("{} {label}", format_binary_size(bytes));
@@ -3225,6 +3740,69 @@ mod tests {
         let defaults: super::AppSettings = serde_json::from_str(r#"{"cpu_intensity":0}"#).unwrap();
         assert_eq!(defaults.ram_budget_percent, 20);
         assert_eq!(defaults.cpu_core_limit, 0);
+    }
+
+    #[test]
+    fn ram_offload_results_show_host_traffic_and_compare_matching_budgets() {
+        use super::{
+            chart_bandwidth, comparison_metric, result_summary, scaling_chart_data,
+            test_description, tuning_takeaway,
+        };
+        use slint::Model;
+        let mut result = saved_test_result(4e12);
+        result.device_id = "gpu:one".into();
+        result.benchmark_id = "gpu.performance.fp32.offload75.scaling".into();
+        result.metrics[0].name = "working_set_1048576.compute".into();
+        for (name, value) in [("bandwidth", 40e9), ("host_bandwidth", 30e9)] {
+            result.metrics.push(Metric {
+                name: format!("working_set_1048576.{name}"),
+                value,
+                unit: "bytes/s".into(),
+                statistics: SampleStatistics::default(),
+            });
+        }
+        result
+            .workload_metadata
+            .insert("ram_offload_percent".into(), "75".into());
+        result
+            .workload_metadata
+            .insert("ram_budget_percent".into(), "20".into());
+        let row = result_row(&result, &[], &[]);
+        let tier = row.profile_statistics.row_data(0).unwrap();
+        assert!(tier.contains("Nominal host traffic (cache included): 30.00 GB/s"));
+        assert!(tier.contains("Placement: 768.00 KiB RAM + 256.00 KiB VRAM"));
+        assert!(test_description(&result.benchmark_id).contains("system-RAM heap"));
+        assert!(tuning_takeaway(&result).contains("GPU core-frequency limit"));
+        assert!(row.tuning_guidance.contains("smaller batches"));
+        assert!(
+            !row.tuning_guidance
+                .contains("Change the RAM offload percentage")
+        );
+        assert!(!result_summary(&result).contains("FP16 matrix"));
+        assert!(
+            scaling_chart_data(&result)
+                .unwrap()
+                .1
+                .iter()
+                .any(|label| label.text.contains("Nominal host traffic"))
+        );
+        assert_eq!(chart_bandwidth(&result, 1048576).unwrap().value, 30e9);
+        let previous = result.clone();
+        assert!(
+            comparison_metric(
+                &result,
+                "working_set_1048576.compute",
+                std::slice::from_ref(&previous),
+                None
+            )
+            .is_some()
+        );
+        result
+            .workload_metadata
+            .insert("ram_budget_percent".into(), "80".into());
+        assert!(
+            comparison_metric(&result, "working_set_1048576.compute", &[previous], None).is_none()
+        );
     }
 
     #[test]
@@ -3366,6 +3944,7 @@ mod tests {
             vram_budget_percent: 80,
             ram_budget_percent: 80,
             cpu_core_limit: 4,
+            ..super::AppSettings::default()
         };
         super::write_json(&path, &settings).unwrap();
         assert_eq!(super::load_settings(&path).unwrap(), settings);
