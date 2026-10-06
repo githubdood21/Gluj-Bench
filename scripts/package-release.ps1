@@ -62,9 +62,7 @@ try {
     $LogoDirectory = Join-Path $StageDirectory 'design\logo-drafts'
     New-Item -ItemType Directory -Force -Path $LogoDirectory | Out-Null
     Copy-Item -LiteralPath 'design\logo-drafts\loop-chip-g-preview.png' -Destination $LogoDirectory
-    if (Test-Path -LiteralPath 'LICENSE') {
-        Copy-Item -LiteralPath 'LICENSE' -Destination $StageDirectory
-    }
+    Copy-Item -LiteralPath 'LICENSE', 'NOTICE', 'BRANDING.md' -Destination $StageDirectory
     New-Item -ItemType Directory -Path (Join-Path $StageDirectory 'docs') | Out-Null
     Copy-Item -LiteralPath 'docs\protocol.md' -Destination (Join-Path $StageDirectory 'docs')
     $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)

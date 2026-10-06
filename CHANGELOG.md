@@ -13,6 +13,8 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 
 ### Changed
 
+- Changed the project license for this revision to GPL-3.0-only and added a separate branding policy for independently distributed forks. Release archives include the license, project notice and branding policy. Earlier MIT releases retain their original permissions.
+
 - Latest-measurement details now show throughput, sample range and variation cards, sample-spread bars, and workload context. Raw measurements are collapsible; GPU timing notices are limited to scaling tests.
 
 - Tuning details now use measurement cards, throughput comparison bars, allocation bars, a measurement-quality notice, and a retest checklist. Full technical reasoning remains available in a separate disclosure.

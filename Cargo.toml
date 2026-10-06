@@ -14,7 +14,7 @@ edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/githubdood21/Gluj-Bench"
 homepage = "https://github.com/githubdood21/Gluj-Bench"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 ash = "0.38"

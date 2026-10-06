@@ -3,7 +3,7 @@
 [![CI](https://github.com/githubdood21/Gluj-Bench/actions/workflows/ci.yml/badge.svg)](https://github.com/githubdood21/Gluj-Bench/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/githubdood21/Gluj-Bench?display_name=tag)](https://github.com/githubdood21/Gluj-Bench/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-5d91ff)](#requirements)
-[![License](https://img.shields.io/badge/license-MIT-3dd6c6)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPLv3-3dd6c6)](LICENSE)
 
 <p align="center">
   <img src="design/logo-drafts/loop-chip-g-preview.png" alt="Gluj-Bench chip and retest-loop logo" width="112">
@@ -267,4 +267,6 @@ Gluj-Bench is actively developed. Measurements depend on the workload, driver, b
 
 For changes, see [CHANGELOG.md](CHANGELOG.md). Report reproducible issues through [GitHub Issues](https://github.com/githubdood21/Gluj-Bench/issues), and follow [SECURITY.md](SECURITY.md) for security reports.
 
-Gluj-Bench is licensed under the [MIT License](LICENSE) and provided without warranty.
+Copyright (c) 2026 githubdood21. Gluj-Bench is licensed under the [GNU General Public License, version 3 only](LICENSE) (`GPL-3.0-only`) and provided without warranty. See [NOTICE](NOTICE) for the project license notice and [BRANDING.md](BRANDING.md) for use of the Gluj-Bench name and logo.
+
+Distributed copies and derivative versions must comply with GPLv3, including the applicable source-code and notice requirements. Commercial use and selling copies are permitted; independently distributed forks must use distinct product branding under the branding policy. Earlier versions published under MIT retain their original license permissions; this change does not revoke those grants. Third-party components retain their respective licenses.
