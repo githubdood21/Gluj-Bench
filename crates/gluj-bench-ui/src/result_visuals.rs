@@ -17,7 +17,11 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
     .then(|| stats.standard_deviation.abs() / metric.value * 100.0);
     [
         (
-            "MEASURED THROUGHPUT",
+            if super::read_latency(result) {
+                "MEASURED READ LATENCY"
+            } else {
+                "MEASURED THROUGHPUT"
+            },
             format_metric(metric.value, &metric.unit),
             super::display_metric_name(&metric.name),
             Color::from_rgb_u8(115, 220, 202),
@@ -45,7 +49,7 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
             variation
                 .map(|v| format!("{v:.1}%"))
                 .unwrap_or_else(|| "Not enough samples".into()),
-            "Standard deviation relative to measured throughput".into(),
+            "Standard deviation relative to measured value".into(),
             if variation.is_some_and(|v| v > 10.0) {
                 Color::from_rgb_u8(237, 199, 120)
             } else {

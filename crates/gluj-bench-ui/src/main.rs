@@ -22,7 +22,7 @@ use std::{
 
 slint::include_modules!();
 
-const HARDWARE_METADATA_CACHE_VERSION: u32 = 15;
+const HARDWARE_METADATA_CACHE_VERSION: u32 = 17;
 const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
 const BENCHMARK_SAMPLES: u32 = 5;
 
@@ -1742,7 +1742,7 @@ fn primary_delta(
     key: Option<&str>,
 ) -> String {
     featured_metric(current)
-        .filter(|m| m.unit.ends_with("/s"))
+        .filter(|m| m.unit.ends_with("/s") || read_latency(current))
         .map(|m| metric_delta(current, &m.name, saved, key))
         .unwrap_or_else(|| "—".into())
 }
@@ -1817,6 +1817,24 @@ fn result_load_signature(result: &BenchmarkResult) -> (u32, u32, u32, u32) {
 }
 
 fn result_settings_note(result: &BenchmarkResult) -> String {
+    if let Some(level) = cache_latency_level(&result.benchmark_id) {
+        return format!(
+            "One pinned CPU thread; allocation presets do not add workers. L{level} working set: {} / {} cache capacity. Warmed dependent reads; lower ns per read is better and a negative Change means decreased latency. Cache residency is inferred from working-set size, not confirmed by hardware counters.",
+            metadata_size(result, "working_set_bytes").unwrap_or_else(|| "not recorded".into()),
+            metadata_size(result, "target_cache_bytes").unwrap_or_else(|| "not recorded".into())
+        );
+    }
+    if ram_latency(result) {
+        return format!(
+            "One pinned CPU thread; CPU core-allocation presets do not change this test. Working set: {}. {} Lower nanoseconds per read is better; a negative Change means latency decreased. Measures CPU-to-memory access, not DRAM CAS timing.",
+            metadata_size(result, "working_set_bytes").unwrap_or_else(|| "not recorded".into()),
+            if result.benchmark_id == "cpu.latency.memory.localized" {
+                "Randomized within 64 KiB blocks to reduce translation overhead; not a PassMark-equivalent score."
+            } else {
+                "Scattered object-like reads across the full allocation include address-translation overhead."
+            }
+        );
+    }
     let (load, vram, cores, ram) = result_load_signature(result);
     let target = if component_family(result) == "gpu" {
         "GPU activity target"
@@ -1912,6 +1930,9 @@ fn component_results<'a>(
 }
 
 fn result_section(result: &BenchmarkResult) -> i32 {
+    if read_latency(result) {
+        return 3; // Latency has its own lower-is-better section.
+    }
     if ["read", "write", "copy"].iter().all(|name| {
         result
             .metrics
@@ -1934,6 +1955,7 @@ fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bo
             "arithmetic_iterations",
             "matrix_tile_reuse",
             "compute_profile_revision",
+            "latency_profile_revision",
         ]
         .iter()
         .all(|key| left.workload_metadata.get(*key) == right.workload_metadata.get(*key))
@@ -1947,20 +1969,70 @@ fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bo
                 .get("dataset_mode")
                 .map(String::as_str)
                 .unwrap_or("automatic")
+        && (!read_latency(left)
+            || [
+                "working_set_bytes",
+                "node_stride_bytes",
+                "random_seed",
+                "processor_group",
+                "processor_index",
+                "page_policy",
+                "access_order",
+                "locality_block_bytes",
+                "target_cache_bytes",
+                "cache_processor_group",
+                "cache_processor_mask",
+                "cache_sharing_logical_processors",
+                "preceding_cache_bytes",
+                "cache_state",
+            ]
+            .iter()
+            .all(|key| left.workload_metadata.get(*key) == right.workload_metadata.get(*key)))
+}
+
+fn ram_latency(result: &BenchmarkResult) -> bool {
+    matches!(
+        result.benchmark_id.as_str(),
+        "cpu.latency.memory" | "cpu.latency.memory.localized"
+    )
+}
+
+fn cache_latency_level(id: &str) -> Option<u8> {
+    match id {
+        "cpu.latency.cache.l1" => Some(1),
+        "cpu.latency.cache.l2" => Some(2),
+        "cpu.latency.cache.l3" => Some(3),
+        _ => None,
+    }
+}
+
+fn read_latency(result: &BenchmarkResult) -> bool {
+    ram_latency(result) || cache_latency_level(&result.benchmark_id).is_some()
 }
 
 fn best_primary<'a>(group: &[&'a BenchmarkResult]) -> Option<&'a Metric> {
     let latest = featured_metric(group.first()?)?;
     // Capacity and inferred transition sizes are context, not performance scores.
-    if !latest.unit.ends_with("/s") {
+    if !latest.unit.ends_with("/s") && !read_latency(group[0]) {
         return None;
     }
     group
         .iter()
         .filter(|r| same_run_configuration(r, group[0]))
         .filter_map(|r| featured_metric(r))
-        .filter(|m| m.name == latest.name && m.unit == latest.unit && m.value.is_finite())
-        .max_by(|a, b| a.value.total_cmp(&b.value))
+        .filter(|m| {
+            m.name == latest.name
+                && m.unit == latest.unit
+                && m.value.is_finite()
+                && (!read_latency(group[0]) || m.value > 0.0)
+        })
+        .max_by(|a, b| {
+            if read_latency(group[0]) {
+                b.value.total_cmp(&a.value)
+            } else {
+                a.value.total_cmp(&b.value)
+            }
+        })
 }
 
 fn bandwidth_score(group: &[&BenchmarkResult], operation: &str, best: bool) -> String {
@@ -2117,7 +2189,9 @@ fn cache_details(device: &DeviceDescriptor) -> String {
 }
 fn suite_description(suite: &str) -> &'static str {
     match suite {
-        "cpu.bandwidth" => "Read, write, and copy bandwidth with per-operation sample statistics.",
+        "cpu.bandwidth" => {
+            "Cache/RAM bandwidth and dependent RAM read latency with sample statistics."
+        }
         "cpu.performance" => {
             "Aggregate processor throughput, single-thread INT64, and compute-vs-memory diagnosis."
         }
@@ -2376,6 +2450,9 @@ fn result_row(
 
 fn metric_explanation(unit: &str, read_write_copy: bool) -> String {
     let units = match unit {
+        "ns" => {
+            "Nanoseconds measure time; lower is better. Read latency is the average time per dependent read, summarized across repeated samples."
+        }
         "operations/s" => {
             "TOPS means trillions of calculations per second; higher means more compute throughput within this test."
         }
@@ -2421,7 +2498,15 @@ fn test_lab_details(benchmark: &BenchmarkDescriptor) -> String {
         details.push_str("\n\nREADING THE SCALING PROFILE\nThe test measures a small compute reference and progressively larger data sets up to your VRAM budget, subject to available memory. The table shows throughput at the largest tested data set and its change against the current run's reference. Any core-limit suggestion is a trial: change the limit yourself, rerun with the same settings and data-set size, and aim for no more than 0–5% throughput loss from your original run.");
         details.push_str("\n\nMEMORY PRESSURE\nThe tuning box compares small and large data sets and shows effective test traffic in GB/s. A sustained slowdown suggests memory pressure, but it does not measure the exact percentage of time the GPU waits for memory. Cache reuse can make effective test traffic differ from physical VRAM traffic. Noisy samples require a repeat measurement before estimating a core-limit reduction.");
     }
-    details.push_str("\n\nBEFORE YOU RUN\nLower test intensity leaves more room for other work but can lower measured throughput. Compare runs with matching intensity and workload settings. These are measurements of this test, rather than a direct prediction of game frame rates or whole-app performance.");
+    if matches!(
+        benchmark.id.as_str(),
+        "cpu.latency.memory" | "cpu.latency.memory.localized"
+    ) || cache_latency_level(&benchmark.id).is_some()
+    {
+        details.push_str("\n\nBEFORE YOU RUN\nThis test always uses one pinned thread regardless of the CPU allocation preset. Close competing memory-heavy work and compare matching working sets. Large allocations require longer complete traversals; Stop all tests remains available during preparation and sampling.");
+    } else {
+        details.push_str("\n\nBEFORE YOU RUN\nLower test intensity leaves more room for other work but can lower measured throughput. Compare runs with matching intensity and workload settings. These are measurements of this test, rather than a direct prediction of game frame rates or whole-app performance.");
+    }
     if !benchmark.workload.is_empty() {
         details.push_str(&format!("\n\nTEST WORKLOAD\n{}", benchmark.workload));
     }
@@ -2430,6 +2515,15 @@ fn test_lab_details(benchmark: &BenchmarkDescriptor) -> String {
 
 fn test_takeaway(id: &str) -> &'static str {
     match id {
+        _ if cache_latency_level(id).is_some() => {
+            "Measures warmed dependent reads in a cache-sized working set on one CPU core. Lower nanoseconds per read is better."
+        }
+        "cpu.latency.memory" => {
+            "Measures dependent reads of scattered object-like nodes across RAM, including address translation. Lower is better."
+        }
+        "cpu.latency.memory.localized" => {
+            "Measures dependent RAM reads with 64 KiB locality to reduce translation overhead. Lower nanoseconds per access is better."
+        }
         "cpu.performance.matrix.fp32.scaling" => {
             "Shows how CPU FP32 matrix throughput changes as weight matrices grow beyond cache into RAM."
         }
@@ -2880,6 +2974,15 @@ fn tuning_breakdown(result: &BenchmarkResult) -> String {
 
 fn test_description(id: &str) -> &'static str {
     match id {
+        _ if cache_latency_level(id).is_some() => {
+            "Follows dependent pointers in a working set selected from the cache instance attached to the pinned core. L1 uses 75% of its capacity. L2 and L3 aim for four times the preceding level's capacity, capped at 75% of the target cache; the set must exceed twice the preceding level's capacity. This leaves shared-cache headroom. Missing or insufficiently separated levels remain disabled with an explanation. L1 uses a fully randomized chain; L2 and L3 randomize within 64 KiB blocks to reduce translation overhead. Two full traversals warm the allocation before timing. Batches contain at least 65,536 reads in complete cycles. Observed time includes loop/timer overhead, translation, prefetching and interference. Exact cache-hit rates and hardware hit-cycle counts are not measured. Shared-cache traffic and SMT siblings can affect results. One pinned thread regardless of allocation preset."
+        }
+        "cpu.latency.memory" => {
+            "Follows a fully randomized pointer chain on one pinned CPU thread, modeling dependent reads of scattered object-like nodes. Each node stores an 8-byte pointer with cache-line spacing; its address supplies the next read. This measures access only, not object allocation or application logic. The working set is at least 256 MiB and four times the detected aggregate last-level cache. Allocation, initialization and one full warmup traversal are excluded from timing. Samples cover complete cycles and can exceed the requested duration. Results include address translation, cache effects, loop/timer overhead and system interference. Uses ordinary pages without explicit NUMA binding; this is not DRAM CAS timing. CPU allocation presets do not add workers."
+        }
+        "cpu.latency.memory.localized" => {
+            "Follows dependent pointers randomized within 64 KiB blocks, advancing through the full allocation. Nearby reads reuse page translations, reducing TLB overhead compared with fully scattered reads. This follows the localized pointer-chasing approach described by conventional memory benchmarks, but does not reproduce PassMark's cache-subtest averaging or score. The working set remains at least 256 MiB and four times the detected aggregate last-level cache. Allocation, construction and full-cycle warmup are untimed; samples cover complete cycles. Cache effects, prefetching, block transitions, translation and OS interference can still affect the result. Ordinary pages, one pinned CPU thread, no explicit NUMA binding; lower ns per read is better."
+        }
         "cpu.performance.matrix.fp32.scaling" => {
             "Multiplies 32 rows of FP32 inputs by progressively larger FP32 weight matrices, using cache-blocked AVX2/FMA instructions. Every selected CPU worker owns separate A[32,K], B[K,N], and C[32,N] matrices, with K=N. Eight rows share each loaded eight-value weight vector; the kernel uses 64-column and 128-K cache blocks. TOPS counts 2×M×N×K operations per complete product. GB/s reports effective reads and output reads/writes within the kernel, including cache-served reuse. The register-only AVX2 reference is measured before and after the sweep; the latest reference is used. These are raw matrix-workload measurements."
         }
@@ -2988,6 +3091,15 @@ fn test_description(id: &str) -> &'static str {
 
 fn test_usage(id: &str) -> &'static str {
     match id {
+        _ if cache_latency_level(id).is_some() => {
+            "Useful for examining the delay of dependent lookups when a working set fits in the processor's cache hierarchy. Compare the same level with matching working-set size and pinned-core placement. Higher levels include traversal of the memory hierarchy; this is not the incremental delay added by that cache alone. Throughput, cache bandwidth and whole-application speed are separate measurements."
+        }
+        "cpu.latency.memory" => {
+            "Useful when comparing the same machine before and after memory-setting changes, or investigating workloads with dependent lookups such as pointer-based structures. Compare matching working sets and processor placement. This test adds no competing memory-load workers; background activity can still affect results. It does not predict whole-application speed."
+        }
+        "cpu.latency.memory.localized" => {
+            "Useful for comparing RAM settings with less address-translation pressure than widely scattered object reads. Compare this test with its own previous runs using matching working sets and processor placement. Its difference from random-object latency shows sensitivity to access locality, not a direct measurement of TLB-miss cost or a prediction of application speed."
+        }
         "cpu.performance.matrix.fp32.scaling" => {
             "Measures the CPU's balance between FP32 matrix arithmetic, data reuse, and cache/RAM access. Matrix multiplication is a building block of neural networks, scientific computing and numerical processing. Compare matching matrix shapes, worker settings and dataset sizes; this is a fixed 32-row workload, not a complete application benchmark."
         }
@@ -3121,25 +3233,29 @@ fn result_facts(result: &BenchmarkResult, primary: Option<&Metric>) -> [(String,
                     .to_uppercase(),
             )
         });
-    let (analysis_label, analysis_value) =
-        if let Some(value) = result.workload_metadata.get("bound_classification") {
-            (
-                "LIMITING FACTOR".into(),
-                match value.as_str() {
-                    "compute_bound" => "Compute".into(),
-                    "memory_bandwidth_bound" => "Memory bandwidth".into(),
-                    _ => value.replace('_', " "),
-                },
-            )
-        } else if let Some(status) = result.workload_metadata.get("cache_discovery_status") {
-            ("CACHE PROFILE".into(), status.replace('_', " "))
-        } else {
-            let count = result.metrics.len();
-            (
-                "MEASUREMENTS".into(),
-                format!("{count} {}", if count == 1 { "output" } else { "outputs" }),
-            )
-        };
+    let (analysis_label, analysis_value) = if cache_latency_level(&result.benchmark_id).is_some() {
+        (
+            "CACHE INSTANCE".into(),
+            metadata_size(result, "target_cache_bytes").unwrap_or_else(|| "Not recorded".into()),
+        )
+    } else if let Some(value) = result.workload_metadata.get("bound_classification") {
+        (
+            "LIMITING FACTOR".into(),
+            match value.as_str() {
+                "compute_bound" => "Compute".into(),
+                "memory_bandwidth_bound" => "Memory bandwidth".into(),
+                _ => value.replace('_', " "),
+            },
+        )
+    } else if let Some(status) = result.workload_metadata.get("cache_discovery_status") {
+        ("CACHE PROFILE".into(), status.replace('_', " "))
+    } else {
+        let count = result.metrics.len();
+        (
+            "MEASUREMENTS".into(),
+            format!("{count} {}", if count == 1 { "output" } else { "outputs" }),
+        )
+    };
     let execution = result
         .workload_metadata
         .get("api")
@@ -3718,6 +3834,138 @@ fn readable_rate(value: f64, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_latency_levels_have_separate_lower_best_results_and_local_instance_comparisons() {
+        let make = |level, value| BenchmarkResult {
+            benchmark_id: format!("cpu.latency.cache.l{level}"),
+            device_id: "cpu:system".into(),
+            elapsed_ns: 1000,
+            metrics: vec![Metric {
+                name: "read_latency".into(),
+                value,
+                unit: "ns".into(),
+                statistics: SampleStatistics::default(),
+            }],
+            workload_metadata: BTreeMap::from([
+                ("working_set_bytes".into(), "2097152".into()),
+                ("target_cache_bytes".into(), "33554432".into()),
+                ("cache_processor_mask".into(), "ffff".into()),
+            ]),
+            device_metadata: BTreeMap::new(),
+        };
+        let current = make(3, 12.0);
+        let previous = make(3, 15.0);
+        assert_eq!(
+            super::best_primary(&[&current, &previous]).unwrap().value,
+            12.0
+        );
+        assert_eq!(
+            super::primary_delta(&current, std::slice::from_ref(&previous), None),
+            "-20.0%"
+        );
+        assert!(
+            super::comparison_metric(&current, "read_latency", &[make(2, 3.0)], None).is_none()
+        );
+        let mut different_instance = previous.clone();
+        different_instance
+            .workload_metadata
+            .insert("cache_processor_mask".into(), "ffff0000".into());
+        assert!(
+            super::comparison_metric(&current, "read_latency", &[different_instance], None)
+                .is_none()
+        );
+        let samples = [make(1, 1.0), make(2, 3.0), current.clone()];
+        assert_eq!(super::component_results(&samples, "cpu:system").len(), 3);
+        assert_eq!(super::result_section(&current), 3);
+        assert!(super::result_settings_note(&current).contains("L3 working set"));
+        assert_eq!(
+            super::result_visuals::facts(&current, current.metrics.first())[0].label,
+            "MEASURED READ LATENCY"
+        );
+    }
+
+    #[test]
+    fn ram_latency_uses_lower_best_and_matching_working_sets() {
+        use gluj_bench_core::{BenchmarkResult, Metric, SampleStatistics};
+        let make = |value| BenchmarkResult {
+            benchmark_id: "cpu.latency.memory".into(),
+            device_id: "memory:system".into(),
+            elapsed_ns: 1000,
+            metrics: vec![Metric {
+                name: "read_latency".into(),
+                value,
+                unit: "ns".into(),
+                statistics: SampleStatistics::default(),
+            }],
+            workload_metadata: std::collections::BTreeMap::from([
+                ("working_set_bytes".into(), "268435456".into()),
+                ("latency_profile_revision".into(), "1".into()),
+            ]),
+            device_metadata: Default::default(),
+        };
+        let current = make(90.0);
+        let previous = make(100.0);
+        let fast = make(80.0);
+        let mut incompatible = make(10.0);
+        incompatible
+            .workload_metadata
+            .insert("working_set_bytes".into(), "536870912".into());
+        assert_eq!(
+            super::best_primary(&[&current, &previous, &fast, &incompatible])
+                .unwrap()
+                .value,
+            80.0
+        );
+        assert_eq!(super::primary_delta(&current, &[previous], None), "-10.0%");
+        assert!(
+            super::comparison_metric(&current, "read_latency", &[incompatible], None).is_none()
+        );
+        assert_eq!(super::result_section(&current), 3);
+        assert!(super::format_metric(90.0, "ns").contains("ns"));
+        assert!(super::result_settings_note(&current).contains("negative Change"));
+        assert_eq!(
+            super::result_visuals::facts(&current, current.metrics.first())[0].label,
+            "MEASURED READ LATENCY"
+        );
+        let mut localized = current.clone();
+        localized.benchmark_id = "cpu.latency.memory.localized".into();
+        localized
+            .workload_metadata
+            .insert("locality_block_bytes".into(), "65536".into());
+        let mut localized_old = localized.clone();
+        localized_old.metrics[0].value = 100.0;
+        assert!(super::ram_latency(&localized));
+        assert_eq!(
+            super::best_primary(&[&localized, &localized_old])
+                .unwrap()
+                .value,
+            90.0
+        );
+        assert_eq!(
+            super::primary_delta(&localized, std::slice::from_ref(&localized_old), None),
+            "-10.0%"
+        );
+        assert!(
+            super::comparison_metric(
+                &localized,
+                "read_latency",
+                std::slice::from_ref(&current),
+                None
+            )
+            .is_none()
+        );
+        assert_eq!(
+            super::component_results(&[current, localized.clone()], "cpu:system").len(),
+            2
+        );
+        localized_old
+            .workload_metadata
+            .insert("locality_block_bytes".into(), "32768".into());
+        assert!(
+            super::comparison_metric(&localized, "read_latency", &[localized_old], None).is_none()
+        );
+    }
+
     use super::{
         benchmark_available_for, benchmark_hardware_supported_for, cache_details, format_metric,
         preferred_gpu_id, result_row,

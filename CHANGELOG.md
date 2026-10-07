@@ -4,7 +4,13 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-07
+
 ### Added
+
+- Separate CPU L1, L2 and L3 read-latency tests, with pinned-core cache-instance sizing, warmed dependent reads, batched timing, cache-level separation checks, cancellation and lower-is-better saved comparisons.
+
+- Two RAM latency tests: fully scattered random-object reads and dependent reads localized within 64 KiB blocks. Both use one pinned core, cache-aware working-set sizing, cancellable preparation/sampling, nanoseconds per access and lower-is-better results. Saved comparisons keep the access patterns separate; original random-read history is preserved.
 
 - Hover inspection for scaling and measured GPU timing graphs, with exact recorded values, sample ranges, dataset sizes and guides to both axes.
 
@@ -62,7 +68,8 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 - Versioned worker CLI and newline-delimited JSON protocol.
 - MIT licensing and automated Windows release packaging.
 
-[Unreleased]: https://github.com/githubdood21/Gluj-Bench/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/githubdood21/Gluj-Bench/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/githubdood21/Gluj-Bench/compare/v0.2.0...v0.3.0
 [0.1.0]: https://github.com/githubdood21/Gluj-Bench/releases/tag/v0.1.0
 
 [0.2.0]: https://github.com/githubdood21/Gluj-Bench/releases/tag/v0.2.0

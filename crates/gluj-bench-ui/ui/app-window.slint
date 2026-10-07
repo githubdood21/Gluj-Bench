@@ -283,7 +283,7 @@ export component MainWindow inherits Window {
                         Text { text: "Select a category and benchmark to measure your hardware."; color: #8f9caf; font-size: 12px; wrap: word-wrap; }
                         Surface { height: 122px; vertical-stretch: 0; VerticalLayout { padding: 14px; spacing: 8px;
                             Label { text: "BENCHMARK CATEGORY"; }
-                            HorizontalLayout { spacing: 7px; Button { text: "CPU bandwidth"; primary: root.suite-description == "Read, write, and copy bandwidth with per-operation sample statistics."; clicked => { root.select-suite("cpu.bandwidth"); } } Button { text: "CPU performance"; primary: root.suite-description == "Aggregate processor throughput, single-thread INT64, and compute-vs-memory diagnosis."; clicked => { root.select-suite("cpu.performance"); } } }
+                            HorizontalLayout { spacing: 7px; Button { text: "CPU memory"; primary: root.suite-description == "Cache/RAM bandwidth and dependent RAM read latency with sample statistics."; clicked => { root.select-suite("cpu.bandwidth"); } } Button { text: "CPU performance"; primary: root.suite-description == "Aggregate processor throughput, single-thread INT64, and compute-vs-memory diagnosis."; clicked => { root.select-suite("cpu.performance"); } } }
                             HorizontalLayout { spacing: 7px; Button { text: "GPU bandwidth"; primary: root.suite-description == "Estimated cache, GPU-local memory, and host-device bandwidth."; clicked => { root.select-suite("gpu.bandwidth"); } } Button { text: "GPU performance"; primary: root.suite-description == "Register throughput, working-set scaling, and capability-gated matrix performance."; clicked => { root.select-suite("gpu.performance"); } } }
                         } }
                         Text { text: root.suite-description; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
@@ -457,7 +457,7 @@ export component MainWindow inherits Window {
                                 spacing: 3px; vertical-stretch: 0;
                                 if index == 0 || root.result-summaries[index - 1].section != row.section: HorizontalLayout {
                                     height: 28px; vertical-stretch: 0; spacing: 12px;
-                                    Label { text: row.bandwidth ? (root.bandwidth-mode == 2 ? "MEMORY / CHANGE" : root.bandwidth-mode == 1 ? "MEMORY / BEST" : "MEMORY / LATEST") : (row.section == 1 ? "CACHE & TRANSFERS" : "COMPUTE"); horizontal-stretch: 1; }
+                                    Label { text: row.bandwidth ? (root.bandwidth-mode == 2 ? "MEMORY / CHANGE" : root.bandwidth-mode == 1 ? "MEMORY / BEST" : "MEMORY / LATEST") : (row.section == 3 ? "LATENCY / LOWER IS BETTER" : row.section == 1 ? "CACHE & TRANSFERS" : "COMPUTE"); horizontal-stretch: 1; }
                                     if row.bandwidth: Label { text: "READ"; width: 80px; horizontal-alignment: right; }
                                     if row.bandwidth: Label { text: "WRITE"; width: 80px; horizontal-alignment: right; }
                                     if row.bandwidth: Label { text: "COPY"; width: 80px; horizontal-alignment: right; }
@@ -517,7 +517,7 @@ export component MainWindow inherits Window {
                                             }
                                         }
                                     }
-                                    if root.result-details-expanded && root.selected-result.measurement-bars.length > 0: Text { text: "Minimum, median and maximum across repeated samples, on one scale. These describe throughput variation within this run."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
+                                    if root.result-details-expanded && root.selected-result.measurement-bars.length > 0: Text { text: "Minimum, median and maximum across repeated samples, on one scale. These describe measurement variation within this run."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded: context-row := HorizontalLayout { spacing: 8px; vertical-stretch: 0;
                                         for fact in root.selected-result.context-facts: Rectangle { width: (context-row.width - 24px) / 4; height: max(80px, context-card.preferred-height + 20px); vertical-stretch: 0; background: #1b3040; border-radius: 8px;
                                             context-card := VerticalLayout { padding: 10px; spacing: 6px; alignment: start;
@@ -620,7 +620,7 @@ export component MainWindow inherits Window {
                                 }
                         }
                     }
-                    if root.result-count > 0: Text { height: max(24px, self.preferred-height); vertical-stretch: 0; text: "Change compares with the selected saved setup. + means higher throughput; — means no comparable metric."; color: #71809a; font-size: 10px; wrap: word-wrap; }
+                    if root.result-count > 0: Text { height: max(24px, self.preferred-height); vertical-stretch: 0; text: "Change compares with the selected saved setup. + means a higher measured value; lower latency is better. — means no comparable metric."; color: #71809a; font-size: 10px; wrap: word-wrap; }
                     Text { height: max(20px, self.preferred-height); text: root.results-file-status; color: #8f9caf; font-size: 10px; wrap: word-wrap; vertical-stretch: 0; }
                     }
                 }

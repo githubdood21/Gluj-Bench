@@ -1,6 +1,8 @@
+mod cache_latency;
 mod compute;
 mod compute_scaling;
 mod kernels;
+mod latency;
 mod matrix_scaling;
 mod topology;
 
@@ -589,6 +591,21 @@ impl BenchmarkProvider for CpuBandwidthProvider {
     fn benchmarks(&self) -> Vec<BenchmarkDescriptor> {
         let mut items: Vec<_> = (1..=3).map(|level| self.cache_descriptor(level)).collect();
         items.push(self.memory_descriptor());
+        for pattern in [latency::Pattern::Localized, latency::Pattern::RandomObjects] {
+            items.push(latency::descriptor(
+                pattern,
+                &self.memory_device,
+                self.topology.as_ref(),
+                self.available_memory,
+            ));
+        }
+        for level in 1..=3 {
+            items.push(cache_latency::descriptor(
+                level,
+                &self.cpu_device,
+                self.topology.as_ref(),
+            ));
+        }
         items.extend(compute::descriptors(
             &self.cpu_device,
             self.topology.is_ok(),
@@ -611,6 +628,26 @@ impl BenchmarkProvider for CpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         Self::validate(config)?;
+        if let Some(level) = cache_latency::level(benchmark_id) {
+            return cache_latency::run(
+                level,
+                config,
+                cancellation,
+                progress,
+                &self.cpu_device,
+                self.topology.as_ref().map_err(Clone::clone)?,
+            );
+        }
+        if let Some(pattern) = latency::Pattern::from_id(benchmark_id) {
+            return latency::run(
+                pattern,
+                config,
+                cancellation,
+                progress,
+                &self.memory_device,
+                self.topology.as_ref().map_err(Clone::clone)?,
+            );
+        }
         if benchmark_id == compute_scaling::ID || benchmark_id == matrix_scaling::ID {
             return compute_scaling::run(
                 benchmark_id,
@@ -731,6 +768,11 @@ mod tests {
         assert!(ids.contains(&"cpu.bandwidth.cache.l1".into()));
         assert!(ids.contains(&"cpu.bandwidth.cache.l3".into()));
         assert!(ids.contains(&"cpu.bandwidth.memory".into()));
+        assert!(ids.contains(&"cpu.latency.memory".into()));
+        assert!(ids.contains(&"cpu.latency.memory.localized".into()));
+        for level in 1..=3 {
+            assert!(ids.contains(&format!("cpu.latency.cache.l{level}")));
+        }
     }
     #[test]
     fn rejects_unstable_sample_counts() {

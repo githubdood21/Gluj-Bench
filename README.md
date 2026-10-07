@@ -11,7 +11,7 @@
 
 Gluj-Bench is a free, vendor-neutral hardware benchmark for Windows. It measures CPU and GPU calculation throughput, cache and memory bandwidth, and how performance changes as a workload grows beyond cache into RAM or VRAM.
 
-Version **0.2.0** focuses on understanding the hardware available to a workload. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
+Version **0.3.0** adds CPU cache/RAM latency, GPU RAM-offload scaling, measured GPU timings, configurable scaling datasets and interactive result graphs. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
 
 ## Get started
 
@@ -71,6 +71,8 @@ Descriptions and tuning guidance start with a short takeaway. Expand their dropd
 | Category | Benchmarks |
 | --- | --- |
 | CPU bandwidth | L1, L2 and L3 data-cache bandwidth; system RAM read, write and copy bandwidth |
+| RAM latency | Random-object and localized dependent reads beyond last-level cache, reported in ns per access |
+| CPU cache latency | Separate L1, L2 and L3 warmed dependent-read measurements in ns per access |
 | CPU performance | FP32/FP64 arithmetic, AVX2/FMA, integer arithmetic, single-thread integer throughput, ASCII scanning, prime sieve, DEFLATE compression/decompression, AES rounds and POPCNT |
 | CPU scaling | AVX2 FP32 vector throughput and blocked FP32 matrix throughput across increasing aggregate datasets |
 | GPU bandwidth | Estimated effective cache bandwidth, GPU-accessible memory read/write/copy bandwidth, and host-device transfers |
@@ -85,6 +87,7 @@ FP8 and sparse matrix families are also represented in capability discovery. The
 - **TOPS:** trillions of operations per second. Floating-point multiply and add count separately, so one FMA per lane counts as two operations. Other operation types have their own definitions in the benchmark details; their rates are not interchangeable.
 - **GB/s:** billions of bytes processed per second. Read, write and copy are distinct operations, with traffic accounting described in the details.
 - **KiB, MiB and GiB:** binary dataset sizes. A GiB is 1,073,741,824 bytes; memory capacities and working sets use these units.
+- **RAM read latency (ns):** average time per dependent read within each sample, summarized by the median across samples. Lower is better; a negative comparison Change means reduced latency.
 - **Sample statistics:** medians, minimums, maximums and variation describe repeated measurements of the same workload.
 
 A throughput result describes that kernel, numeric format, dataset and configuration. It is not a measurement of every task the component can perform.
@@ -106,6 +109,25 @@ Single-thread CPU tests always use one worker. Ordinary CPU cache and RAM bandwi
 The CPU scaling allocation also uses no more than 80% of currently available RAM and leaves at least 2 GiB available. GPU profiles reserve allocation overhead, and the matrix profile accounts for its output buffer. Vulkan storage-buffer limits, alignment and shared-memory limits on integrated GPUs can reduce the actual tested size. Concurrent applications can change memory availability or cause an allocation to fail.
 
 Reduced allocation or activity can improve responsiveness and may reduce heat or power use, but it can also lower measured throughput. GPU timestamp measurements exclude pacing intervals; wall-clock transfer measurements include them. Settings do not impose a temperature limit or guarantee stability.
+
+## CPU cache latency
+
+Under **CPU memory**, **L1/L2/L3 cache read latency** each use one pinned thread and the cache instance attached to that core. Shared cache capacities are not summed across processor complexes. L1 uses 75% of its detected capacity. L2 and L3 aim for four times the preceding level's capacity, capped at 75% of the target cache. A test is unavailable if the working set cannot exceed twice the preceding level's capacity or required topology is missing.
+
+L1 uses a fully randomized dependent pointer chain. L2 and L3 randomize within 64 KiB blocks to reduce address-translation pressure. Two complete traversals warm the data before timing; timed batches contain at least 65,536 dependent reads in complete cycles. Preparation and warmup are excluded, and cancellation remains available. CPU allocation presets do not add workers.
+
+Results show observed nanoseconds per read, with lower values better. Cache residency is inferred from topology and working-set size, not confirmed by hardware counters. Prefetching, translation, shared-cache traffic, SMT siblings and system interference can affect results; these are not exact hardware hit-cycle counts or incremental delays added by one level alone. Results record the working set, cache-instance capacity, processor group/mask and pinned core. Saved comparisons reject incompatible placement, cache instances and working sets.
+
+## RAM latency tests
+
+Under **CPU memory**, two separate latency tests follow dependent pointers on one pinned CPU thread. Every read supplies the next address. Both use one node per detected cache-line stride, a working set of at least 256 MiB and four times the detected aggregate last-level cache, capped at 1 GiB and one-sixteenth of currently available memory while retaining 2 GiB of headroom. If those limits cannot accommodate the working set, the tests report that they are unavailable.
+
+- **RAM random-object latency** shuffles nodes across the entire allocation. It models scattered pointer-based access, including pressure on address translation. It does not time object allocation or application logic. The original `cpu.latency.memory` ID and measurement method are preserved for existing saved results.
+- **RAM read latency (localized)** randomizes nodes within 64 KiB blocks and traverses the blocks in order. Reusing nearby page translations reduces TLB pressure, though block boundaries, cache effects and prefetching still contribute. This uses the localized pointer-chasing strategy documented by [PassMark](https://www.passmark.com/products/performancetest/v12/help/2-Benchmarks/4-Memory-Mark/27-Memory-Latency/memory-latency-help.php), while retaining a RAM-sized allocation. It does not reproduce PassMark's cache-subtest average or provide an interchangeable score. Its ID is `cpu.latency.memory.localized`.
+
+Allocation, pointer-chain construction and one full warmup traversal occur before timing. Every sample covers complete cycles, so large working sets can extend the requested duration. Cancellation is checked during preparation and traversal. CPU core-count and allocation presets do not change this single-thread test.
+
+Both results measure the CPU-to-memory path under their respective conditions, including cache effects, address translation, loop/timer overhead and background interference. Neither is DRAM CAS timing. Memory uses ordinary allocator pages with first touch on the pinned core; no explicit NUMA placement or large-page policy is applied. Compare the same test with matching working sets and processor placement. Saved comparisons keep the patterns separate and reject differences in locality-block size, recorded latency profile and placement settings. The difference between the tests indicates sensitivity to access locality, not isolated TLB-miss cost. Gluj-Bench does not require a vendor SDK or additional privileges for either test.
 
 ## Scaling performance
 
@@ -226,7 +248,7 @@ From the repository root:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 build --workspace --locked
 powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 test --workspace --locked
-powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 clippy --workspace --all-targets -- -D warnings
+powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 clippy --workspace --all-targets '--' -D warnings
 powershell -ExecutionPolicy Bypass -File .\scripts\cargo.ps1 run -p gluj-bench-ui
 ```
 
@@ -234,10 +256,10 @@ Wrapper builds place the executables in `target/x86_64-pc-windows-gnullvm/debug/
 
 VS Code provides a **Gluj-Bench UI (Debug)** launch configuration that builds the workspace before starting the UI. Install the recommended rust-analyzer and CodeLLDB extensions for that workflow.
 
-### Package version 0.2.0
+### Package version 0.3.0
 
 ```powershell
-.\scripts\package-release.ps1 -Version 0.2.0
+.\scripts\package-release.ps1 -Version 0.3.0
 ```
 
 The script verifies the Cargo version, builds the release workspace, and creates the Windows x64 ZIP and SHA-256 checksum under `dist/`. Pass `-SkipBuild` only when the matching release binaries have already been built. The Windows icon and version metadata are embedded in the UI executable; no separate icon installation is required.

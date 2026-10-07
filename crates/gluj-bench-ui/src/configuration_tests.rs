@@ -245,6 +245,10 @@ fn render_configuration_previews() {
         (2, 1280, 820, "chart-guide"),
         (2, 980, 680, "chart-guide-min"),
         (2, 1280, 820, "timing-hover"),
+        (2, 1280, 820, "ram-latency"),
+        (2, 980, 680, "ram-latency-min"),
+        (2, 1280, 820, "cache-latency"),
+        (2, 980, 680, "cache-latency-min"),
     ] {
         app.page = page;
         if page == 2 {
@@ -339,6 +343,72 @@ fn render_configuration_previews() {
                 ]);
             }
             app.result_details_expanded = !name.starts_with("tuning-visuals");
+            if name.starts_with("ram-latency") || name.starts_with("cache-latency") {
+                app.devices = vec![DeviceDescriptor {
+                    id: "cpu:system".into(),
+                    name: "Example CPU / system RAM".into(),
+                    category: DeviceCategory::Cpu,
+                    available: true,
+                    status: "Ready".into(),
+                    properties: BTreeMap::new(),
+                    caches: vec![],
+                }];
+                let benchmark = &mut app.benchmarks[0];
+                benchmark.id = "cpu.latency.memory".into();
+                benchmark.name = "RAM random-object latency".into();
+                benchmark.category = BenchmarkCategory::Memory;
+                benchmark.unit = "ns".into();
+                benchmark.suite_id = "cpu.bandwidth".into();
+                benchmark.supported_device_ids = vec!["memory:system".into()];
+                let result = &mut app.results[0];
+                result.benchmark_id = "cpu.latency.memory".into();
+                result.device_id = "memory:system".into();
+                result.metrics = vec![metric("read_latency", 116.0, "ns")];
+                result.workload_metadata = BTreeMap::from([
+                    ("working_set_bytes".into(), "268435456".into()),
+                    ("thread_count".into(), "1".into()),
+                ]);
+                let mut localized = result.clone();
+                localized.benchmark_id = "cpu.latency.memory.localized".into();
+                localized.metrics[0] = metric("read_latency", 84.0, "ns");
+                localized
+                    .workload_metadata
+                    .insert("locality_block_bytes".into(), "65536".into());
+                let mut localized_descriptor = benchmark.clone();
+                localized_descriptor.id = "cpu.latency.memory.localized".into();
+                localized_descriptor.name = "RAM read latency (localized)".into();
+                app.benchmarks.push(localized_descriptor);
+                app.results.push(localized);
+                if name.starts_with("cache-latency") {
+                    let template = app.results[0].clone();
+                    let descriptor = app.benchmarks[0].clone();
+                    app.results.clear();
+                    app.benchmarks.clear();
+                    for (level, value, bytes, capacity) in [
+                        (1, 1.1, 24576, 32768),
+                        (2, 3.3, 131072, 524288),
+                        (3, 11.4, 2097152, 33554432),
+                    ] {
+                        let mut result = template.clone();
+                        result.benchmark_id = format!("cpu.latency.cache.l{level}");
+                        result.device_id = "cpu:system".into();
+                        result.metrics[0] = metric("read_latency", value, "ns");
+                        result
+                            .workload_metadata
+                            .insert("working_set_bytes".into(), bytes.to_string());
+                        result
+                            .workload_metadata
+                            .insert("target_cache_bytes".into(), capacity.to_string());
+                        let mut benchmark = descriptor.clone();
+                        benchmark.id = result.benchmark_id.clone();
+                        benchmark.name = format!("L{level} cache read latency");
+                        benchmark.category = BenchmarkCategory::Cpu;
+                        app.results.push(result);
+                        app.benchmarks.push(benchmark);
+                    }
+                    app.result_selection = 2;
+                }
+            }
         }
         App::refresh(&window, &app);
         window.set_tuning_details_expanded(name.starts_with("tuning-visuals"));
@@ -366,7 +436,10 @@ fn render_configuration_previews() {
                 .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
                     position: slint::LogicalPosition::new(width as f32 - 100.0, 500.0),
                     delta_x: 0.0,
-                    delta_y: if name.starts_with("chart-") {
+                    delta_y: if name.starts_with("ram-latency") || name.starts_with("cache-latency")
+                    {
+                        -280.0
+                    } else if name.starts_with("chart-") {
                         -850.0
                     } else if name == "timing-hover" {
                         -1350.0
