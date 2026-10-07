@@ -59,9 +59,9 @@ try {
     Copy-Item -LiteralPath $UiBinary, $WorkerBinary -Destination $StageDirectory
     Copy-Item -LiteralPath 'README.md', 'CHANGELOG.md', 'SECURITY.md' -Destination $StageDirectory
     Copy-Item -LiteralPath 'SysInfo.png', 'Benchmarks.png', 'ScalingCompute.png' -Destination $StageDirectory
-    $LogoDirectory = Join-Path $StageDirectory 'design\logo-drafts'
+    $LogoDirectory = Join-Path $StageDirectory 'assets\branding'
     New-Item -ItemType Directory -Force -Path $LogoDirectory | Out-Null
-    Copy-Item -LiteralPath 'design\logo-drafts\loop-chip-g-preview.png' -Destination $LogoDirectory
+    Copy-Item -LiteralPath 'assets\branding\loop-chip-g-preview.png' -Destination $LogoDirectory
     Copy-Item -LiteralPath 'LICENSE', 'NOTICE', 'BRANDING.md' -Destination $StageDirectory
     New-Item -ItemType Directory -Path (Join-Path $StageDirectory 'docs') | Out-Null
     Copy-Item -LiteralPath 'docs\protocol.md' -Destination (Join-Path $StageDirectory 'docs')

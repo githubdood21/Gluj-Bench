@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-GPLv3-3dd6c6)](LICENSE)
 
 <p align="center">
-  <img src="design/logo-drafts/loop-chip-g-preview.png" alt="Gluj-Bench chip and retest-loop logo" width="112">
+  <img src="assets/branding/loop-chip-g-preview.png" alt="Gluj-Bench chip and retest-loop logo" width="112">
 </p>
 
 Gluj-Bench is a free, vendor-neutral hardware benchmark for Windows. It measures CPU and GPU calculation throughput, cache and memory bandwidth, and how performance changes as a workload grows beyond cache into RAM or VRAM.

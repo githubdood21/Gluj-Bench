@@ -13,4 +13,4 @@ VP_VULKANINFO_*.json
 /results.json.*.tmp
 /settings.json
 /settings.json.*.tmp
-design/
+/design/
