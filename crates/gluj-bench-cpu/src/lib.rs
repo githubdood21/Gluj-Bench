@@ -4,6 +4,7 @@ mod compute_scaling;
 mod kernels;
 mod latency;
 mod matrix_scaling;
+mod pacing;
 mod topology;
 
 use gluj_bench_core::{

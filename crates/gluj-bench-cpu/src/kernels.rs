@@ -591,6 +591,7 @@ pub fn measure_parallel_sizes(
     let mut values = Vec::with_capacity(options.sample_count as usize);
     let mut elapsed_total = 0u64;
     let mut sample_passes = passes;
+    let mut cold_pacer = crate::pacing::CpuPacer::current(cancellation);
     for _ in 0..options.sample_count {
         if cancellation.is_cancelled() {
             return Err(BenchmarkError::new(
@@ -601,7 +602,7 @@ pub fn measure_parallel_sizes(
         let wall_ns = if options.preparation == CachePreparation::Cold {
             let mut elapsed = 0u64;
             for _ in 0..sample_passes {
-                elapsed = elapsed.saturating_add(parallel_once(
+                let active_ns = parallel_once(
                     operation,
                     locations,
                     &mut buffers,
@@ -614,7 +615,9 @@ pub fn measure_parallel_sizes(
                         first_touch: false,
                     },
                     cancellation,
-                )?);
+                )?;
+                elapsed = elapsed.saturating_add(active_ns);
+                cold_pacer.account(std::time::Duration::from_nanos(active_ns))?;
             }
             elapsed
         } else {
@@ -659,6 +662,7 @@ fn parallel_once(
     cancellation: &CancellationToken,
 ) -> Result<u64, BenchmarkError> {
     let barrier = Arc::new(Barrier::new(locations.len()));
+    let intensity = gluj_bench_core::cpu_activity_percent();
     let elapsed = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(locations.len());
         for (thread_index, ((source, destination), location)) in buffers
@@ -685,7 +689,16 @@ fn parallel_once(
                     0
                 };
                 barrier.wait();
+                let mut pacer = crate::pacing::CpuPacer::new(
+                    if options.preparation == CachePreparation::Hot {
+                        intensity
+                    } else {
+                        100
+                    },
+                    cancellation,
+                );
                 let start = Instant::now();
+                let idle_before = pacer.idle();
                 let mut remaining = options.passes;
                 while remaining != 0 {
                     if cancellation.is_cancelled() {
@@ -695,6 +708,7 @@ fn parallel_once(
                         ));
                     }
                     let current = remaining.min(options.chunk_passes);
+                    let batch_start = Instant::now();
                     execute_rotated(
                         operation,
                         source,
@@ -704,8 +718,9 @@ fn parallel_once(
                         start_offset,
                     );
                     remaining -= current;
+                    pacer.account(batch_start.elapsed())?;
                 }
-                Ok(start.elapsed().as_nanos().max(1) as u64)
+                Ok(pacer.active_elapsed(start, idle_before).as_nanos().max(1) as u64)
             }));
         }
         handles

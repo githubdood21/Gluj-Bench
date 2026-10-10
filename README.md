@@ -11,7 +11,7 @@
 
 Gluj-Bench is a free, vendor-neutral hardware benchmark for Windows. It measures CPU and GPU calculation throughput, cache and memory bandwidth, and how performance changes as a workload grows beyond cache into RAM or VRAM.
 
-Version **0.3.0** adds CPU cache/RAM latency, GPU RAM-offload scaling, measured GPU timings, configurable scaling datasets and interactive result graphs. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
+Version **0.3.1** adds independent 95%, 99% and 100% workload-intensity controls alongside CPU cache/RAM latency, GPU RAM-offload scaling, measured GPU timings, configurable scaling datasets and interactive result graphs. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
 
 ## Get started
 
@@ -98,13 +98,15 @@ Settings save beside the executable and apply to the next run. Controls are lock
 
 | Setting | Choices / default | Effect |
 | --- | --- | --- |
-| CPU worker allocation | Gentle 50%, Balanced 75% (default), Full 100% | In Automatic mode, selects that share of physical CPU cores, with at least one worker |
-| CPU physical cores | Automatic (default), or an exact count | Uses one pinned worker per selected physical core, excluding SMT siblings; an exact count overrides the percentage preset |
+| CPU workload intensity | 95%, 99% (default), 100% | Controls active work versus idle time on the selected cores; deliberate idle intervals are excluded from measured throughput and latency |
+| CPU physical cores | Automatic (all cores, default), or an exact count | Uses one pinned worker per selected physical core, excluding SMT siblings; independent of workload intensity |
 | Scaling test RAM budget | 20-80% of installed RAM; default 20% | Limits CPU scaling buffers and the system-RAM region of GPU offload profiles |
-| GPU activity pacing | Gentle 50%, Balanced 75% (default), Full 100% | Adds cancellable idle intervals between GPU submissions; reduced modes also target shorter batches |
+| GPU activity pacing | 95%, 99% (default), 100% | Adds cancellable idle intervals between GPU submissions; reduced modes also target shorter batches |
 | GPU scaling VRAM budget | 20-80% of reported GPU memory; default 25% | Limits test-buffer allocation for GPU scaling profiles |
 
 Single-thread CPU tests always use one worker. Ordinary CPU cache and RAM bandwidth tests keep their own dataset sizing; the percentage RAM budget applies to the scaling profiles.
+
+Workload intensity is independent of core count: 95%, 99% and 100% all use the same selected CPU workers. CPU and GPU pacing add idle time equal to approximately 5.3% of active batch time at 95%, 1% at 99%, and none at 100%; actual activity depends on scheduling. CPU workers accumulate about 50 ms of active work before pausing, so very short work phases may finish before a pause is due. Intentional CPU pauses are excluded from reported throughput and read latency, while other timing overhead and interference remain included. Existing saved preset indices map to the new 95%/99%/100% choices. Historical results retain their original recorded settings and are not silently compared with the new CPU pacing policy.
 
 The CPU scaling allocation also uses no more than 80% of currently available RAM and leaves at least 2 GiB available. GPU profiles reserve allocation overhead, and the matrix profile accounts for its output buffer. Vulkan storage-buffer limits, alignment and shared-memory limits on integrated GPUs can reduce the actual tested size. Concurrent applications can change memory availability or cause an allocation to fail.
 
@@ -208,7 +210,7 @@ A local LLM may generate tokens at a rate limited by memory bandwidth. Gluj-Benc
 
 For illustration, an actual LLM workload might deliver **100 tokens/s at 400 W** without a limit and **95 tokens/s at 250 W** with a lower core-frequency limit and unchanged memory clock: 5% less throughput for 37.5% less power. Reported GPU utilization could stay at 100% even while compute waits for memory. These are example numbers, not Gluj-Bench measurements or predicted savings.
 
-Validate the change in the actual application: prompt processing can slow down because it often depends more on compute throughput. Gluj-Bench measures hardware benchmark kernels; it does not optimize LLMs, predict token speeds, measure power or apply clock changes. Note that prefill speeds will see a larger drop in perfomance by doing this, See NVIDIA's [prefill and decode explanation](https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/) for context.
+Validate the change in the actual application: prompt processing can slow down because it often depends more on compute throughput. Gluj-Bench measures hardware benchmark kernels; it does not optimize LLMs, predict token speeds, measure power or apply clock changes. See NVIDIA's [prefill and decode explanation](https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/) for context.
 
 ## Saved results and comparisons
 
@@ -256,10 +258,10 @@ Wrapper builds place the executables in `target/x86_64-pc-windows-gnullvm/debug/
 
 VS Code provides a **Gluj-Bench UI (Debug)** launch configuration that builds the workspace before starting the UI. Install the recommended rust-analyzer and CodeLLDB extensions for that workflow.
 
-### Package version 0.3.0
+### Package version 0.3.1
 
 ```powershell
-.\scripts\package-release.ps1 -Version 0.3.0
+.\scripts\package-release.ps1 -Version 0.3.1
 ```
 
 The script verifies the Cargo version, builds the release workspace, and creates the Windows x64 ZIP and SHA-256 checksum under `dist/`. Pass `-SkipBuild` only when the matching release binaries have already been built. The Windows icon and version metadata are embedded in the UI executable; no separate icon installation is required.

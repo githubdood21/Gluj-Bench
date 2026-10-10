@@ -11,7 +11,10 @@ use miniz_oxide::{deflate::compress_to_vec, inflate::decompress_to_vec};
 use std::{
     collections::BTreeMap,
     hint::black_box,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Instant,
 };
@@ -259,6 +262,7 @@ where
     let mut elapsed_total = 0u64;
     let mut cpu_total = 0u64;
     let mut checksum = 0u64;
+    let mut pacer = crate::pacing::CpuPacer::current(cancellation);
     for sample in 0..config.samples {
         if cancellation.is_cancelled() {
             return Err(BenchmarkError::new(
@@ -273,12 +277,15 @@ where
         });
         let cpu_start = thread_cpu_time_ns();
         let start = Instant::now();
+        let idle_before = pacer.idle();
         let mut operations = 0u64;
         loop {
+            let batch_start = Instant::now();
             let (completed, value) = chunk();
             operations = operations.saturating_add(completed);
             checksum ^= value.rotate_left((operations & 63) as u32);
-            if start.elapsed().as_nanos() >= u128::from(target_ns) {
+            pacer.account(batch_start.elapsed())?;
+            if pacer.active_elapsed(start, idle_before).as_nanos() >= u128::from(target_ns) {
                 break;
             }
             if cancellation.is_cancelled() {
@@ -288,7 +295,7 @@ where
                 ));
             }
         }
-        let elapsed = start.elapsed().as_nanos().max(1) as u64;
+        let elapsed = pacer.active_elapsed(start, idle_before).as_nanos().max(1) as u64;
         let cpu = thread_cpu_time_ns().saturating_sub(cpu_start);
         values.push(operations as f64 * 1e9 / elapsed as f64);
         elapsed_total = elapsed_total.saturating_add(elapsed);
@@ -620,38 +627,53 @@ fn measure_parallel(
         drop(AffinityGuard::pin(location)?);
     }
     let barrier = Arc::new(Barrier::new(locations.len()));
+    let cancelled_all = Arc::new(AtomicBool::new(false));
+    let intensity = gluj_bench_core::cpu_activity_percent();
     let thread_results = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(locations.len());
         for (thread_index, location) in locations.iter().copied().enumerate() {
             let barrier = barrier.clone();
+            let cancelled_all = cancelled_all.clone();
             handles.push(
                 scope.spawn(move || -> Result<Vec<ThreadSample>, BenchmarkError> {
                     let _affinity = AffinityGuard::pin(location)?;
                     let mut state =
                         ThreadWorkload::new(workload, thread_index, large, locations.len());
+                    let mut pacer = crate::pacing::CpuPacer::new(intensity, cancellation);
                     let warmup_start = Instant::now();
                     while warmup_start.elapsed().as_nanos() < u128::from(WARMUP_NS) {
+                        let batch_start = Instant::now();
                         black_box(state.chunk());
-                        if cancellation.is_cancelled() {
-                            return Err(BenchmarkError::new(
-                                "cancelled",
-                                "The benchmark was cancelled.",
-                            ));
+                        if pacer.account(batch_start.elapsed()).is_err() {
+                            cancelled_all.store(true, Ordering::SeqCst);
+                            break;
                         }
+                    }
+                    barrier.wait();
+                    if cancelled_all.load(Ordering::SeqCst) {
+                        return Err(BenchmarkError::new("cancelled", "CPU workload cancelled."));
                     }
                     let mut samples = Vec::with_capacity(sample_count as usize);
                     for _ in 0..sample_count {
                         barrier.wait();
                         let cpu_start = thread_cpu_time_ns();
                         let start = Instant::now();
+                        let idle_before = pacer.idle();
                         let mut operations = 0u64;
                         let mut checksum = 0u64;
                         let mut cancelled = false;
                         loop {
+                            let batch_start = Instant::now();
                             let (count, value) = state.chunk();
                             operations = operations.saturating_add(count);
                             checksum ^= value.rotate_left((operations & 63) as u32);
-                            if start.elapsed().as_nanos() >= u128::from(target_ns) {
+                            if pacer.account(batch_start.elapsed()).is_err() {
+                                cancelled = true;
+                                break;
+                            }
+                            if pacer.active_elapsed(start, idle_before).as_nanos()
+                                >= u128::from(target_ns)
+                            {
                                 break;
                             }
                             if cancellation.is_cancelled() {
@@ -659,13 +681,17 @@ fn measure_parallel(
                                 break;
                             }
                         }
-                        let elapsed_ns = start.elapsed().as_nanos().max(1) as u64;
+                        let elapsed_ns =
+                            pacer.active_elapsed(start, idle_before).as_nanos().max(1) as u64;
                         let cpu_ns = thread_cpu_time_ns().saturating_sub(cpu_start);
-                        barrier.wait();
                         if cancelled {
+                            cancelled_all.store(true, Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                        if cancelled_all.load(Ordering::SeqCst) {
                             return Err(BenchmarkError::new(
                                 "cancelled",
-                                "The benchmark was cancelled.",
+                                "CPU workload cancelled.",
                             ));
                         }
                         samples.push(ThreadSample {
@@ -811,7 +837,7 @@ fn run_parallel(
     let mut workload_metadata = BTreeMap::new();
     workload_metadata.insert("operation_definition".into(), definition.operation.into());
     workload_metadata.insert("kernel_revision".into(), "4".into());
-    workload_metadata.insert("harness_revision".into(), "2".into());
+    workload_metadata.insert("harness_revision".into(), "3".into());
     if let Some(group) = comparison_group(definition.workload) {
         workload_metadata.insert("comparison_group".into(), group.into());
         workload_metadata.insert(

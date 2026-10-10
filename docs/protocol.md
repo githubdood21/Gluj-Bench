@@ -10,6 +10,8 @@ Protocol version 2 requests contain a non-empty request ID:
 
 Supported commands are `devices`, `benchmarks`, `run`, and `cancel`. A run includes its benchmark configuration:
 
+Workload intensity options `cpu_activity_percent` and `gpu_activity_percent` accept 95, 99, or 100 (default 100 for direct worker requests). CPU intensity adds short pauses independently of `cpu_core_limit`; zero or omitted core limit uses all processors selected by `thread_mode`. UI Automatic uses all physical cores. Intentional CPU pauses are excluded from measured rates/latency and results record `cpu_pacing_revision` for comparison compatibility.
+
 ```json
 {"protocol":2,"id":"run-1","command":"run","arguments":{"benchmark_id":"cpu.bandwidth.cache.l1","target_duration_ms":2000,"samples":5}}
 ```
@@ -40,7 +42,7 @@ FP8 and structured-sparse rows remain visible but disabled unless a capability-v
 
 
 ```json
-{"protocol":2,"id":"ram-offload","command":"run","arguments":{"benchmark_id":"gpu.performance.fp32.offload.scaling","target_duration_ms":2000,"samples":5,"options":{"device_id":"gpu:vulkan:<device-uuid>","ram_budget_percent":"20","vram_budget_percent":"25","gpu_activity_percent":"75","ram_offload_percent":"75","dataset_mode":"single","dataset_bytes":"268435456"}}}
+{"protocol":2,"id":"ram-offload","command":"run","arguments":{"benchmark_id":"gpu.performance.fp32.offload.scaling","target_duration_ms":2000,"samples":5,"options":{"device_id":"gpu:vulkan:<device-uuid>","ram_budget_percent":"20","vram_budget_percent":"25","gpu_activity_percent":"99","ram_offload_percent":"75","dataset_mode":"single","dataset_bytes":"268435456"}}}
 ```
 
 `ram_budget_percent` accepts 20–80 (default 20), limiting the host region to that share of installed RAM, the host heap, 80% of available RAM, and available RAM minus 2 GiB, with another 16 MiB reserved for allocation overhead. Any VRAM region respects `vram_budget_percent`, also reserving 16 MiB. `max_working_set_bytes` is an optional total-dataset cap, at least 262144 bytes; it also applies to the ordinary FP32 scaling profile. Sweeps must allow at least three tiers; single-dataset mode requires one valid aligned tier. All offload percentages use the same quarter-region alignment, preserving exact shares and matching tier sizes when their allocation caps match. `arithmetic_iterations` retains the existing FP32 scaling behavior (default 64, clamped to 1–1024).

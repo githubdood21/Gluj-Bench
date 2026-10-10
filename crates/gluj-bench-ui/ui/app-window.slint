@@ -340,15 +340,15 @@ export component MainWindow inherits Window {
                                 Text { text: "MiB uses binary units; 1024 MiB = 1 GiB. Actual sizes follow buffer alignment or matrix shape. A size above the allocation budget needs a smaller dataset or larger budget."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                             }
                             if root.test-is-cpu: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
-                                Label { text: "CPU WORKER ALLOCATION"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.test-cpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cpu", self.current-index); } }
+                                Label { text: "CPU WORKLOAD INTENSITY"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["95%", "99%", "100%"]; current-value: root.test-cpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cpu", self.current-index); } }
                                 Label { text: "CPU PHYSICAL CORES"; }
                                 ComboBox { height: 36px; vertical-stretch: 0; model: root.cpu-core-options; current-value: root.test-core-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cores", self.current-index); } }
-                                Text { text: "An exact count overrides the worker percentage; single-thread tests still use one worker."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                                Text { text: "Core count and workload intensity are independent. Automatic uses all physical cores; single-thread tests still use one worker."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                             }
                             if root.test-is-gpu: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "GPU ACTIVITY"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.test-gpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("gpu", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["95%", "99%", "100%"]; current-value: root.test-gpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("gpu", self.current-index); } }
                             }
                             if root.test-has-ram: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "RAM ALLOCATION BUDGET"; }
@@ -390,14 +390,14 @@ export component MainWindow inherits Window {
                         }
                     }
                     Surface { height: max(190px, settings-panel-1.preferred-height + 36px); vertical-stretch: 0; settings-panel-1 := VerticalLayout { padding: 18px; spacing: 10px;
-                        Text { text: "CPU worker allocation"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
-                        ComboBox { model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.cpu-intensity-name; enabled: !root.running; selected(value) => { root.select-cpu-intensity(self.current-index); } }
-                        Text { text: "Limits the number of workers used by CPU compute, cache, and RAM tests. Reduced modes leave some workers free for other apps and allocate fewer cache-test buffers. Single-thread tests still use one worker; a single-core system cannot reserve a whole core."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "CPU workload intensity"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
+                        ComboBox { model: ["95%", "99%", "100%"]; current-value: root.cpu-intensity-name; enabled: !root.running; selected(value) => { root.select-cpu-intensity(self.current-index); } }
+                        Text { text: "Controls active work versus short idle intervals on the selected cores. 95% adds about 5.3% idle time relative to active work, 99% adds about 1%, and 100% adds no deliberate pauses. It does not change core count. Pauses are excluded from measured throughput and latency; scheduling can affect actual activity."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(190px, settings-panel-2.preferred-height + 36px); vertical-stretch: 0; settings-panel-2 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "CPU physical cores"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
                         ComboBox { model: root.cpu-core-options; current-value: root.cpu-core-name; enabled: !root.running; selected(value) => { root.select-cpu-cores(self.current-index); } }
-                        Text { text: "Choose an exact number of physical cores for multithreaded CPU tests, with one worker per core. This overrides the percentage preset above. Automatic applies that preset to physical cores. Single-thread tests still use one worker. Fewer cores may ease contention and reduce heat or power use; retest to check throughput."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "Choose an exact number of physical cores for multithreaded CPU tests, with one worker per core. Automatic uses all available physical cores. Workload intensity applies independently to those workers. Single-thread and latency tests still use one worker."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(190px, settings-panel-3.preferred-height + 36px); vertical-stretch: 0; settings-panel-3 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "Scaling test RAM budget"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
@@ -406,8 +406,8 @@ export component MainWindow inherits Window {
                     } }
                     Surface { height: max(190px, settings-panel-4.preferred-height + 36px); vertical-stretch: 0; settings-panel-4 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "GPU activity pacing"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
-                        ComboBox { model: ["Gentle · 50%", "Balanced · 75%", "Full · 100%"]; current-value: root.gpu-intensity-name; enabled: !root.running; selected(value) => { root.select-gpu-intensity(self.current-index); } }
-                        Text { text: "Adds idle time between completed GPU work batches. Gentle waits about as long as the batch ran; Balanced adds about one-third as much idle time. These are activity targets, not exact utilization or power limits. GPU work can still reach full load during a burst."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
+                        ComboBox { model: ["95%", "99%", "100%"]; current-value: root.gpu-intensity-name; enabled: !root.running; selected(value) => { root.select-gpu-intensity(self.current-index); } }
+                        Text { text: "Targets near-full GPU activity by adding idle time between completed batches: about 5.3% of active time at 95%, about 1% at 99%, and no deliberate idle time at 100%. Scheduling can affect the actual activity ratio. GPU work can reach full load during each batch; these are not exact utilization or power limits."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(190px, settings-panel-5.preferred-height + 36px); vertical-stretch: 0; settings-panel-5 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "Scaling test VRAM budget"; color: #f4f7fb; font-size: 17px; font-weight: 700; }

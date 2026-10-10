@@ -4,6 +4,16 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-07
+
+### Fixed
+
+- Aligned logo arrowheads with their arcs and centered the lower arc. Updated application icons, the Windows icon, and the README preview in the 2026-10-10 release rebuild.
+
+### Changed
+
+- Replaced workload-intensity presets with 95%, 99% (default), and 100%. CPU intensity now paces active work independently of the physical-core setting; Automatic uses all physical cores. Intentional CPU idle intervals are excluded from measured throughput/latency, and saved comparisons distinguish the new pacing policy. Existing saved preset indices map to the new percentages. RAM offload and memory-budget choices retain their existing values.
+
 ## [0.3.0] - 2026-10-07
 
 ### Added
@@ -68,7 +78,8 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 - Versioned worker CLI and newline-delimited JSON protocol.
 - MIT licensing and automated Windows release packaging.
 
-[Unreleased]: https://github.com/githubdood21/Gluj-Bench/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/githubdood21/Gluj-Bench/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/githubdood21/Gluj-Bench/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/githubdood21/Gluj-Bench/compare/v0.2.0...v0.3.0
 [0.1.0]: https://github.com/githubdood21/Gluj-Bench/releases/tag/v0.1.0
 

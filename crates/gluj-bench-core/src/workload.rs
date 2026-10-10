@@ -1,6 +1,6 @@
 use crate::{BenchmarkConfig, BenchmarkError, CancellationToken};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     time::{Duration, Instant},
 };
 
@@ -11,16 +11,13 @@ pub fn workload_percent(config: &BenchmarkConfig, key: &str) -> Result<u32, Benc
         .map(|value| value.parse::<u32>())
         .transpose()
         .map_err(|_| {
-            BenchmarkError::new(
-                "invalid_config",
-                format!("{key} must be 25, 50, 75, or 100."),
-            )
+            BenchmarkError::new("invalid_config", format!("{key} must be 95, 99, or 100."))
         })?
         .unwrap_or(100);
-    if ![25, 50, 75, 100].contains(&percent) {
+    if ![95, 99, 100].contains(&percent) {
         return Err(BenchmarkError::new(
             "invalid_config",
-            format!("{key} must be 25, 50, 75, or 100."),
+            format!("{key} must be 95, 99, or 100."),
         ));
     }
     Ok(percent)
@@ -103,30 +100,43 @@ pub fn configured_dataset(
 
 thread_local! {
     static GPU_PACING: RefCell<Option<(u32, CancellationToken)>> = const { RefCell::new(None) };
+    static CPU_ACTIVITY: Cell<u32> = const { Cell::new(100) };
 }
 
 // A worker runs one benchmark at a time. Pacing is scoped to its submission thread.
-pub struct WorkloadGuard(Option<(u32, CancellationToken)>);
+pub struct WorkloadGuard {
+    gpu: Option<(u32, CancellationToken)>,
+    cpu: u32,
+}
 
 impl WorkloadGuard {
     pub fn enter(
         config: &BenchmarkConfig,
         cancellation: &CancellationToken,
     ) -> Result<Self, BenchmarkError> {
-        workload_percent(config, "cpu_worker_percent")?;
+        let cpu = workload_percent(config, "cpu_activity_percent")?;
         vram_budget_percent(config)?;
         let percent = workload_percent(config, "gpu_activity_percent")?;
         let old = GPU_PACING.with(|state| state.replace(Some((percent, cancellation.clone()))));
-        Ok(Self(old))
+        let old_cpu = CPU_ACTIVITY.with(|state| state.replace(cpu));
+        Ok(Self {
+            gpu: old,
+            cpu: old_cpu,
+        })
     }
 }
 
 impl Drop for WorkloadGuard {
     fn drop(&mut self) {
         GPU_PACING.with(|state| {
-            state.replace(self.0.take());
+            state.replace(self.gpu.take());
         });
+        CPU_ACTIVITY.with(|state| state.set(self.cpu));
     }
+}
+
+pub fn cpu_activity_percent() -> u32 {
+    CPU_ACTIVITY.with(Cell::get)
 }
 
 pub fn gpu_activity_percent() -> u32 {
@@ -211,21 +221,39 @@ mod tests {
     }
     #[test]
     fn reduced_modes_leave_workers_free_and_add_proportional_idle_time() {
-        assert_eq!(worker_budget(16, 75), 12);
-        assert_eq!(worker_budget(1, 25), 1);
-        assert_eq!(worker_budget(0, 75), 0);
+        assert_eq!(worker_budget(16, 95), 15);
+        assert_eq!(worker_budget(16, 99), 15);
+        assert_eq!(worker_budget(16, 100), 16);
+        assert_eq!(worker_budget(1, 95), 1);
+        assert_eq!(worker_budget(0, 99), 0);
         assert_eq!(
-            idle_duration(Duration::from_millis(30), 75),
-            Duration::from_millis(10)
+            idle_duration(Duration::from_millis(95), 95),
+            Duration::from_millis(5)
         );
         assert_eq!(
-            idle_duration(Duration::from_millis(30), 50),
-            Duration::from_millis(30)
+            idle_duration(Duration::from_millis(99), 99),
+            Duration::from_millis(1)
         );
         assert_eq!(
             idle_duration(Duration::from_millis(30), 100),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn allocation_options_accept_near_full_presets_and_reject_old_values() {
+        for key in ["cpu_activity_percent", "gpu_activity_percent"] {
+            let mut config = BenchmarkConfig::default();
+            assert_eq!(workload_percent(&config, key).unwrap(), 100);
+            for percent in [95, 99, 100] {
+                config.options.insert(key.into(), percent.to_string());
+                assert_eq!(workload_percent(&config, key).unwrap(), percent);
+            }
+            for value in ["0", "25", "50", "75", "94", "96", "101", "invalid"] {
+                config.options.insert(key.into(), value.into());
+                assert!(workload_percent(&config, key).is_err());
+            }
+        }
     }
     #[test]
     fn vram_budget_accepts_only_twenty_to_eighty_percent() {
@@ -250,10 +278,14 @@ mod tests {
         let mut config = BenchmarkConfig::default();
         config
             .options
-            .insert("gpu_activity_percent".into(), "50".into());
+            .insert("gpu_activity_percent".into(), "99".into());
+        config
+            .options
+            .insert("cpu_activity_percent".into(), "95".into());
         let cancellation = CancellationToken::default();
         let guard = WorkloadGuard::enter(&config, &cancellation).unwrap();
-        assert_eq!(gpu_activity_percent(), 50);
+        assert_eq!(gpu_activity_percent(), 99);
+        assert_eq!(cpu_activity_percent(), 95);
         assert_eq!(
             gpu_burst_duration(Duration::from_secs(1)),
             Duration::from_millis(50)
@@ -265,6 +297,7 @@ mod tests {
         );
         drop(guard);
         assert_eq!(gpu_activity_percent(), 100);
+        assert_eq!(cpu_activity_percent(), 100);
         assert_eq!(
             gpu_burst_duration(Duration::from_secs(1)),
             Duration::from_secs(1)

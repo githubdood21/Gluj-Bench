@@ -337,6 +337,7 @@ pub fn run(
     let mut values = Vec::new();
     let mut elapsed_total = 0u64;
     let mut loads_total = 0u64;
+    let mut pacer = crate::pacing::CpuPacer::current(cancellation);
     for sample in 0..config.samples {
         progress(ProgressUpdate {
             fraction: 0.1 + 0.9 * f64::from(sample) / f64::from(config.samples),
@@ -356,9 +357,10 @@ pub fn run(
             check_cancel(cancellation)?;
             let start = Instant::now();
             chain.traverse(cancellation)?;
-            elapsed =
-                elapsed.saturating_add(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+            let active = start.elapsed();
+            elapsed = elapsed.saturating_add(active.as_nanos().min(u128::from(u64::MAX)) as u64);
             loads += chain.nodes as u64;
+            pacer.account(active)?;
             if elapsed >= target {
                 break;
             }

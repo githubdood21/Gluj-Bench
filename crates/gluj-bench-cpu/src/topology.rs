@@ -25,7 +25,7 @@ pub struct CpuTopology {
 }
 
 /// An explicit core limit uses one pinned worker per physical core (no SMT siblings).
-/// Legacy requests retain their existing thread mode and percentage allocation.
+/// Activity intensity is independent of processor selection.
 pub fn selected_workers(
     topology: &CpuTopology,
     config: &gluj_bench_core::BenchmarkConfig,
@@ -71,10 +71,6 @@ pub fn selected_workers(
     };
     locations.sort_unstable();
     locations.dedup();
-    locations.truncate(gluj_bench_core::worker_budget(
-        locations.len(),
-        gluj_bench_core::workload_percent(config, "cpu_worker_percent")?,
-    ));
     Ok(locations)
 }
 
@@ -389,7 +385,12 @@ mod tests {
         assert_eq!(selected_workers(&topology, &config, true).unwrap().len(), 4);
         config
             .options
-            .insert("cpu_worker_percent".into(), "50".into());
+            .insert("cpu_activity_percent".into(), "95".into());
+        assert_eq!(selected_workers(&topology, &config, true).unwrap().len(), 4);
+        assert_eq!(
+            selected_workers(&topology, &config, false).unwrap().len(),
+            2
+        );
         config.options.insert("cpu_core_limit".into(), "2".into());
         assert_eq!(
             selected_workers(&topology, &config, true).unwrap(),

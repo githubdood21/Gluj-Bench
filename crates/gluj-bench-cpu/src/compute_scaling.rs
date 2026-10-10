@@ -201,6 +201,7 @@ fn measure(
     let barrier = Barrier::new(locations.len());
     let failed = AtomicBool::new(false);
     let duration_ns = config.target_duration_ms.saturating_mul(1_000_000) / config.samples as u64;
+    let intensity = gluj_bench_core::cpu_activity_percent();
     let results = thread::scope(|scope| {
         let handles = locations
             .iter()
@@ -227,6 +228,7 @@ fn measure(
                         }));
                     }
                     let (_affinity, mut buffers) = prepared?;
+                    let mut pacer = crate::pacing::CpuPacer::new(intensity, cancellation);
                     let warmup = Instant::now();
                     while warmup.elapsed().as_millis() < 100 && !cancellation.is_cancelled() {
                         if !buffers.sweep(cancellation) {
@@ -237,16 +239,23 @@ fn measure(
                     for _ in 0..config.samples {
                         barrier.wait();
                         let start = Instant::now();
+                        let idle_before = pacer.idle();
                         let mut sweeps = 0_u64;
-                        while start.elapsed().as_nanos() < duration_ns as u128
+                        while pacer.active_elapsed(start, idle_before).as_nanos()
+                            < duration_ns as u128
                             && !cancellation.is_cancelled()
                         {
+                            let batch_start = Instant::now();
                             if !buffers.sweep(cancellation) {
                                 break;
                             }
                             sweeps += 1;
+                            if pacer.account(batch_start.elapsed()).is_err() {
+                                break;
+                            }
                         }
-                        let elapsed = start.elapsed().as_nanos().max(1) as u64;
+                        let elapsed =
+                            pacer.active_elapsed(start, idle_before).as_nanos().max(1) as u64;
                         barrier.wait();
                         let checksum = buffers.checksum();
                         samples.push((sweeps, elapsed, checksum));
@@ -465,7 +474,7 @@ pub fn run(
         ("arithmetic_intensity_operations_per_byte".into(), format!("{:.4}", (2 * REUSE) as f64 / BYTES_PER_ELEMENT as f64)),
         ("thread_count".into(), locations.len().to_string()),
         ("thread_mode".into(), if crate::topology::explicit_core_limit(config) || config.options.get("thread_mode").is_some_and(|s| s == "physical_cores") { "physical_cores" } else { "logical_processors" }.into()),
-        ("cpu_worker_percent".into(), gluj_bench_core::workload_percent(config, "cpu_worker_percent")?.to_string()),
+        ("cpu_activity_percent".into(), gluj_bench_core::workload_percent(config, "cpu_activity_percent")?.to_string()),
         ("affinity".into(), "one_worker_per_selected_logical_processor".into()),
         ("buffer_ownership".into(), "pinned_thread_first_touch; disjoint arrays".into()),
         ("instruction_path".into(), "x86_avx2_fma".into()),

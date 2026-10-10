@@ -294,7 +294,7 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
         settings.vram_budget_percent.to_string().into(),
     );
     options.insert(
-        "cpu_worker_percent".into(),
+        "cpu_activity_percent".into(),
         INTENSITY_PERCENT[settings.cpu_intensity].to_string().into(),
     );
     options.insert(
@@ -303,15 +303,12 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
     );
     if id.starts_with("cpu.") || id.starts_with("memory.") {
         let cores = if settings.cpu_core_limit == 0 {
-            (run.physical_cores * INTENSITY_PERCENT[settings.cpu_intensity] / 100).max(1)
+            run.physical_cores.max(1)
         } else {
             settings.cpu_core_limit.min(run.physical_cores).max(1)
         };
         options.insert("cpu_core_limit".into(), cores.to_string().into());
         options.insert("thread_mode".into(), "physical_cores".into());
-        if settings.cpu_core_limit > 0 {
-            options.insert("cpu_worker_percent".into(), "100".into());
-        }
     }
     if cpu_scaling(id) || gpu_offload(id) {
         options.insert(
@@ -358,11 +355,14 @@ fn configuration_summary(settings: &AppSettings, id: &str) -> String {
     } else {
         parts.push(if settings.cpu_core_limit == 0 {
             format!(
-                "CPU workers {}% (automatic cores)",
+                "CPU activity {}% (all physical cores)",
                 INTENSITY_PERCENT[settings.cpu_intensity]
             )
         } else {
-            format!("{} physical cores", settings.cpu_core_limit)
+            format!(
+                "{} physical cores · CPU activity {}%",
+                settings.cpu_core_limit, INTENSITY_PERCENT[settings.cpu_intensity]
+            )
         });
     }
     if cpu_scaling(id) || gpu_offload(id) {
@@ -381,8 +381,8 @@ fn configuration_summary(settings: &AppSettings, id: &str) -> String {
     parts.join(" · ")
 }
 
-const INTENSITY_PERCENT: [u32; 3] = [50, 75, 100];
-const INTENSITY_NAMES: [&str; 3] = ["Gentle · 50%", "Balanced · 75%", "Full · 100%"];
+const INTENSITY_PERCENT: [u32; 3] = [95, 99, 100];
+const INTENSITY_NAMES: [&str; 3] = ["95%", "99%", "100%"];
 const VRAM_BUDGET_OPTIONS: [u32; 8] = [20, 25, 30, 40, 50, 60, 70, 80];
 
 fn settings_path() -> PathBuf {
@@ -462,7 +462,7 @@ impl App {
             Err(error) => {
                 app.settings_writable = false;
                 app.settings_status = format!(
-                    "Using Balanced defaults. Could not load settings.json: {error}. Existing file preserved."
+                    "Using 99% allocation defaults. Could not load settings.json: {error}. Existing file preserved."
                 );
             }
         }
@@ -1080,7 +1080,7 @@ impl App {
         window
             .set_vram_budget_name(format!("{}% of VRAM", app.settings.vram_budget_percent).into());
         window.set_ram_budget_name(format!("{}% of RAM", app.settings.ram_budget_percent).into());
-        let mut core_options = vec![SharedString::from("Automatic · use allocation preset")];
+        let mut core_options = vec![SharedString::from("Automatic · all physical cores")];
         core_options.extend((1..=app.physical_core_count()).map(|n| {
             SharedString::from(format!(
                 "{n} physical core{}",
@@ -1155,7 +1155,7 @@ impl App {
         window.set_settings_status(app.settings_status.clone().into());
         window.set_load_description(
             format!(
-                "CPU workers: {}% · GPU activity target: {}%",
+                "CPU activity target: {}% · GPU activity target: {}%",
                 INTENSITY_PERCENT[app.settings.cpu_intensity],
                 INTENSITY_PERCENT[app.settings.gpu_intensity]
             )
@@ -1775,11 +1775,16 @@ fn result_load_percent(result: &BenchmarkResult) -> u32 {
     let key = if component_family(result) == "gpu" {
         "gpu_activity_percent"
     } else {
-        "cpu_worker_percent"
+        "cpu_activity_percent"
     };
     result
         .workload_metadata
         .get(key)
+        .or_else(|| {
+            (key == "cpu_activity_percent")
+                .then(|| result.workload_metadata.get("cpu_worker_percent"))
+                .flatten()
+        })
         .and_then(|value| value.parse().ok())
         .unwrap_or(100)
 }
@@ -1826,7 +1831,7 @@ fn result_settings_note(result: &BenchmarkResult) -> String {
     }
     if ram_latency(result) {
         return format!(
-            "One pinned CPU thread; CPU core-allocation presets do not change this test. Working set: {}. {} Lower nanoseconds per read is better; a negative Change means latency decreased. Measures CPU-to-memory access, not DRAM CAS timing.",
+            "One pinned CPU thread regardless of core-count settings; intensity pauses are outside the measured reads. Working set: {}. {} Lower nanoseconds per read is better; a negative Change means latency decreased. Measures CPU-to-memory access, not DRAM CAS timing.",
             metadata_size(result, "working_set_bytes").unwrap_or_else(|| "not recorded".into()),
             if result.benchmark_id == "cpu.latency.memory.localized" {
                 "Randomized within 64 KiB blocks to reduce translation overhead; not a PassMark-equivalent score."
@@ -1839,7 +1844,7 @@ fn result_settings_note(result: &BenchmarkResult) -> String {
     let target = if component_family(result) == "gpu" {
         "GPU activity target"
     } else {
-        "CPU worker allocation"
+        "CPU activity target"
     };
     let mut note = format!(
         "Recorded settings: {target} {load}%. Reduced intensity can lower measured throughput. Compare runs with matching settings."
@@ -1956,6 +1961,7 @@ fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bo
             "matrix_tile_reuse",
             "compute_profile_revision",
             "latency_profile_revision",
+            "cpu_pacing_revision",
         ]
         .iter()
         .all(|key| left.workload_metadata.get(*key) == right.workload_metadata.get(*key))

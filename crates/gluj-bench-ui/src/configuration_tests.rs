@@ -102,6 +102,34 @@ fn global_defaults_overrides_and_queue_snapshots_are_independent() {
 }
 
 #[test]
+fn saved_preset_indices_map_to_intensity_independently_of_core_count() {
+    for (index, percent) in [(0, 95), (1, 99), (2, 100)] {
+        let settings: AppSettings = serde_json::from_str(&format!(
+            "{{\"cpu_intensity\":{index},\"gpu_intensity\":{index}}}"
+        ))
+        .unwrap();
+        let mut run = QueuedRun {
+            benchmark_id: "cpu.performance.integer.i64".into(),
+            settings,
+            gpu_id: None,
+            physical_cores: 16,
+        };
+        let options = run_options(&run);
+        assert_eq!(options["cpu_activity_percent"], percent.to_string());
+        assert_eq!(options["gpu_activity_percent"], percent.to_string());
+        assert_eq!(options["cpu_core_limit"], "16");
+        run.settings.cpu_core_limit = 8;
+        let options = run_options(&run);
+        assert_eq!(options["cpu_activity_percent"], percent.to_string());
+        assert_eq!(options["cpu_core_limit"], "8");
+        run.benchmark_id = "gpu.performance.fp32.offload.scaling".into();
+        assert_eq!(run_options(&run)["ram_offload_percent"], "75");
+    }
+    assert_eq!(INTENSITY_PERCENT[AppSettings::default().cpu_intensity], 99);
+    assert_eq!(INTENSITY_PERCENT[AppSettings::default().gpu_intensity], 99);
+}
+
+#[test]
 fn result_history_keeps_offload_shares_and_datasets_separate() {
     use gluj_bench_core::SampleStatistics;
     let result = |percent: &str, bytes: &str| BenchmarkResult {

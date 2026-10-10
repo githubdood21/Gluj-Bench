@@ -1,5 +1,13 @@
 # Ideas for later
 
+## Logo arrow alignment
+
+Completed for the rebuilt 0.3.1 release on 2026-10-10.
+
+- Aligned both arrowheads with the tangents of their arcs and centered the lower arc around the chip.
+- Regenerated all ten PNG icon sizes, the Windows ICO, and the README branding preview from the corrected SVG.
+- Verified the small-size rendering and all ten ICO entries; the UI build passed.
+
 ## Automatic CPU core-count sweep
 
 Accepted as a small automated feature idea; not implemented or scheduled.

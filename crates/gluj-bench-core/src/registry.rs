@@ -49,10 +49,20 @@ impl BenchmarkRegistry {
                 .any(|benchmark| benchmark.id == benchmark_id)
             {
                 let mut result = provider.run(benchmark_id, config, cancellation, progress)?;
-                for key in ["cpu_worker_percent", "gpu_activity_percent"] {
+                for key in ["cpu_activity_percent", "gpu_activity_percent"] {
                     result.workload_metadata.insert(
                         key.into(),
                         crate::workload_percent(config, key)?.to_string(),
+                    );
+                }
+                if benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory.") {
+                    result
+                        .workload_metadata
+                        .insert("cpu_pacing_revision".into(), "1".into());
+                    result.workload_metadata.insert(
+                        "cpu_pacing_timing".into(),
+                        "intentional idle intervals excluded from measured rates and latency"
+                            .into(),
                     );
                 }
                 if benchmark_id.starts_with("gpu.") && benchmark_id.ends_with(".scaling") {
