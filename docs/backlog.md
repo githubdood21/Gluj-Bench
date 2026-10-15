@@ -8,6 +8,15 @@ Completed for the rebuilt 0.3.1 release on 2026-10-10.
 - Regenerated all ten PNG icon sizes, the Windows ICO, and the README branding preview from the corrected SVG.
 - Verified the small-size rendering and all ten ICO entries; the UI build passed.
 
+## Optional SMT support for CPU benchmarks
+
+Requested on 2026-10-10; not implemented or scheduled. This is a separate, larger follow-up to the configurable compute redesign.
+
+- Add an explicit option to use SMT / Hyper-Threading siblings on supported CPUs, alongside the current physical-core-only allocation.
+- Define how selected physical cores map to sibling workers, including processor groups and CPUs without SMT. Update affinity, cache-sharing budgets and per-worker working-set sizing together.
+- Record the thread policy, actual worker count and placement in results, and keep physical-core and SMT configurations distinct in saved comparisons.
+- Validate throughput, cancellation and cache/memory sizing on AMD and Intel hardware before extending the option across CPU workloads. Keep the beginner automatic choices on physical cores until this work is implemented and verified.
+
 ## Automatic CPU core-count sweep
 
 Accepted as a small automated feature idea; not implemented or scheduled.

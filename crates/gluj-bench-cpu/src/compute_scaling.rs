@@ -31,24 +31,67 @@ pub fn matrix_descriptor(
 ) -> BenchmarkDescriptor {
     let mut descriptor = descriptor(device, topology_available);
     descriptor.id = crate::matrix_scaling::ID.into();
-    descriptor.name = "AVX2 FP32 matrix compute scaling".into();
+    descriptor.name = "AVX2 FP32 matrix compute".into();
     descriptor.workload =
-        "Cache-blocked FP32 matrix multiplication: 32 input rows and increasing weight matrices"
-            .into();
+        "CPU matrix calculations with automatic or fully custom data sizes".into();
     descriptor.display_order = 12;
     descriptor
         .metadata
         .insert("kernel_revision".into(), "avx2-matrix-1".into());
     descriptor
 }
+pub fn integer_descriptor(
+    device: &DeviceDescriptor,
+    topology_available: bool,
+) -> BenchmarkDescriptor {
+    let mut item = compute::descriptors(device, topology_available)
+        .into_iter()
+        .find(|item| item.id == crate::integer_scaling::ID)
+        .unwrap();
+    item.workload = "64-bit wrapping multiply/add with register, cache, RAM or custom data".into();
+    item.metadata
+        .insert("kernel_revision".into(), "int64-streaming-1".into());
+    item.metadata
+        .insert("profile_axis".into(), "aggregate_working_set_bytes".into());
+    item.metadata.insert(
+        "compute_reference_benchmark".into(),
+        crate::integer_scaling::ID.into(),
+    );
+    item
+}
 
 enum WorkBuffers {
     Vector(Buffers),
     Matrix(crate::matrix_scaling::Buffers),
+    Ascii(crate::ascii_scaling::Buffers),
+    Integer(crate::integer_scaling::Buffers),
+}
+#[derive(Clone, Copy)]
+pub(crate) enum Kernel {
+    Vector,
+    Matrix,
+    Ascii,
+    Integer,
 }
 impl WorkBuffers {
-    fn new(elements: usize, worker: usize, matrix: bool) -> Result<Self, BenchmarkError> {
-        if matrix {
+    fn new(
+        elements: usize,
+        worker: usize,
+        kernel: Kernel,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, BenchmarkError> {
+        if matches!(kernel, Kernel::Integer) {
+            Ok(Self::Integer(crate::integer_scaling::Buffers::new(
+                elements,
+                worker,
+                cancellation,
+            )?))
+        } else if matches!(kernel, Kernel::Ascii) {
+            Ok(Self::Ascii(crate::ascii_scaling::Buffers::new(
+                elements,
+                cancellation,
+            )?))
+        } else if matches!(kernel, Kernel::Matrix) {
             Ok(Self::Matrix(crate::matrix_scaling::Buffers::new(
                 elements, worker,
             )?))
@@ -63,10 +106,14 @@ impl WorkBuffers {
                 true
             }
             Self::Matrix(buffers) => buffers.sweep(cancellation),
+            Self::Ascii(buffers) => buffers.sweep(cancellation),
+            Self::Integer(buffers) => buffers.sweep(cancellation),
         }
     }
     fn checksum(&self) -> u64 {
         match self {
+            Self::Integer(buffers) => buffers.checksum(),
+            Self::Ascii(buffers) => buffers.checksum(),
             Self::Matrix(buffers) => buffers.checksum(),
             Self::Vector(buffers) => {
                 u64::from(black_box(buffers.output[0]).to_bits())
@@ -82,9 +129,9 @@ pub fn descriptor(device: &DeviceDescriptor, topology_available: bool) -> Benchm
         .find(|d| d.id == REFERENCE)
         .expect("AVX2 reference is registered");
     descriptor.id = ID.into();
-    descriptor.name = "AVX2 FP32 vector compute scaling".into();
+    descriptor.name = "AVX2 FP32 vector compute".into();
     descriptor.workload =
-        "AVX2/FMA throughput over two input arrays and one output array, from cache to RAM".into();
+        "CPU vector calculations with automatic or fully custom data sizes".into();
     descriptor.display_order = 11;
     descriptor.metadata = BTreeMap::from([
         ("profile_axis".into(), "aggregate_working_set_bytes".into()),
@@ -100,18 +147,289 @@ pub fn descriptor(device: &DeviceDescriptor, topology_available: bool) -> Benchm
 }
 
 fn sizes(maximum: u64, workers: usize) -> Vec<u64> {
-    let alignment = BLOCK as u64 * BYTES_PER_ELEMENT * workers as u64;
+    array_sizes(maximum, workers, BYTES_PER_ELEMENT)
+}
+fn array_sizes(maximum: u64, workers: usize, bytes_per_element: u64) -> Vec<u64> {
+    let alignment = BLOCK as u64 * bytes_per_element * workers as u64;
     let maximum = maximum / alignment * alignment;
-    let mut size = 1024 * BYTES_PER_ELEMENT * workers as u64;
+    let mut size = (1024 * bytes_per_element * workers as u64).min(maximum);
     let mut result = Vec::new();
     while size < maximum {
         result.push(size);
         size = size.saturating_mul(2);
     }
-    if maximum >= 1024 * BYTES_PER_ELEMENT * workers as u64 {
+    if maximum >= alignment {
         result.push(maximum);
     }
     result
+}
+
+// Divide each cache instance among its selected workers. Equal-sized buffers
+// use the smallest share, leaving 25% capacity as headroom.
+fn cache_dataset(
+    topology: &CpuTopology,
+    workers: &[ProcessorLocation],
+    level: u8,
+) -> Result<u64, BenchmarkError> {
+    cache_dataset_aligned(topology, workers, level, BLOCK as u64 * BYTES_PER_ELEMENT)
+}
+pub(crate) fn cache_dataset_aligned(
+    topology: &CpuTopology,
+    workers: &[ProcessorLocation],
+    level: u8,
+    alignment: u64,
+) -> Result<u64, BenchmarkError> {
+    if workers.is_empty() {
+        return Err(BenchmarkError::new(
+            "cache_unavailable",
+            "No selected CPU workers.",
+        ));
+    }
+    let mut per_worker = u64::MAX;
+    for worker in workers {
+        let target = topology
+            .cache_targets
+            .iter()
+            .find(|target| {
+                target.descriptor.level == level
+                    && target.group == worker.group
+                    && target.mask & (1usize << worker.index) != 0
+                    && matches!(
+                        target.descriptor.kind,
+                        gluj_bench_core::CacheKind::Data | gluj_bench_core::CacheKind::Unified
+                    )
+            })
+            .ok_or_else(|| {
+                BenchmarkError::new(
+                    "cache_unavailable",
+                    format!("L{level} data cache was not detected for every selected worker."),
+                )
+            })?;
+        let sharing = workers
+            .iter()
+            .filter(|other| {
+                other.group == target.group && target.mask & (1usize << other.index) != 0
+            })
+            .count() as u64;
+        per_worker = per_worker.min(target.descriptor.size_bytes / 4 * 3 / sharing);
+    }
+    let bytes = per_worker / alignment * alignment * workers.len() as u64;
+    if bytes == 0 {
+        return Err(BenchmarkError::new(
+            "cache_unavailable",
+            "Cache capacity cannot accommodate the vector kernel.",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub fn cache_previews(descriptor: &mut BenchmarkDescriptor, topology: &CpuTopology) {
+    let matrix = descriptor.id == crate::matrix_scaling::ID;
+    let alignment = if descriptor.id == crate::integer_scaling::ID {
+        crate::integer_scaling::BLOCK_ELEMENTS * crate::integer_scaling::BYTES_PER_ELEMENT
+    } else {
+        BLOCK as u64 * BYTES_PER_ELEMENT
+    };
+    for level in 1..=3 {
+        let sizes = (1..=topology.physical_cores.len())
+            .map(|count| {
+                cache_dataset_aligned(
+                    topology,
+                    &topology.physical_cores[..count],
+                    level,
+                    alignment,
+                )
+                .map(|bytes| {
+                    let bytes = if matrix {
+                        crate::matrix_scaling::bytes(crate::matrix_scaling::dimension_for_bytes(
+                            bytes / count as u64,
+                        )) * count as u64
+                    } else {
+                        bytes
+                    };
+                    bytes.to_string()
+                })
+                .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        descriptor
+            .metadata
+            .insert(format!("cache_l{level}_dataset_sizes"), sizes);
+    }
+    if matrix {
+        let sizes = (1..=topology.physical_cores.len())
+            .map(|count| {
+                matrix_compute_target(topology, &topology.physical_cores[..count]).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        descriptor
+            .metadata
+            .insert("automatic_compute_dataset_sizes".into(), sizes);
+    }
+}
+
+fn matrix_compute_target(topology: &CpuTopology, workers: &[ProcessorLocation]) -> u64 {
+    cache_dataset(topology, workers, 2)
+        .unwrap_or(256 * 1024 * workers.len() as u64)
+        .max(crate::matrix_scaling::bytes(32) * workers.len() as u64)
+}
+
+fn matrix_dataset(
+    config: &BenchmarkConfig,
+    limit: u64,
+    topology: &CpuTopology,
+    workers: &[ProcessorLocation],
+) -> Result<(u64, bool), BenchmarkError> {
+    let preset = config
+        .options
+        .get("matrix_preset")
+        .map(String::as_str)
+        .unwrap_or("legacy");
+    if preset == "legacy" {
+        return gluj_bench_core::configured_dataset(config, limit);
+    }
+    let mode = config
+        .options
+        .get("dataset_mode")
+        .map(String::as_str)
+        .unwrap_or("single");
+    if !["single", "sweep", "automatic"].contains(&mode) {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Matrix dataset mode must be single or sweep.",
+        ));
+    }
+    let requested = match preset {
+        "compute" => matrix_compute_target(topology, workers).min(limit),
+        "ram" => limit,
+        "l1" | "l2" | "l3" => {
+            let level = preset.as_bytes()[1] - b'0';
+            let target = cache_dataset(topology, workers, level)?;
+            let dimension =
+                crate::matrix_scaling::dimension_for_bytes(target / workers.len() as u64);
+            if dimension < 32 {
+                return Err(BenchmarkError::new(
+                    "cache_unavailable",
+                    "The selected cache cannot fit the minimum matrix shape.",
+                ));
+            }
+            crate::matrix_scaling::bytes(dimension) * workers.len() as u64
+        }
+        "custom" => config
+            .options
+            .get("dataset_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                BenchmarkError::new(
+                    "invalid_config",
+                    "Custom matrix size must be a positive byte count.",
+                )
+            })?,
+        _ => {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unknown matrix data preset.",
+            ));
+        }
+    };
+    let minimum = crate::matrix_scaling::bytes(32) * workers.len() as u64;
+    if requested < minimum {
+        return Err(BenchmarkError::new(
+            "insufficient_memory",
+            format!("Matrix dataset must be at least {minimum} bytes for the selected workers."),
+        ));
+    }
+    if requested > limit {
+        return Err(BenchmarkError::new(
+            "dataset_exceeds_budget",
+            format!(
+                "Requested matrix dataset is {requested} bytes; the RAM budget allows {limit} bytes."
+            ),
+        ));
+    }
+    Ok((requested, mode == "single"))
+}
+
+fn vector_dataset(
+    config: &BenchmarkConfig,
+    limit: u64,
+    topology: &CpuTopology,
+    workers: &[ProcessorLocation],
+) -> Result<(u64, bool), BenchmarkError> {
+    array_dataset(
+        config,
+        limit,
+        topology,
+        workers,
+        "vector_preset",
+        BLOCK as u64 * BYTES_PER_ELEMENT,
+    )
+}
+fn array_dataset(
+    config: &BenchmarkConfig,
+    limit: u64,
+    topology: &CpuTopology,
+    workers: &[ProcessorLocation],
+    preset_key: &str,
+    alignment: u64,
+) -> Result<(u64, bool), BenchmarkError> {
+    let mode = config
+        .options
+        .get("dataset_mode")
+        .map(String::as_str)
+        .unwrap_or("automatic");
+    if !["automatic", "single", "sweep"].contains(&mode) {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Dataset mode must be automatic, single, or sweep.",
+        ));
+    }
+    let preset = config
+        .options
+        .get(preset_key)
+        .map(String::as_str)
+        .unwrap_or("legacy");
+    let requested = match preset {
+        "legacy" => return gluj_bench_core::configured_dataset(config, limit),
+        "ram" => limit,
+        "l1" => cache_dataset_aligned(topology, workers, 1, alignment)?,
+        "l2" => cache_dataset_aligned(topology, workers, 2, alignment)?,
+        "l3" => cache_dataset_aligned(topology, workers, 3, alignment)?,
+        "custom" => config
+            .options
+            .get("dataset_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                BenchmarkError::new(
+                    "invalid_config",
+                    "Custom dataset size must be a positive byte count.",
+                )
+            })?,
+        _ => {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unknown CPU arithmetic data preset.",
+            ));
+        }
+    };
+    let minimum = alignment * workers.len() as u64;
+    if requested < minimum {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            format!("Dataset must be at least {minimum} bytes for the selected workers."),
+        ));
+    }
+    if requested > limit {
+        return Err(BenchmarkError::new(
+            "dataset_exceeds_budget",
+            format!(
+                "Requested dataset is {requested} bytes; the current RAM budget allows {limit} bytes."
+            ),
+        ));
+    }
+    Ok((requested, mode == "single"))
 }
 
 struct Buffers {
@@ -171,32 +489,44 @@ unsafe fn vector_sweep(a: &[f32], b: &[f32], output: &mut [f32]) {
     }
 }
 
-fn measure(
+pub(crate) fn measure(
     locations: &[ProcessorLocation],
     bytes: u64,
     config: &BenchmarkConfig,
     cancellation: &CancellationToken,
-    matrix: bool,
+    kernel: Kernel,
 ) -> Result<(Vec<f64>, Vec<f64>, u64, u64), BenchmarkError> {
+    let matrix = matches!(kernel, Kernel::Matrix);
+    let ascii = matches!(kernel, Kernel::Ascii);
+    let bytes_per_element = if matches!(kernel, Kernel::Integer) {
+        crate::integer_scaling::BYTES_PER_ELEMENT
+    } else {
+        BYTES_PER_ELEMENT
+    };
     let elements = if matrix {
         crate::matrix_scaling::dimension_for_bytes(bytes / locations.len() as u64)
     } else {
-        usize::try_from(bytes / locations.len() as u64 / BYTES_PER_ELEMENT).map_err(|_| {
-            BenchmarkError::new(
-                "allocation_too_large",
-                "Working set exceeds the address range.",
-            )
-        })?
+        usize::try_from(bytes / locations.len() as u64 / if ascii { 1 } else { bytes_per_element })
+            .map_err(|_| {
+                BenchmarkError::new(
+                    "allocation_too_large",
+                    "Working set exceeds the address range.",
+                )
+            })?
     };
     let operations_per_sweep = if matrix {
         crate::matrix_scaling::operations(elements)
+    } else if ascii {
+        elements as u64 / 64
     } else {
         elements as u64 * 2 * REUSE
     };
     let traffic_per_sweep = if matrix {
         crate::matrix_scaling::traffic(elements)
+    } else if ascii {
+        elements as u64
     } else {
-        elements as u64 * BYTES_PER_ELEMENT
+        elements as u64 * bytes_per_element
     };
     let barrier = Barrier::new(locations.len());
     let failed = AtomicBool::new(false);
@@ -211,7 +541,7 @@ fn measure(
                 scope.spawn(move || -> Result<Vec<(u64, u64, u64)>, BenchmarkError> {
                     let prepared = (|| {
                         let affinity = AffinityGuard::pin(*location)?;
-                        let buffers = WorkBuffers::new(elements, index, matrix)?;
+                        let buffers = WorkBuffers::new(elements, index, kernel, cancellation)?;
                         Ok::<_, BenchmarkError>((affinity, buffers))
                     })();
                     if prepared.is_err() {
@@ -306,8 +636,24 @@ pub fn run(
     topology: &CpuTopology,
 ) -> Result<BenchmarkResult, BenchmarkError> {
     let matrix = id == crate::matrix_scaling::ID;
+    let integer = id == crate::integer_scaling::ID;
+    let reference_id = if integer {
+        crate::integer_scaling::ID
+    } else {
+        REFERENCE
+    };
+    let label = if integer { "INT64" } else { "AVX2 FP32" };
+    let preset_key = if integer {
+        "int64_preset"
+    } else if matrix {
+        "matrix_preset"
+    } else {
+        "vector_preset"
+    };
     let descriptor = if matrix {
         matrix_descriptor(device, true)
+    } else if integer {
+        integer_descriptor(device, true)
     } else {
         descriptor(device, true)
     };
@@ -316,6 +662,41 @@ pub fn run(
             "benchmark_unavailable",
             descriptor.unavailable_reason,
         ));
+    }
+    if !matrix
+        && config
+            .options
+            .get(preset_key)
+            .map(String::as_str)
+            .unwrap_or(if integer { "register" } else { "legacy" })
+            == "register"
+    {
+        let mut result = compute::run(
+            reference_id,
+            config,
+            cancellation,
+            progress,
+            topology.representative,
+            device,
+            topology,
+        )?;
+        result.benchmark_id = id.into();
+        result
+            .workload_metadata
+            .insert(preset_key.into(), "register".into());
+        result
+            .workload_metadata
+            .insert("dataset_mode".into(), "register".into());
+        result.workload_metadata.insert(
+            "working_set_definition".into(),
+            "register-resident arithmetic; no streaming arrays".into(),
+        );
+        if integer {
+            result
+                .workload_metadata
+                .insert("data_type".into(), "i64".into());
+        }
+        return Ok(result);
     }
     let locations = crate::topology::selected_workers(topology, config, true)?;
     if locations.is_empty() {
@@ -361,16 +742,42 @@ pub fn run(
     }
     let maximum = allocation_budget(system.total_memory(), available, ram_percent, requested_mib);
 
-    let (maximum, single_dataset) = gluj_bench_core::configured_dataset(config, maximum)?;
+    let allocation_limit = maximum;
+    let (maximum, single_dataset) = if matrix {
+        matrix_dataset(config, maximum, topology, &locations)?
+    } else if integer {
+        array_dataset(
+            config,
+            maximum,
+            topology,
+            &locations,
+            preset_key,
+            crate::integer_scaling::BLOCK_ELEMENTS * crate::integer_scaling::BYTES_PER_ELEMENT,
+        )?
+    } else {
+        vector_dataset(config, maximum, topology, &locations)?
+    };
     let mut tiers = if matrix {
         crate::matrix_scaling::sizes(maximum, locations.len())
+    } else if integer {
+        array_sizes(
+            maximum,
+            locations.len(),
+            crate::integer_scaling::BYTES_PER_ELEMENT,
+        )
     } else {
         sizes(maximum, locations.len())
     };
     if single_dataset {
         tiers = tiers.last().copied().into_iter().collect();
     }
-    if tiers.len() < if single_dataset { 1 } else { 3 } {
+    if tiers.len()
+        < if single_dataset || !matrix || config.options.contains_key("matrix_preset") {
+            1
+        } else {
+            3
+        }
+    {
         return Err(BenchmarkError::new(
             "insufficient_memory",
             "Not enough free RAM for a CPU scaling sweep.",
@@ -382,10 +789,10 @@ pub fn run(
     progress(ProgressUpdate {
         fraction: 0.0,
         phase: "cpu_compute_reference".into(),
-        message: "Measuring register-resident AVX2 FP32 throughput".into(),
+        message: format!("Measuring register-resident {label} throughput"),
     });
     let initial = compute::run(
-        REFERENCE,
+        reference_id,
         &ref_config,
         cancellation,
         &mut quiet,
@@ -401,20 +808,33 @@ pub fn run(
             fraction: 0.05 + 0.85 * index as f64 / tiers.len() as f64,
             phase: if matrix {
                 "cpu_matrix_scaling"
+            } else if integer {
+                "cpu_integer_scaling"
             } else {
                 "cpu_vector_scaling"
             }
             .into(),
             message: format!(
-                "AVX2 FP32: {:.2} MiB total, {:.2} KiB per worker ({}/{})",
+                "{label}: {:.2} MiB total, {:.2} KiB per worker ({}/{})",
                 *bytes as f64 / MIB as f64,
                 *bytes as f64 / locations.len() as f64 / 1024.0,
                 index + 1,
                 tiers.len()
             ),
         });
-        let (compute, bandwidth, time, hash) =
-            measure(&locations, *bytes, config, cancellation, matrix)?;
+        let (compute, bandwidth, time, hash) = measure(
+            &locations,
+            *bytes,
+            config,
+            cancellation,
+            if matrix {
+                Kernel::Matrix
+            } else if integer {
+                Kernel::Integer
+            } else {
+                Kernel::Vector
+            },
+        )?;
         elapsed += time;
         checksum ^= hash;
         for (suffix, samples, unit) in [
@@ -433,10 +853,10 @@ pub fn run(
     progress(ProgressUpdate {
         fraction: 0.92,
         phase: "cpu_compute_reference".into(),
-        message: "Checking current AVX2 FP32 compute reference".into(),
+        message: format!("Checking current {label} compute reference"),
     });
     let check = compute::run(
-        REFERENCE,
+        reference_id,
         &ref_config,
         cancellation,
         &mut quiet,
@@ -460,7 +880,7 @@ pub fn run(
     let transition = transition_index(&compute_tiers, baseline);
     let largest = compute_tiers.last().unwrap().value;
     let mut metadata = BTreeMap::from([
-        ("compute_reference_benchmark".into(), REFERENCE.into()),
+        ("compute_reference_benchmark".into(), reference_id.into()),
         ("compute_reference_selection".into(), "latest_post_sweep".into()),
         ("compute_reference_kind".into(), "measured_register_resident; not_theoretical_peak".into()),
         ("compute_reference_drift_percent".into(), format!("{drift:.2}")),
@@ -482,7 +902,7 @@ pub fn run(
         ("working_set_definition".into(), "aggregate of two input arrays and one output array across selected workers".into()),
         ("ram_budget_mib".into(), requested_mib.to_string()),
         ("available_memory_bytes_at_run".into(), available.to_string()),
-        ("allocation_budget_bytes".into(), maximum.to_string()),
+        ("allocation_budget_bytes".into(), allocation_limit.to_string()),
         ("allocated_test_buffer_bytes".into(), tiers.last().unwrap().to_string()),
         ("per_thread_working_set_bytes".into(), (tiers.last().unwrap() / locations.len() as u64).to_string()),
         ("allocation_limit_note".into(), "Percentage requests use installed RAM, capped at 80% of available RAM with at least 2 GiB left available. Legacy requests use ram_budget_mib and one eighth of available RAM.".into()),
@@ -549,6 +969,43 @@ pub fn run(
             format!("{:.4}", compute_tiers[index].value / baseline),
         );
     }
+    if integer {
+        metadata.insert(
+            "dataset_mode".into(),
+            if single_dataset { "single" } else { "sweep" }.into(),
+        );
+        metadata.insert("kernel_revision".into(), "int64-streaming-1".into());
+        metadata.insert(
+            "compiler_guard".into(),
+            "per_value_per_round_black_box".into(),
+        );
+        metadata.insert("data_type".into(), "i64".into());
+        metadata.insert(
+            "instruction_path".into(),
+            "scalar_wrapping_u64_multiply_add".into(),
+        );
+        metadata.insert(
+            "operation_definition".into(),
+            "one 64-bit wrapping multiply or add; 16 multiply/add rounds per value".into(),
+        );
+        metadata.insert(
+            "overflow_semantics".into(),
+            "modulo_2_pow_64; signed and unsigned representations share the same low 64 bits"
+                .into(),
+        );
+        metadata.insert(
+            "arithmetic_intensity_operations_per_byte".into(),
+            "2.0000".into(),
+        );
+        metadata.insert("byte_definition".into(), "one_64bit_input_read_plus_one_64bit_output_write; effective payload, excludes write allocation and cache-line writeback".into());
+        metadata.insert(
+            "working_set_definition".into(),
+            "aggregate of one input array and one output array across selected workers".into(),
+        );
+        if let Some(guidance) = metadata.get_mut("tuning_guidance") {
+            *guidance = guidance.replace("Matrix dimensions per worker change with the worker count, so inspect the recorded shapes when comparing. ", "");
+        }
+    }
     if matrix {
         let n = crate::matrix_scaling::dimension_for_bytes(
             *tiers.last().unwrap() / locations.len() as u64,
@@ -597,11 +1054,35 @@ pub fn run(
         phase: "complete".into(),
         message: if matrix {
             "AVX2 FP32 matrix scaling complete"
+        } else if integer {
+            "INT64 multiply-add scaling complete"
         } else {
             "AVX2 FP32 vector scaling complete"
         }
         .into(),
     });
+    if let Some(preset) = config.options.get(preset_key) {
+        metadata.insert(preset_key.into(), preset.clone());
+        metadata.insert(
+            "resolved_dataset_bytes".into(),
+            tiers.last().unwrap().to_string(),
+        );
+        metadata.insert("requested_dataset_bytes".into(), maximum.to_string());
+        if matches!(preset.as_str(), "l1" | "l2" | "l3") {
+            metadata.insert("cache_capacity_fraction".into(), "0.75".into());
+        }
+        if matrix && preset == "compute" {
+            metadata.insert(
+                "matrix_compute_sizing".into(),
+                if cache_dataset(topology, &locations, 2).is_ok() {
+                    "detected_l2"
+                } else {
+                    "256kib_per_worker_fallback"
+                }
+                .into(),
+            );
+        }
+    }
     Ok(BenchmarkResult {
         benchmark_id: id.into(),
         device_id: device.id.clone(),
@@ -612,7 +1093,7 @@ pub fn run(
     })
 }
 
-fn transition_index(tiers: &[&Metric], baseline: f64) -> Option<usize> {
+pub(crate) fn transition_index(tiers: &[&Metric], baseline: f64) -> Option<usize> {
     let stable = |m: &Metric| {
         m.value.is_finite()
             && m.value > 0.0
@@ -631,9 +1112,7 @@ fn transition_index(tiers: &[&Metric], baseline: f64) -> Option<usize> {
 
 fn allocation_budget(total: u64, available: u64, percent: Option<u32>, legacy_mib: u64) -> u64 {
     match percent {
-        Some(p) => (total / 100 * p as u64)
-            .min(available / 5 * 4)
-            .min(available.saturating_sub(2 * 1024 * MIB)),
+        Some(p) => gluj_bench_core::ram_allocation_budget(total, available, p),
         None => (legacy_mib * MIB).min(available / 8),
     }
 }
@@ -641,6 +1120,417 @@ fn allocation_budget(total: u64, available: u64, percent: Option<u32>, legacy_mi
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn cache_topology() -> CpuTopology {
+        use crate::topology::CacheTarget;
+        use gluj_bench_core::{CacheDescriptor, CacheKind};
+        let workers = (0..4)
+            .map(|index| ProcessorLocation { group: 0, index })
+            .collect::<Vec<_>>();
+        let target = |mask, bytes| CacheTarget {
+            descriptor: CacheDescriptor {
+                level: 3,
+                kind: CacheKind::Unified,
+                size_bytes: bytes,
+                line_size_bytes: 64,
+                sharing_logical_processors: 2,
+                instances: 1,
+            },
+            group: 0,
+            mask,
+        };
+        CpuTopology {
+            representative: workers[0],
+            core_threads: workers
+                .iter()
+                .map(|worker| (*worker, vec![*worker]))
+                .collect(),
+            physical_cores: workers,
+            representative_caches: BTreeMap::new(),
+            cache_targets: vec![target(0b0011, 8 * MIB), target(0b1100, 4 * MIB)],
+            caches: vec![],
+        }
+    }
+
+    #[test]
+    fn cache_presets_share_only_selected_instances_and_handle_missing_levels() {
+        let topology = cache_topology();
+        let workers = &topology.physical_cores;
+        let aligned = |bytes| bytes / 768 * 768;
+        assert_eq!(
+            cache_dataset(&topology, &workers[..1], 3).unwrap(),
+            aligned(6 * MIB)
+        );
+        assert_eq!(
+            cache_dataset(&topology, &workers[..2], 3).unwrap(),
+            aligned(3 * MIB) * 2
+        );
+        assert_eq!(
+            cache_dataset(&topology, workers, 3).unwrap(),
+            aligned(3 * MIB / 2) * 4
+        );
+        assert_eq!(
+            cache_dataset(&topology, &[], 3).unwrap_err().code,
+            "cache_unavailable"
+        );
+        assert_eq!(
+            cache_dataset(&topology, workers, 1).unwrap_err().code,
+            "cache_unavailable"
+        );
+        let mut missing = topology.clone();
+        missing.cache_targets.pop();
+        assert!(cache_dataset(&missing, workers, 3).is_err());
+    }
+
+    #[test]
+    fn custom_and_auto_vector_targets_validate_and_align_without_clamping() {
+        let topology = cache_topology();
+        let workers = &topology.physical_cores[..2];
+        let mut config = BenchmarkConfig::default();
+        config
+            .options
+            .insert("vector_preset".into(), "custom".into());
+        config
+            .options
+            .insert("dataset_mode".into(), "single".into());
+        config.options.insert("dataset_bytes".into(), "2049".into());
+        assert_eq!(
+            vector_dataset(&config, MIB, &topology, workers).unwrap(),
+            (2049, true)
+        );
+        assert_eq!(sizes(2049, 2), vec![1536]);
+        config
+            .options
+            .insert("dataset_bytes".into(), (2 * MIB).to_string());
+        assert_eq!(
+            vector_dataset(&config, MIB, &topology, workers)
+                .unwrap_err()
+                .code,
+            "dataset_exceeds_budget"
+        );
+        config.options.insert("dataset_bytes".into(), "1024".into());
+        assert!(vector_dataset(&config, MIB, &topology, workers).is_err());
+        config.options.insert("vector_preset".into(), "ram".into());
+        assert_eq!(
+            vector_dataset(&config, MIB, &topology, workers).unwrap(),
+            (MIB, true)
+        );
+        config.options.insert("dataset_mode".into(), "sweep".into());
+        assert_eq!(
+            vector_dataset(&config, MIB, &topology, workers).unwrap(),
+            (MIB, false)
+        );
+        config
+            .options
+            .insert("vector_preset".into(), "unknown".into());
+        assert!(vector_dataset(&config, MIB, &topology, workers).is_err());
+    }
+
+    #[test]
+    fn integer_presets_use_two_arrays_and_complete_blocks() {
+        let topology = cache_topology();
+        let workers = &topology.physical_cores[..2];
+        let mut config = BenchmarkConfig::default();
+        config
+            .options
+            .insert("int64_preset".into(), "custom".into());
+        config
+            .options
+            .insert("dataset_mode".into(), "single".into());
+        config.options.insert("dataset_bytes".into(), "4097".into());
+        let resolve = |config: &BenchmarkConfig| {
+            array_dataset(config, MIB, &topology, workers, "int64_preset", 1024)
+        };
+        assert_eq!(resolve(&config).unwrap(), (4097, true));
+        assert_eq!(array_sizes(4097, 2, 16), vec![4096]);
+        config.options.insert("dataset_bytes".into(), "2047".into());
+        assert!(resolve(&config).is_err());
+        config
+            .options
+            .insert("dataset_bytes".into(), (MIB + 1).to_string());
+        assert_eq!(resolve(&config).unwrap_err().code, "dataset_exceeds_budget");
+        config.options.insert("int64_preset".into(), "l1".into());
+        assert_eq!(resolve(&config).unwrap_err().code, "cache_unavailable");
+        config.options.insert("int64_preset".into(), "l3".into());
+        assert_eq!(
+            array_dataset(&config, 8 * MIB, &topology, workers, "int64_preset", 1024).unwrap(),
+            (6 * MIB, true)
+        );
+        config.options.insert("int64_preset".into(), "ram".into());
+        config.options.insert("dataset_mode".into(), "sweep".into());
+        assert_eq!(resolve(&config).unwrap(), (MIB, false));
+        let tiers = array_sizes(MIB, 2, 16);
+        assert!(tiers.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(tiers.iter().all(|bytes| bytes % 2048 == 0));
+        assert_eq!(tiers.last(), Some(&MIB));
+        assert_eq!(REUSE, crate::integer_scaling::REUSE);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "runs short INT64 benchmarks on the current machine"]
+    fn integer_modes_smoke() {
+        let mut registry = gluj_bench_core::BenchmarkRegistry::default();
+        registry.add(Box::new(crate::CpuBandwidthProvider::discover()));
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..BenchmarkConfig::default()
+        };
+        config.options.insert("cpu_core_limit".into(), "1".into());
+        config
+            .options
+            .insert("ram_budget_percent".into(), "20".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "65537".into());
+        for (preset, mode) in [
+            ("register", "register"),
+            ("custom", "single"),
+            ("custom", "sweep"),
+            ("l1", "single"),
+        ] {
+            config.options.insert("int64_preset".into(), preset.into());
+            config.options.insert("dataset_mode".into(), mode.into());
+            let result = registry
+                .run(
+                    crate::integer_scaling::ID,
+                    &config,
+                    &CancellationToken::default(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(result.workload_metadata["int64_preset"], preset);
+            if preset == "register" {
+                assert_eq!(result.metrics.len(), 1);
+                assert!(result.metrics[0].value > 0.0);
+                assert!(
+                    !result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name.starts_with("working_set_"))
+                );
+                continue;
+            }
+            assert_eq!(
+                result.workload_metadata["kernel_revision"],
+                "int64-streaming-1"
+            );
+            assert_eq!(
+                result.workload_metadata["compute_reference_benchmark"],
+                crate::integer_scaling::ID
+            );
+            assert_eq!(result.workload_metadata["dataset_mode"], mode);
+            let measured = result
+                .metrics
+                .iter()
+                .filter(|m| m.name.ends_with(".compute"))
+                .collect::<Vec<_>>();
+            assert!(!measured.is_empty());
+            if mode == "single" {
+                assert_eq!(measured.len(), 1);
+            }
+            for metric in measured {
+                assert!(metric.value.is_finite() && metric.value > 0.0);
+                let traffic = result
+                    .metrics
+                    .iter()
+                    .find(|m| m.name == metric.name.replace(".compute", ".bandwidth"))
+                    .unwrap();
+                assert!((metric.value / traffic.value - 2.0).abs() < 1e-6);
+                assert_eq!(metric.statistics.sample_count, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_presets_resolve_real_matrix_buffers_and_validate_limits() {
+        let topology = cache_topology();
+        let workers = &topology.physical_cores[..2];
+        let mut config = BenchmarkConfig::default();
+        config
+            .options
+            .insert("matrix_preset".into(), "compute".into());
+        config
+            .options
+            .insert("dataset_mode".into(), "single".into());
+        assert_eq!(
+            matrix_dataset(&config, 8 * MIB, &topology, workers).unwrap(),
+            (512 * 1024, true)
+        );
+        let mut l2 = topology.clone();
+        for cache in &mut l2.cache_targets {
+            cache.descriptor.level = 2;
+        }
+        assert_eq!(
+            matrix_dataset(&config, 8 * MIB, &l2, workers).unwrap(),
+            (cache_dataset(&l2, workers, 2).unwrap(), true)
+        );
+        assert_eq!(
+            matrix_dataset(&config, 128 * 1024, &l2, workers).unwrap(),
+            (128 * 1024, true)
+        );
+        config.options.insert("matrix_preset".into(), "l2".into());
+        let cache_shape = crate::matrix_scaling::bytes(crate::matrix_scaling::dimension_for_bytes(
+            cache_dataset(&l2, workers, 2).unwrap() / 2,
+        )) * 2;
+        assert_eq!(
+            matrix_dataset(&config, cache_shape, &l2, workers).unwrap(),
+            (cache_shape, true)
+        );
+        config
+            .options
+            .insert("matrix_preset".into(), "custom".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "100000".into());
+        let (target, single) = matrix_dataset(&config, MIB, &topology, workers).unwrap();
+        assert!(single);
+        let tiers = crate::matrix_scaling::sizes(target, 2);
+        assert_eq!(*tiers.last().unwrap(), 92160);
+        config
+            .options
+            .insert("dataset_bytes".into(), (2 * MIB).to_string());
+        assert_eq!(
+            matrix_dataset(&config, MIB, &topology, workers)
+                .unwrap_err()
+                .code,
+            "dataset_exceeds_budget"
+        );
+        config.options.insert("dataset_bytes".into(), "1024".into());
+        assert!(matrix_dataset(&config, MIB, &topology, workers).is_err());
+        config.options.insert("matrix_preset".into(), "l1".into());
+        assert_eq!(
+            matrix_dataset(&config, MIB, &topology, workers)
+                .unwrap_err()
+                .code,
+            "cache_unavailable"
+        );
+        config
+            .options
+            .insert("matrix_preset".into(), "register".into());
+        assert!(matrix_dataset(&config, MIB, &topology, workers).is_err());
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[ignore = "runs short matrix benchmarks on the current machine"]
+    fn matrix_modes_smoke() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let mut registry = gluj_bench_core::BenchmarkRegistry::default();
+        registry.add(Box::new(crate::CpuBandwidthProvider::discover()));
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..BenchmarkConfig::default()
+        };
+        config.options.insert("cpu_core_limit".into(), "1".into());
+        config
+            .options
+            .insert("ram_budget_percent".into(), "20".into());
+        for (preset, mode) in [
+            ("compute", "single"),
+            ("custom", "single"),
+            ("custom", "sweep"),
+            ("l1", "single"),
+        ] {
+            config.options.insert("matrix_preset".into(), preset.into());
+            config.options.insert("dataset_mode".into(), mode.into());
+            config
+                .options
+                .insert("dataset_bytes".into(), "65536".into());
+            let result = registry
+                .run(
+                    crate::matrix_scaling::ID,
+                    &config,
+                    &CancellationToken::default(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(result.workload_metadata["matrix_preset"], preset);
+            assert_eq!(result.workload_metadata["kernel_revision"], "avx2-matrix-1");
+            let measured = result
+                .metrics
+                .iter()
+                .filter(|metric| metric.name.ends_with(".compute"))
+                .collect::<Vec<_>>();
+            assert!(
+                measured
+                    .iter()
+                    .all(|metric| metric.value.is_finite() && metric.value > 0.0)
+            );
+            if mode == "single" {
+                assert_eq!(measured.len(), 1);
+            }
+            assert!(
+                result
+                    .workload_metadata
+                    .contains_key("matrix_profile_shapes")
+            );
+            let requested = result.workload_metadata["requested_dataset_bytes"]
+                .parse::<u64>()
+                .unwrap();
+            let actual = result.workload_metadata["resolved_dataset_bytes"]
+                .parse::<u64>()
+                .unwrap();
+            assert!(requested >= actual);
+        }
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[ignore = "runs short AVX2 benchmarks on the current machine"]
+    fn vector_modes_smoke() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let mut registry = gluj_bench_core::BenchmarkRegistry::default();
+        registry.add(Box::new(crate::CpuBandwidthProvider::discover()));
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..BenchmarkConfig::default()
+        };
+        config.options.insert("cpu_core_limit".into(), "1".into());
+        config
+            .options
+            .insert("ram_budget_percent".into(), "20".into());
+        for (preset, mode) in [
+            ("register", "single"),
+            ("custom", "single"),
+            ("custom", "sweep"),
+            ("l1", "single"),
+        ] {
+            config.options.insert("vector_preset".into(), preset.into());
+            config.options.insert("dataset_mode".into(), mode.into());
+            config
+                .options
+                .insert("dataset_bytes".into(), "32768".into());
+            let result = registry
+                .run(ID, &config, &CancellationToken::default(), &mut |_| {})
+                .unwrap();
+            assert_eq!(result.benchmark_id, ID);
+            assert!(result.metrics.iter().all(|metric| metric.value.is_finite()));
+            assert_eq!(result.workload_metadata["vector_preset"], preset);
+            if preset == "register" {
+                assert_eq!(result.metrics.len(), 1);
+                assert_eq!(result.workload_metadata["dataset_mode"], "register");
+                assert!(
+                    !result
+                        .workload_metadata
+                        .contains_key("requested_dataset_bytes")
+                );
+            } else {
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|metric| metric.name.ends_with(".bandwidth") && metric.value > 0.0)
+                );
+            }
+        }
+    }
     #[test]
     fn percentage_ram_budget_uses_installed_memory_and_preserves_available_headroom() {
         let gib = 1024 * MIB;

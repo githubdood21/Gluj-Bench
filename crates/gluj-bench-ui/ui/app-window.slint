@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, ProgressIndicator, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ProgressIndicator, ScrollView, Slider } from "std-widgets.slint";
 
 export struct DeviceFact { label: string, value: string, }
 export struct DeviceRow {
@@ -87,10 +87,43 @@ export component MainWindow inherits Window {
     in property <string> default-offload-name;
     callback select-default-configuration(string, int);
     callback edit-default-dataset(string);
-    in property <bool> test-override-enabled;
+    in-out property <bool> test-override-enabled;
+    in-out property <length> configuration-scroll-offset: 0px;
+    in property <string> configuration-test-id;
     in property <bool> test-is-cpu;
     in property <bool> test-is-gpu;
     in property <bool> test-is-scaling;
+    in property <bool> test-is-configurable-compute;
+    in property <bool> test-is-matrix;
+    in property <bool> test-is-ascii;
+    in property <bool> test-is-int64;
+    in property <bool> test-is-ram-bandwidth;
+    in property <bool> test-ram-bandwidth-custom;
+    in-out property <int> test-ram-bandwidth-index;
+    in-out property <int> test-vector-choice-index: 0;
+    in property <bool> test-vector-can-reset;
+    callback select-vector-choice(int);
+    callback reset-vector-configuration();
+    in property <bool> test-vector-legacy;
+    in property <bool> test-vector-register;
+    in property <bool> test-vector-custom;
+    in-out property <int> test-vector-preset-index;
+    in-out property <int> test-vector-mode-index;
+    in property <string> test-vector-size;
+    in property <string> test-vector-preview;
+    in-out property <float> test-vector-size-position;
+    in property <bool> test-vector-size-available;
+    in property <string> test-vector-size-range;
+    callback select-vector-size(float);
+    in-out property <float> test-core-value;
+    in-out property <float> cpu-core-value;
+    in property <float> cpu-core-maximum;
+    in-out property <int> test-cpu-index;
+    in-out property <int> test-gpu-index;
+    in-out property <int> test-ram-index;
+    in-out property <int> test-vram-index;
+    in-out property <int> test-offload-index;
+    in-out property <int> test-dataset-index;
     in property <bool> test-is-offload;
     in property <bool> test-has-ram;
     in property <bool> test-dataset-custom;
@@ -103,7 +136,7 @@ export component MainWindow inherits Window {
     in property <string> test-vram-name;
     in property <string> test-offload-name;
     in property <string> test-dataset-mode;
-    in property <string> test-dataset-text;
+    in-out property <string> test-dataset-text;
     callback toggle-test-override(bool);
     callback select-test-configuration(string, int);
     callback edit-test-dataset(string);
@@ -308,8 +341,9 @@ export component MainWindow inherits Window {
                     } }
                     Surface { horizontal-stretch: 2; min-width: 300px; VerticalLayout { padding: 18px; spacing: 14px;
                         configuration-scroll := ScrollView { viewport-width: self.width; vertical-stretch: 1;
+                            viewport-y <=> root.configuration-scroll-offset;
                             viewport-height: max(self.visible-height, configuration-content.preferred-height);
-                            configuration-content := VerticalLayout { width: configuration-scroll.visible-width - 16px; height: self.preferred-height; spacing: 12px; alignment: start;
+                            configuration-content := VerticalLayout { x: 0px; y: 0px; width: configuration-scroll.visible-width - 16px; height: self.preferred-height; spacing: 12px; alignment: start;
                         Label { text: "BENCHMARK DETAILS"; } Text { text: root.selected-benchmark-name; color: #f4f7fb; font-size: 21px; font-weight: 700; wrap: word-wrap; }
                         Text { text: root.selected-benchmark-description; color: #9fabbd; font-size: 12px; wrap: word-wrap; }
                         Button { text: root.lab-details-expanded ? "▾ About this test" : "▸ About this test"; clicked => { root.lab-details-expanded = !root.lab-details-expanded; } }
@@ -323,40 +357,71 @@ export component MainWindow inherits Window {
                         if !root.show-gpu-selector: Text { text: root.target-hardware-name; color: #f4f7fb; font-size: 14px; font-weight: 600; wrap: word-wrap; }
                         Text { text: root.target-hardware-description; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                         Rectangle { height: 1px; background: #293448; }
-                        Label { text: "RUN CONFIGURATION"; }
+                        if root.test-is-configurable-compute: VerticalLayout { spacing: 8px; vertical-stretch: 0; height: self.preferred-height;
+                            Label { text: "WHAT DO YOU WANT TO MEASURE?"; }
+                            ComboBox { height: 36px; vertical-stretch: 0; model: root.test-is-ascii ? ["Text scanning speed", "Performance across data sizes", "Customize this test"] : root.test-is-matrix ? ["Matrix calculation speed", "Performance across data sizes", "Customize this test"] : ["Compute speed", "Performance across data sizes", "Customize this test"]; current-index <=> root.test-vector-choice-index; enabled: !root.running && root.selected-benchmark-enabled; selected(value) => { root.configuration-scroll-offset = 0px; root.select-vector-choice(self.current-index); } }
+                            Text { text: root.test-vector-choice-index == 0 ? (root.test-is-ascii ? "Scans text with one automatically sized input, using all CPU cores." : root.test-is-matrix ? "Measures matrix multiplication with one automatically sized dataset." : "Measures how quickly your CPU performs calculations, with data kept close to the processor.") : root.test-vector-choice-index == 1 ? "Automatically tests small through large datasets to show how performance changes as more data is used." : "Choose your data preset, dataset size, run mode and CPU allocation."; color: #9fabbd; font-size: 12px; wrap: word-wrap; }
+                        }
+                        HorizontalLayout { height: root.test-is-configurable-compute && root.test-vector-can-reset ? 24px : 16px; spacing: 8px; vertical-stretch: 0;
+                            Label { text: "RUN CONFIGURATION"; horizontal-stretch: 1; vertical-alignment: center; }
+                            if root.test-is-configurable-compute && root.test-vector-can-reset: Button { width: 128px; height: 24px; vertical-stretch: 0; text: "Reset to defaults"; enabled: !root.running; clicked => { root.configuration-scroll-offset = 0px; root.reset-vector-configuration(); } }
+                        }
                         Text { text: root.test-configuration-summary; color: root.test-configuration-valid ? #a5bce0 : #f3ba67; font-size: 12px; wrap: word-wrap; }
-                        HorizontalLayout { spacing: 8px; vertical-stretch: 0; CheckBox { text: ""; width: 22px; height: 22px; checked: root.test-override-enabled; enabled: !root.running && root.selected-benchmark-enabled; toggled => { root.toggle-test-override(self.checked); } } Text { text: "Override global settings for this test"; color: #dbe7f5; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; } }
-                        if root.test-override-enabled: VerticalLayout { spacing: 8px; vertical-stretch: 0; height: self.preferred-height;
-                            Text { text: "Applies only to this test in this session. Turn off to use the current global defaults."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                        if !root.test-is-configurable-compute: HorizontalLayout { spacing: 8px; vertical-stretch: 0; CheckBox { text: ""; width: 22px; height: 22px; checked <=> root.test-override-enabled; enabled: !root.running && root.selected-benchmark-enabled; toggled => { root.configuration-scroll-offset = 0px; root.toggle-test-override(self.checked); } } Text { text: "Override global settings for this test"; color: #dbe7f5; font-size: 12px; wrap: word-wrap; vertical-stretch: 0; } }
+                        if (root.test-is-configurable-compute && root.test-vector-choice-index == 2) || (!root.test-is-configurable-compute && root.test-override-enabled): VerticalLayout { spacing: 8px; vertical-stretch: 0; height: self.preferred-height;
+                            Text { text: root.test-is-configurable-compute ? "Custom settings are saved for this test and kept when you try an automatic choice." : "Settings are saved for this test. Turn off the override to return to the current global defaults."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                             if root.test-is-offload: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "INPUT / OUTPUT DATA IN SYSTEM RAM"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["50% system RAM", "75% system RAM", "100% system RAM"]; current-value: root.test-offload-name; enabled: !root.running; selected(value) => { root.select-test-configuration("offload", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["50% system RAM", "75% system RAM", "100% system RAM"]; current-index <=> root.test-offload-index; enabled: !root.running; selected(value) => { root.select-test-configuration("offload", self.current-index); } }
                             }
-                            if root.test-is-scaling: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                            if root.test-is-configurable-compute: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "DATA PRESET"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: root.test-is-ascii ? ["Use global dataset settings", "Automatic scan-sized input", "Automatic L1 cache", "Automatic L2 cache", "Automatic L3 cache", "Automatic RAM budget", "Custom size"] : root.test-is-matrix ? ["Use global dataset settings", "Automatic compute-sized data", "Automatic L1 cache", "Automatic L2 cache", "Automatic L3 cache", "Automatic RAM budget", "Custom size"] : ["Use global dataset settings", "Register compute", "Automatic L1 cache", "Automatic L2 cache", "Automatic L3 cache", "Automatic RAM budget", "Custom size"]; current-index <=> root.test-vector-preset-index; enabled: !root.running; selected(value) => { root.select-test-configuration("vector-preset", self.current-index); } }
+                                if !root.test-vector-register && !root.test-vector-legacy: ComboBox { height: 36px; vertical-stretch: 0; model: ["One dataset", "Sweep to target"]; current-index <=> root.test-vector-mode-index; enabled: !root.running; selected(value) => { root.select-test-configuration("vector-mode", self.current-index); } }
+                                if root.test-vector-custom: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                    Label { text: "DATASET SIZE · " + root.test-vector-size; }
+                                    Slider { height: 32px; vertical-stretch: 0; minimum: 0; maximum: 1000; step: 1; value <=> root.test-vector-size-position; enabled: !root.running && root.test-vector-size-available; changed(value) => { root.select-vector-size(value); } }
+                                    Text { text: root.test-vector-size-range; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                                }
+                                Text { text: root.test-vector-preview; color: #a5bce0; font-size: 12px; wrap: word-wrap; }
+                                Text { text: root.test-is-int64 ? (root.test-vector-register ? "Runs 64-bit wrapping multiply/add in registers without a streaming allocation." : "Dataset size includes one input and one output array across the selected workers, aligned to 1024 bytes per worker. Every size performs the same wrapping multiply/add work per value. Cache presets target 75% of each cache instance shared among selected workers; residency is not measured.") : root.test-is-ascii ? "Input size is shared across the selected workers and rounded to complete 64-byte ASCII records. Every size uses the same character-counting scan. Cache presets target 75% of each cache instance, divided among its selected workers; residency is not measured." : root.test-is-matrix ? "Dataset size includes input, weight and output matrices across all selected workers. Dimensions are rounded to valid matrix shapes. Cache presets target 75% of the selected cache instances; residency is not measured." : (root.test-vector-register ? "Runs register-resident AVX2/FMA arithmetic without streaming arrays." : "Dataset size includes both inputs and the output across all selected workers. Cache presets use 75% of each cache instance, divided among its selected workers. Residency is a sizing target. Actual allocations are aligned and recorded when the run starts."); color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                            }
+                            if root.test-is-ram-bandwidth: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                Label { text: "RAM DATA SIZE"; }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Automatic", "Custom size"]; current-index <=> root.test-ram-bandwidth-index; enabled: !root.running; selected(value) => { root.select-test-configuration("ram-bandwidth-size", self.current-index); } }
+                                if root.test-ram-bandwidth-custom: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
+                                    Label { text: "PAYLOAD SIZE · " + root.test-vector-size; }
+                                    Slider { height: 32px; vertical-stretch: 0; minimum: 0; maximum: 1000; step: 1; value <=> root.test-vector-size-position; enabled: !root.running && root.test-vector-size-available; changed(value) => { root.select-vector-size(value); } }
+                                    Text { text: root.test-vector-size-range; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                                }
+                                Text { text: root.test-ram-bandwidth-custom ? "The payload stays larger than the CPU cache range. Copy uses a source and destination buffer, reserving twice this payload size. Read, write and copy use the existing RAM benchmark methods." : "Uses the existing automatically sized RAM workload."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
+                            }
+                            if root.test-is-scaling && (!root.test-is-configurable-compute || root.test-vector-legacy): VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "DATASET MODE"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Automatic (allocation budget)", "Sweep up to chosen size", "Test one chosen size"]; current-value: root.test-dataset-mode; enabled: !root.running; selected(value) => { root.select-test-configuration("dataset", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["Automatic (allocation budget)", "Sweep up to chosen size", "Test one chosen size"]; current-index <=> root.test-dataset-index; enabled: !root.running; selected(value) => { root.select-test-configuration("dataset", self.current-index); } }
                                 Label { text: "DATASET SIZE · MiB"; }
-                                LineEdit { height: 36px; vertical-stretch: 0; text: root.test-dataset-text; enabled: !root.running && root.test-dataset-custom; edited => { root.edit-test-dataset(self.text); } }
+                                LineEdit { height: 36px; vertical-stretch: 0; text <=> root.test-dataset-text; enabled: !root.running && root.test-dataset-custom; edited => { root.edit-test-dataset(self.text); } }
                                 Text { text: "MiB uses binary units; 1024 MiB = 1 GiB. Actual sizes follow buffer alignment or matrix shape. A size above the allocation budget needs a smaller dataset or larger budget."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                             }
                             if root.test-is-cpu: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "CPU WORKLOAD INTENSITY"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["95%", "99%", "100%"]; current-value: root.test-cpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cpu", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["95%", "99%", "100%"]; current-index <=> root.test-cpu-index; enabled: !root.running; selected(value) => { root.select-test-configuration("cpu", self.current-index); } }
                                 Label { text: "CPU PHYSICAL CORES"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: root.cpu-core-options; current-value: root.test-core-name; enabled: !root.running; selected(value) => { root.select-test-configuration("cores", self.current-index); } }
+                                Text { text: root.test-core-name; color: #a5bce0; font-size: 12px; }
+                                Slider { height: 32px; vertical-stretch: 0; minimum: 1; maximum: max(2, root.cpu-core-maximum); step: 1; value <=> root.test-core-value; enabled: !root.running && root.cpu-core-maximum > 1; changed(value) => { root.select-test-configuration("cores", round(value)); } }
                                 Text { text: "Core count and workload intensity are independent. Automatic uses all physical cores; single-thread tests still use one worker."; color: #8f9caf; font-size: 11px; wrap: word-wrap; }
                             }
                             if root.test-is-gpu: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "GPU ACTIVITY"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["95%", "99%", "100%"]; current-value: root.test-gpu-name; enabled: !root.running; selected(value) => { root.select-test-configuration("gpu", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["95%", "99%", "100%"]; current-index <=> root.test-gpu-index; enabled: !root.running; selected(value) => { root.select-test-configuration("gpu", self.current-index); } }
                             }
                             if root.test-has-ram: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "RAM ALLOCATION BUDGET"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["20% of RAM", "25% of RAM", "30% of RAM", "40% of RAM", "50% of RAM", "60% of RAM", "70% of RAM", "80% of RAM"]; current-value: root.test-ram-name; enabled: !root.running; selected(value) => { root.select-test-configuration("ram", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["20% of RAM", "25% of RAM", "30% of RAM", "40% of RAM", "50% of RAM", "60% of RAM", "70% of RAM", "80% of RAM"]; current-index <=> root.test-ram-index; enabled: !root.running; selected(value) => { root.select-test-configuration("ram", self.current-index); } }
                             }
                             if root.test-is-gpu && root.test-is-scaling: VerticalLayout { spacing: 6px; vertical-stretch: 0; height: self.preferred-height;
                                 Label { text: "VRAM ALLOCATION BUDGET"; }
-                                ComboBox { height: 36px; vertical-stretch: 0; model: ["20% of VRAM", "25% of VRAM", "30% of VRAM", "40% of VRAM", "50% of VRAM", "60% of VRAM", "70% of VRAM", "80% of VRAM"]; current-value: root.test-vram-name; enabled: !root.running; selected(value) => { root.select-test-configuration("vram", self.current-index); } }
+                                ComboBox { height: 36px; vertical-stretch: 0; model: ["20% of VRAM", "25% of VRAM", "30% of VRAM", "40% of VRAM", "50% of VRAM", "60% of VRAM", "70% of VRAM", "80% of VRAM"]; current-index <=> root.test-vram-index; enabled: !root.running; selected(value) => { root.select-test-configuration("vram", self.current-index); } }
                             }
 
 
@@ -364,7 +429,7 @@ export component MainWindow inherits Window {
                         } }
 
                         if root.running: VerticalLayout { spacing: 10px; Label { text: "BENCHMARK IN PROGRESS"; color: #60e4c1; } Text { text: root.progress-message; color: #f4f7fb; font-size: 13px; wrap: word-wrap; } ProgressIndicator { progress: root.progress; } Text { text: root.queued-count > 0 ? "Queue: " + root.queued-count + " benchmark(s) remaining" : "Final benchmark in progress"; color: #9facbd; font-size: 11px; } Button { text: "Cancel benchmark"; clicked => { root.cancel(); } } }
-                        if !root.running: VerticalLayout { spacing: 10px; Text { text: "5 repeated samples · configuration above applies to this test"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run benchmark"; primary: true; enabled: root.selected-benchmark-enabled && root.test-configuration-valid; clicked => { root.run-selected(); } } Button { text: "Run all in this category"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
+                        if !root.running: VerticalLayout { spacing: 10px; Text { text: root.test-is-configurable-compute && root.test-vector-choice-index == 1 ? "5 samples per size · longer than the compute-speed test" : "5 repeated samples · configuration above applies to this test"; color: #8998ad; font-size: 11px; wrap: word-wrap; } Button { text: "Run benchmark"; primary: true; enabled: root.selected-benchmark-enabled && root.test-configuration-valid; clicked => { root.run-selected(); } } Button { text: "Run all in this category"; enabled: root.benchmarks.length > 0; clicked => { root.run-all(); } } }
                     } }
                 }
                 if root.page == 3: settings-scroll := ScrollView {
@@ -374,7 +439,7 @@ export component MainWindow inherits Window {
                     height: self.preferred-height; padding-bottom: 24px;
                     width: settings-scroll.visible-width - 16px; spacing: 16px; alignment: start;
                     SectionTitle { text: "Settings"; }
-                    Text { text: "Global defaults apply to every test. On Benchmarks, enable an override to customize one selected test."; color: #8f9caf; font-size: 13px; wrap: word-wrap; }
+                    Text { text: "Global defaults set activity and allocation budgets. On Benchmarks, choose Customize this test for FP32 vector/matrix compute, INT64 multiply-add or ASCII scan, or enable an override for other tests."; color: #8f9caf; font-size: 13px; wrap: word-wrap; }
                     Surface { height: max(260px, scaling-defaults.preferred-height + 36px); vertical-stretch: 0;
                         scaling-defaults := VerticalLayout { padding: 18px; spacing: 10px;
                             Text { text: "Scaling test defaults"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
@@ -396,7 +461,8 @@ export component MainWindow inherits Window {
                     } }
                     Surface { height: max(190px, settings-panel-2.preferred-height + 36px); vertical-stretch: 0; settings-panel-2 := VerticalLayout { padding: 18px; spacing: 10px;
                         Text { text: "CPU physical cores"; color: #f4f7fb; font-size: 17px; font-weight: 700; }
-                        ComboBox { model: root.cpu-core-options; current-value: root.cpu-core-name; enabled: !root.running; selected(value) => { root.select-cpu-cores(self.current-index); } }
+                        Text { text: root.cpu-core-name; color: #a5bce0; font-size: 13px; }
+                        Slider { height: 32px; vertical-stretch: 0; minimum: 1; maximum: max(2, root.cpu-core-maximum); step: 1; value <=> root.cpu-core-value; enabled: !root.running && root.cpu-core-maximum > 1; changed(value) => { root.select-cpu-cores(round(value)); } }
                         Text { text: "Choose an exact number of physical cores for multithreaded CPU tests, with one worker per core. Automatic uses all available physical cores. Workload intensity applies independently to those workers. Single-thread and latency tests still use one worker."; color: #a7b4c5; font-size: 12px; wrap: word-wrap; }
                     } }
                     Surface { height: max(190px, settings-panel-3.preferred-height + 36px); vertical-stretch: 0; settings-panel-3 := VerticalLayout { padding: 18px; spacing: 10px;
@@ -531,7 +597,7 @@ export component MainWindow inherits Window {
                                         chart: root.selected-result.profile-chart; labels: root.selected-result.profile-labels; points: root.selected-result.profile-points; source-height: 420;
                                         pick-point(x, y, width, height) => { return root.chart-point-at(root.selected-result.profile-points, x, y, width, height, 420); }
                                     }
-                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: "Points show median throughput; shading shows sample minimum–maximum. Dashed line: this run’s compute reference. Dataset sizes use a logarithmic scale."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
+                                    if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: "Points show median throughput; shading shows sample minimum–maximum. A dashed line, when present, shows this run's compute reference. Dataset sizes use a logarithmic scale."; color: #9db1c8; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: ComboBox { model: root.selected-result.profile-sizes; current-index: root.profile-index; selected(value) => { root.profile-selection = self.current-index; } }
                                     if root.result-details-expanded && root.selected-result.profile-sizes.length > 0: Text { text: root.selected-result.profile-statistics[root.profile-index]; color: #c2cede; font-size: 11px; wrap: word-wrap; }
                                     if root.result-details-expanded && root.selected-result.gpu-timing-visible: Label { text: "MEASURED GPU TIMINGS · LOWER IS FASTER"; color: #edc778; }

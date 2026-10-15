@@ -7,11 +7,11 @@ const BLOCK_K: usize = 128;
 const BLOCK_N: usize = 64;
 
 pub fn bytes(dimension: usize) -> u64 {
-    4 * (dimension as u64 * dimension as u64 + 2 * ROWS as u64 * dimension as u64)
+    gluj_bench_core::cpu_matrix_bytes(dimension as u64)
 }
 pub fn dimension_for_bytes(budget: u64) -> usize {
     // A: 32×K, B: K×N, C: 32×N, with K=N and eight-column vector alignment.
-    (((ROWS as f64 * ROWS as f64 + budget as f64 / 4.0).sqrt() - ROWS as f64) as usize) / 8 * 8
+    gluj_bench_core::cpu_matrix_dimension(budget) as usize
 }
 pub fn sizes(maximum: u64, workers: usize) -> Vec<u64> {
     let maximum_dimension = dimension_for_bytes(maximum / workers as u64);

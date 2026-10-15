@@ -68,7 +68,7 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
 }
 
 pub(super) fn bars(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<TuningBar> {
-    if result.benchmark_id.ends_with(".scaling") {
+    if super::scaling_result(result) {
         return Vec::new();
     }
     let Some(metric) = metric else {

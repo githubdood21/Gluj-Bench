@@ -72,18 +72,27 @@ impl BenchmarkRegistry {
                     );
                 }
                 if benchmark_id.ends_with(".scaling") {
-                    result.workload_metadata.insert(
-                        "dataset_mode".into(),
-                        config
-                            .options
-                            .get("dataset_mode")
-                            .cloned()
-                            .unwrap_or_else(|| "automatic".into()),
-                    );
-                    if let Some(bytes) = config.options.get("dataset_bytes") {
+                    result
+                        .workload_metadata
+                        .entry("dataset_mode".into())
+                        .or_insert_with(|| {
+                            config
+                                .options
+                                .get("dataset_mode")
+                                .cloned()
+                                .unwrap_or_else(|| "automatic".into())
+                        });
+                    if result
+                        .workload_metadata
+                        .get("dataset_mode")
+                        .map(String::as_str)
+                        != Some("register")
+                        && let Some(bytes) = config.options.get("dataset_bytes")
+                    {
                         result
                             .workload_metadata
-                            .insert("requested_dataset_bytes".into(), bytes.clone());
+                            .entry("requested_dataset_bytes".into())
+                            .or_insert_with(|| bytes.clone());
                     }
                 }
                 if (benchmark_id.starts_with("cpu.") || benchmark_id.starts_with("memory."))

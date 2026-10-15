@@ -57,6 +57,48 @@ pub fn vram_budget_bytes(total: u64, percent: u32) -> u64 {
     (total / 100).saturating_mul(u64::from(percent))
 }
 
+/// Shared CPU buffer limit for sizing previews and allocation at run time.
+pub fn ram_allocation_budget(total: u64, available: u64, percent: u32) -> u64 {
+    (total / 100 * u64::from(percent))
+        .min(available / 5 * 4)
+        .min(available.saturating_sub(2 * 1024 * 1024 * 1024))
+}
+
+/// RAM bandwidth payload across all workers. Two equal-sized buffers are
+/// allocated, so the payload limit is half the safe allocation ceiling.
+pub fn ram_bandwidth_payload_range(
+    last_level_cache: u64,
+    available: u64,
+    workers: u32,
+) -> (u64, u64) {
+    let alignment = 64 * u64::from(workers.max(1));
+    let minimum = last_level_cache
+        .saturating_mul(2)
+        .saturating_add(64 * 1024 * 1024);
+    let minimum = minimum.saturating_add(alignment - 1) / alignment * alignment;
+    let maximum = (available / 5 * 4).min(available.saturating_sub(2 * 1024 * 1024 * 1024)) / 2;
+    (minimum, maximum / alignment * alignment)
+}
+
+/// Fixed 32-row CPU matrix layout: A[32,K], B[K,N], C[32,N], K=N.
+pub fn cpu_matrix_bytes(dimension: u64) -> u64 {
+    4_u64.saturating_mul(
+        dimension
+            .saturating_mul(dimension)
+            .saturating_add(64_u64.saturating_mul(dimension)),
+    )
+}
+pub fn cpu_matrix_dimension(budget: u64) -> u64 {
+    let mut dimension = (((1024.0 + budget as f64 / 4.0).sqrt() - 32.0) as u64) / 8 * 8;
+    while dimension > 0
+        && 4 * (u128::from(dimension) * u128::from(dimension) + 64 * u128::from(dimension))
+            > u128::from(budget)
+    {
+        dimension -= 8;
+    }
+    dimension
+}
+
 /// Resolve an explicit scaling dataset before allocation. A request must fit the budget;
 /// kernel alignment/shape rounding is reported separately in the result's actual tier size.
 pub fn configured_dataset(
@@ -188,6 +230,18 @@ pub fn pace_gpu(active: Duration) -> Result<(), BenchmarkError> {
 mod tests {
     use super::*;
     #[test]
+    fn cpu_matrix_layout_rounds_down_and_handles_large_budgets() {
+        for budget in [0, 12287, 12288, 65536, 1024_u64.pow(4), u64::MAX] {
+            let dimension = cpu_matrix_dimension(budget);
+            assert_eq!(dimension % 8, 0);
+            assert!(cpu_matrix_bytes(dimension) <= budget);
+            let next = u128::from(dimension + 8);
+            assert!(4 * (next * next + 64 * next) > u128::from(budget));
+        }
+        assert_eq!(cpu_matrix_bytes(32), 12288);
+        assert_eq!(cpu_matrix_dimension(12288), 32);
+    }
+    #[test]
     fn explicit_datasets_are_single_or_sweeps_and_never_silently_clamped() {
         let mut config = BenchmarkConfig::default();
         assert_eq!(
@@ -254,6 +308,23 @@ mod tests {
                 assert!(workload_percent(&config, key).is_err());
             }
         }
+    }
+
+    #[test]
+    fn ram_bandwidth_limits_keep_payload_beyond_cache_and_budget_both_buffers() {
+        let gib = 1024_u64.pow(3);
+        let llc = 32 * 1024 * 1024;
+        for workers in [1, 3, 16] {
+            let (minimum, maximum) = ram_bandwidth_payload_range(llc, 16 * gib, workers);
+            assert!(minimum >= 2 * llc + 64 * 1024 * 1024);
+            assert_eq!(minimum % (64 * workers as u64), 0);
+            assert_eq!(maximum % (64 * workers as u64), 0);
+            assert!(2 * maximum <= 16 * gib / 5 * 4);
+            assert!(16 * gib - 2 * maximum >= 2 * gib);
+            assert!(maximum > minimum);
+        }
+        let (minimum, maximum) = ram_bandwidth_payload_range(llc, gib, 4);
+        assert!(maximum < minimum);
     }
     #[test]
     fn vram_budget_accepts_only_twenty_to_eighty_percent() {

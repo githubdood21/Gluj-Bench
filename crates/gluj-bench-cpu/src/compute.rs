@@ -360,7 +360,7 @@ unsafe fn scan_avx2(data: &[u8]) -> (u64, u64) {
     (data.len() as u64, hits)
 }
 
-fn scan(data: &[u8]) -> (u64, u64) {
+pub(crate) fn scan(data: &[u8]) -> (u64, u64) {
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") {
         let (_, hits) = unsafe { scan_avx2(data) };

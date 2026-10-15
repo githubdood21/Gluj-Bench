@@ -65,6 +65,7 @@ pub(super) fn view(result: &BenchmarkResult) -> View {
         .take(3)
         .max_by(|a, b| a.1.value.total_cmp(&b.1.value))
         .copied();
+    let ascii = result.benchmark_id == super::CPU_ASCII_ID;
     let transition = number(result, "bandwidth_transition_working_set_bytes").filter(|n| *n > 0.0);
     view.top.push(fact(
         "DATASET TESTED",
@@ -87,11 +88,29 @@ pub(super) fn view(result: &BenchmarkResult) -> View {
         green,
     ));
     view.top.push(fact(
-        "CHANGE VS REFERENCE",
-        reference
-            .map(|m| format!("{:+.1}%", (largest.value / m.value - 1.0) * 100.0))
-            .unwrap_or_else(|| "Not recorded".into()),
-        "Throughput comparison, not GPU stall time".into(),
+        if ascii {
+            "CHANGE VS SMALL INPUT"
+        } else {
+            "CHANGE VS REFERENCE"
+        },
+        (if ascii {
+            small.filter(|(size, _)| *size < bytes).map(|(_, m)| m)
+        } else {
+            reference
+        })
+        .map(|m| format!("{:+.1}%", (largest.value / m.value - 1.0) * 100.0))
+        .unwrap_or_else(|| {
+            if ascii {
+                "One input size".into()
+            } else {
+                "Not recorded".into()
+            }
+        }),
+        if ascii {
+            "Same scan at different input sizes".into()
+        } else {
+            "Throughput comparison, not GPU stall time".into()
+        },
         blue,
     ));
     let variation = (largest.statistics.sample_count > 1
@@ -113,18 +132,20 @@ pub(super) fn view(result: &BenchmarkResult) -> View {
         },
     ));
     let drift = number(result, "compute_reference_drift_percent");
-    view.bottom.push(fact(
-        "REFERENCE DRIFT",
-        drift
-            .map(|n| format!("{n:.1}%"))
-            .unwrap_or_else(|| "Not recorded".into()),
-        "Change between pre/post reference runs".into(),
-        if drift.is_some_and(|n| n > 5.0) {
-            amber
-        } else {
-            neutral
-        },
-    ));
+    if !ascii {
+        view.bottom.push(fact(
+            "REFERENCE DRIFT",
+            drift
+                .map(|n| format!("{n:.1}%"))
+                .unwrap_or_else(|| "Not recorded".into()),
+            "Change between pre/post reference runs".into(),
+            if drift.is_some_and(|n| n > 5.0) {
+                amber
+            } else {
+                neutral
+            },
+        ));
+    }
     let traffic = result.metrics.iter().find(|m| {
         m.name == format!("working_set_{bytes}.bandwidth")
             && m.unit == "bytes/s"
@@ -218,7 +239,9 @@ pub(super) fn view(result: &BenchmarkResult) -> View {
     };
     view.actions
         .push(fact("1 · CHANGE ONE THING", first, String::new(), green));
-    let shape = if cpu {
+    let shape = if ascii {
+        "Keep the same aggregate input, character-counting scan and worker count.".into()
+    } else if cpu {
         "Keep the same aggregate dataset and arithmetic settings.".into()
     } else if offload {
         format!(

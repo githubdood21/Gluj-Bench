@@ -22,7 +22,7 @@ use std::{
 
 slint::include_modules!();
 
-const HARDWARE_METADATA_CACHE_VERSION: u32 = 17;
+const HARDWARE_METADATA_CACHE_VERSION: u32 = 22;
 const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
 const BENCHMARK_SAMPLES: u32 = 5;
 
@@ -198,6 +198,11 @@ struct App {
     result_selection: usize,
     queue: VecDeque<QueuedRun>,
     run_overrides: BTreeMap<String, TestOverride>,
+    vector_choices: BTreeMap<String, usize>,
+    benchmark_preferences: BenchmarkPreferences,
+    benchmark_preferences_path: PathBuf,
+    benchmark_preferences_writable: bool,
+    benchmark_preferences_status: String,
     dataset_text: String,
     active_request: Option<String>,
     progress: f32,
@@ -229,6 +234,11 @@ struct AppSettings {
     dataset_mode: usize,
     dataset_mib: u64,
     ram_offload_percent: u32,
+    vector_preset: usize,
+    vector_sweep: bool,
+    vector_size: String,
+    ram_bandwidth_custom: bool,
+    ram_bandwidth_bytes: u64,
 }
 impl Default for AppSettings {
     fn default() -> Self {
@@ -241,13 +251,40 @@ impl Default for AppSettings {
             dataset_mode: 0,
             dataset_mib: 256,
             ram_offload_percent: 75,
+            vector_preset: 0,
+            vector_sweep: true,
+            vector_size: "256 MiB".into(),
+            ram_bandwidth_custom: false,
+            ram_bandwidth_bytes: 256 * 1024 * 1024,
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct TestOverride {
     settings: AppSettings,
     dataset_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SavedBenchmarkPreference {
+    #[serde(default)]
+    selected_option: Option<String>,
+    #[serde(default)]
+    custom: Option<TestOverride>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct BenchmarkPreferences {
+    version: u32,
+    tests: BTreeMap<String, SavedBenchmarkPreference>,
+}
+impl Default for BenchmarkPreferences {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            tests: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -265,6 +302,152 @@ const DATASET_NAMES: [&str; 3] = [
 ];
 const DATASET_MODES: [&str; 3] = ["automatic", "sweep", "single"];
 const OFFLOAD_PERCENT: [u32; 3] = [50, 75, 100];
+const CPU_VECTOR_ID: &str = "cpu.performance.avx2.f32_fma.scaling";
+const CPU_MATRIX_ID: &str = "cpu.performance.matrix.fp32.scaling";
+const CPU_ASCII_ID: &str = "cpu.performance.string.ascii";
+const CPU_INT64_ID: &str = "cpu.performance.integer.i64";
+const CPU_RAM_BANDWIDTH_ID: &str = "cpu.bandwidth.memory";
+fn configurable_cpu_compute(id: &str) -> bool {
+    matches!(
+        id,
+        CPU_VECTOR_ID | CPU_MATRIX_ID | CPU_ASCII_ID | CPU_INT64_ID
+    )
+}
+fn register_arithmetic(id: &str) -> bool {
+    matches!(id, CPU_VECTOR_ID | CPU_INT64_ID)
+}
+fn buffered_cpu_compute(id: &str) -> bool {
+    matches!(id, CPU_MATRIX_ID | CPU_ASCII_ID)
+}
+const VECTOR_DEFAULT_CHOICE: usize = 0;
+const VECTOR_CHOICE_IDS: [&str; 3] = ["compute_speed", "data_sizes", "custom"];
+const VECTOR_PRESETS: [&str; 6] = ["legacy", "register", "l1", "l2", "l3", "ram"];
+const VECTOR_NAMES: [&str; 7] = [
+    "Use global dataset settings",
+    "Register compute",
+    "Automatic L1 cache",
+    "Automatic L2 cache",
+    "Automatic L3 cache",
+    "Automatic RAM budget",
+    "Custom size",
+];
+
+fn vector_size_bytes(text: &str) -> Result<u64, String> {
+    let mut parts = text.split_whitespace();
+    let number = parts.next().and_then(|value| value.parse::<u64>().ok());
+    let multiplier = match parts.next().unwrap_or("MiB").to_ascii_lowercase().as_str() {
+        "b" => Some(1_u64),
+        "kib" => Some(1024_u64),
+        "mib" => Some(1024_u64.pow(2)),
+        "gib" => Some(1024_u64.pow(3)),
+        _ => None,
+    };
+    number
+        .zip(multiplier)
+        .and_then(|(n, unit)| n.checked_mul(unit))
+        .filter(|bytes| *bytes > 0 && *bytes <= 1024_u64.pow(4) && parts.next().is_none())
+        .ok_or_else(|| {
+            "Enter a positive whole-number size, e.g. 64 KiB, 256 MiB or 8 GiB (maximum 1 TiB)."
+                .into()
+        })
+}
+
+#[derive(Clone, Copy)]
+struct DatasetSliderRange {
+    minimum: u64,
+    maximum: u64,
+    matrix_workers: Option<u32>,
+    alignment: u64,
+}
+
+impl DatasetSliderRange {
+    fn for_ram_bandwidth(workers: u32, last_level_cache: u64, available: u64) -> Self {
+        let (minimum, maximum) =
+            gluj_bench_core::ram_bandwidth_payload_range(last_level_cache, available, workers);
+        Self {
+            minimum,
+            maximum,
+            matrix_workers: None,
+            alignment: 64 * u64::from(workers.max(1)),
+        }
+    }
+    fn for_integer(workers: u32, budget: u64) -> Self {
+        let minimum = 1024 * u64::from(workers.max(1));
+        Self {
+            minimum,
+            maximum: budget.min(1024_u64.pow(4)) / minimum * minimum,
+            matrix_workers: None,
+            alignment: minimum,
+        }
+    }
+    fn for_ascii(workers: u32, budget: u64) -> Self {
+        let minimum = 64 * u64::from(workers.max(1));
+        Self {
+            minimum,
+            maximum: budget.min(1024_u64.pow(4)) / minimum * minimum,
+            matrix_workers: None,
+            alignment: minimum,
+        }
+    }
+    fn new(workers: u32, budget: u64) -> Self {
+        let minimum = 768 * u64::from(workers.max(1));
+        Self {
+            minimum,
+            maximum: budget.min(1024_u64.pow(4)) / minimum * minimum,
+            matrix_workers: None,
+            alignment: minimum,
+        }
+    }
+    fn for_matrix(workers: u32, budget: u64) -> Self {
+        let workers = workers.max(1);
+        let minimum = gluj_bench_core::cpu_matrix_bytes(32) * u64::from(workers);
+        let dimension =
+            gluj_bench_core::cpu_matrix_dimension(budget.min(1024_u64.pow(4)) / u64::from(workers));
+        Self {
+            minimum,
+            maximum: gluj_bench_core::cpu_matrix_bytes(dimension) * u64::from(workers),
+            matrix_workers: Some(workers),
+            alignment: minimum,
+        }
+    }
+    fn available(self) -> bool {
+        self.maximum >= self.minimum
+    }
+    fn clamp(self, bytes: u64) -> u64 {
+        if !self.available() {
+            return 0;
+        }
+        let bytes = bytes.max(self.minimum).min(self.maximum);
+        if let Some(workers) = self.matrix_workers {
+            gluj_bench_core::cpu_matrix_bytes(gluj_bench_core::cpu_matrix_dimension(
+                bytes / u64::from(workers),
+            )) * u64::from(workers)
+        } else {
+            bytes / self.alignment * self.alignment
+        }
+    }
+    fn bytes(self, position: f32) -> u64 {
+        if !self.available() {
+            return 0;
+        }
+        if position >= 1000.0 {
+            return self.maximum;
+        }
+        let fraction = f64::from(position.clamp(0.0, 1000.0)) / 1000.0;
+        let bytes = (self.minimum as f64
+            * (self.maximum as f64 / self.minimum as f64).powf(fraction))
+            as u64;
+        self.clamp(bytes)
+    }
+    fn position(self, bytes: u64) -> f32 {
+        if self.maximum <= self.minimum {
+            return 0.0;
+        }
+        ((self.clamp(bytes) as f64 / self.minimum as f64).ln()
+            / (self.maximum as f64 / self.minimum as f64).ln()
+            * 1000.0) as f32
+    }
+}
 
 fn validated_run_settings(
     settings: &AppSettings,
@@ -272,7 +455,19 @@ fn validated_run_settings(
     id: &str,
 ) -> Result<AppSettings, String> {
     let mut settings = settings.clone();
-    if id.ends_with(".scaling") && settings.dataset_mode != 0 {
+    if configurable_cpu_compute(id) && settings.vector_preset == 6 {
+        vector_size_bytes(&settings.vector_size)?;
+    }
+    if id == CPU_RAM_BANDWIDTH_ID
+        && settings.ram_bandwidth_custom
+        && settings.ram_bandwidth_bytes == 0
+    {
+        return Err("Choose a positive RAM bandwidth payload size.".into());
+    }
+    if (id.ends_with(".scaling") || matches!(id, CPU_ASCII_ID | CPU_INT64_ID))
+        && settings.dataset_mode != 0
+        && !(configurable_cpu_compute(id) && settings.vector_preset != 0)
+    {
         settings.dataset_mib = text
             .trim()
             .parse::<u64>()
@@ -289,6 +484,23 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
     let settings = &run.settings;
     let id = &run.benchmark_id;
     let mut options = serde_json::Map::new();
+    if id == CPU_RAM_BANDWIDTH_ID {
+        options.insert(
+            "ram_bandwidth_mode".into(),
+            if settings.ram_bandwidth_custom {
+                "custom"
+            } else {
+                "automatic"
+            }
+            .into(),
+        );
+        if settings.ram_bandwidth_custom {
+            options.insert(
+                "ram_bandwidth_bytes".into(),
+                settings.ram_bandwidth_bytes.to_string().into(),
+            );
+        }
+    }
     options.insert(
         "vram_budget_percent".into(),
         settings.vram_budget_percent.to_string().into(),
@@ -322,7 +534,7 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
             settings.ram_offload_percent.to_string().into(),
         );
     }
-    if id.ends_with(".scaling") {
+    if id.ends_with(".scaling") || matches!(id.as_str(), CPU_ASCII_ID | CPU_INT64_ID) {
         options.insert(
             "dataset_mode".into(),
             DATASET_MODES[settings.dataset_mode].into(),
@@ -338,6 +550,62 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
         && let Some(device) = &run.gpu_id
     {
         options.insert("device_id".into(), device.clone().into());
+    }
+    if matches!(id.as_str(), CPU_ASCII_ID | CPU_INT64_ID) && settings.vector_preset == 0 {
+        options.insert(
+            if id == CPU_INT64_ID {
+                "int64_preset"
+            } else {
+                "ascii_preset"
+            }
+            .into(),
+            "legacy".into(),
+        );
+    }
+    if configurable_cpu_compute(id) && settings.vector_preset != 0 {
+        let preset = if settings.vector_preset == 6 {
+            "custom"
+        } else {
+            if buffered_cpu_compute(id) && settings.vector_preset == 1 {
+                "compute"
+            } else {
+                VECTOR_PRESETS[settings.vector_preset]
+            }
+        };
+        options.insert(
+            if id == CPU_MATRIX_ID {
+                "matrix_preset"
+            } else if id == CPU_ASCII_ID {
+                "ascii_preset"
+            } else if id == CPU_INT64_ID {
+                "int64_preset"
+            } else {
+                "vector_preset"
+            }
+            .into(),
+            preset.into(),
+        );
+        options.insert(
+            "dataset_mode".into(),
+            if preset == "register" {
+                "register"
+            } else if settings.vector_sweep {
+                "sweep"
+            } else {
+                "single"
+            }
+            .into(),
+        );
+        options.remove("dataset_bytes");
+        if preset == "custom" {
+            options.insert(
+                "dataset_bytes".into(),
+                vector_size_bytes(&settings.vector_size)
+                    .expect("queued settings validated")
+                    .to_string()
+                    .into(),
+            );
+        }
     }
     options
 }
@@ -365,17 +633,59 @@ fn configuration_summary(settings: &AppSettings, id: &str) -> String {
             )
         });
     }
-    if cpu_scaling(id) || gpu_offload(id) {
+    if (cpu_scaling(id) || gpu_offload(id))
+        && !(register_arithmetic(id) && settings.vector_preset == 1)
+    {
         parts.push(format!("RAM budget {}%", settings.ram_budget_percent));
     }
     if gpu_offload(id) {
         parts.push(format!("{}% RAM offload", settings.ram_offload_percent));
     }
-    if id.ends_with(".scaling") {
+    if configurable_cpu_compute(id) && settings.vector_preset != 0 {
+        parts.push(
+            if buffered_cpu_compute(id) && settings.vector_preset == 1 {
+                if id == CPU_ASCII_ID {
+                    "Automatic scan-sized input"
+                } else {
+                    "Automatic compute-sized data"
+                }
+            } else {
+                VECTOR_NAMES[settings.vector_preset]
+            }
+            .into(),
+        );
+        if buffered_cpu_compute(id) || settings.vector_preset != 1 {
+            parts.push(
+                if settings.vector_sweep {
+                    "Sweep to target"
+                } else {
+                    "One dataset"
+                }
+                .into(),
+            );
+            if settings.vector_preset == 6 {
+                parts.push(
+                    vector_size_bytes(&settings.vector_size)
+                        .map(|bytes| format_binary_size(bytes as f64))
+                        .unwrap_or_else(|_| settings.vector_size.clone()),
+                );
+            }
+        }
+    } else if id.ends_with(".scaling") || matches!(id, CPU_ASCII_ID | CPU_INT64_ID) {
         parts.push(match settings.dataset_mode {
             1 => format!("Sweep up to {} MiB", settings.dataset_mib),
             2 => format!("One dataset: {} MiB", settings.dataset_mib),
             _ => "Automatic dataset sweep".into(),
+        });
+    }
+    if id == CPU_RAM_BANDWIDTH_ID {
+        parts.push(if settings.ram_bandwidth_custom {
+            format!(
+                "RAM payload: {}",
+                format_binary_size(settings.ram_bandwidth_bytes as f64)
+            )
+        } else {
+            "Automatic RAM payload".into()
         });
     }
     parts.join(" · ")
@@ -389,6 +699,55 @@ fn settings_path() -> PathBuf {
     results_path().with_file_name("settings.json")
 }
 
+fn benchmark_preferences_path() -> PathBuf {
+    results_path().with_file_name("benchmark-settings.json")
+}
+
+fn load_benchmark_preferences(path: &std::path::Path) -> Result<BenchmarkPreferences, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BenchmarkPreferences::default());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let preferences: BenchmarkPreferences =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if preferences.version != 1 {
+        return Err("Unsupported benchmark-settings.json version.".into());
+    }
+    for (id, preference) in &preferences.tests {
+        if let Some(option) = &preference.selected_option {
+            if !configurable_cpu_compute(id) || !VECTOR_CHOICE_IDS.contains(&option.as_str()) {
+                return Err(format!("Invalid saved option for {id}."));
+            }
+            if option == "custom" && preference.custom.is_none() {
+                return Err(format!("Missing custom settings for {id}."));
+            }
+        }
+        if let Some(custom) = &preference.custom {
+            if !settings_valid(&custom.settings) {
+                return Err(format!("Invalid saved settings for {id}."));
+            }
+            validated_run_settings(&custom.settings, &custom.dataset_text, id)?;
+        }
+    }
+    Ok(preferences)
+}
+
+fn settings_valid(settings: &AppSettings) -> bool {
+    settings.cpu_intensity < 3
+        && settings.gpu_intensity < 3
+        && (20..=80).contains(&settings.vram_budget_percent)
+        && (20..=80).contains(&settings.ram_budget_percent)
+        && settings.dataset_mode <= 2
+        && settings.vector_preset <= 6
+        && vector_size_bytes(&settings.vector_size).is_ok()
+        && settings.ram_bandwidth_bytes > 0
+        && (1..=1_048_576).contains(&settings.dataset_mib)
+        && OFFLOAD_PERCENT.contains(&settings.ram_offload_percent)
+}
+
 fn load_settings(path: &std::path::Path) -> Result<AppSettings, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -398,14 +757,7 @@ fn load_settings(path: &std::path::Path) -> Result<AppSettings, String> {
         Err(error) => return Err(error.to_string()),
     };
     let settings: AppSettings = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if settings.cpu_intensity >= 3
-        || settings.gpu_intensity >= 3
-        || !(20..=80).contains(&settings.vram_budget_percent)
-        || !(20..=80).contains(&settings.ram_budget_percent)
-        || settings.dataset_mode > 2
-        || !(1..=1_048_576).contains(&settings.dataset_mib)
-        || !OFFLOAD_PERCENT.contains(&settings.ram_offload_percent)
-    {
+    if !settings_valid(&settings) {
         return Err("invalid intensity setting".into());
     }
     Ok(settings)
@@ -438,6 +790,11 @@ impl App {
             result_selection: 0,
             queue: VecDeque::new(),
             run_overrides: BTreeMap::new(),
+            vector_choices: BTreeMap::new(),
+            benchmark_preferences: BenchmarkPreferences::default(),
+            benchmark_preferences_path: benchmark_preferences_path(),
+            benchmark_preferences_writable: true,
+            benchmark_preferences_status: String::new(),
             dataset_text: "256".into(),
             active_request: None,
             progress: 0.,
@@ -467,6 +824,15 @@ impl App {
             }
         }
         app.dataset_text = app.settings.dataset_mib.to_string();
+        match load_benchmark_preferences(&app.benchmark_preferences_path) {
+            Ok(preferences) => app.restore_benchmark_preferences(preferences),
+            Err(error) => {
+                app.benchmark_preferences_writable = false;
+                app.benchmark_preferences_status = format!(
+                    "Using first-use benchmark defaults. Could not load benchmark-settings.json: {error} Existing file preserved; benchmark changes apply only to this session."
+                );
+            }
+        }
         match load_results(&results_path()) {
             Ok(results) => {
                 app.results = results.clone();
@@ -514,7 +880,7 @@ impl App {
                     } else {
                         app.run_overrides.remove(&id);
                     }
-                    app.ui_dirty = true;
+                    app.persist_benchmark_preferences();
                 }
             }
         });
@@ -529,6 +895,24 @@ impl App {
         window.on_edit_test_dataset(move |text| {
             if let Some(app) = weak.upgrade() {
                 app.borrow_mut().edit_dataset(true, text.to_string());
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_select_vector_size(move |position| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut().edit_vector_slider(position);
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_select_vector_choice(move |index| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut().select_vector_choice(index);
+            }
+        });
+        let weak = Rc::downgrade(app);
+        window.on_reset_vector_configuration(move || {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut().reset_vector_configuration();
             }
         });
         let app_weak = Rc::downgrade(app);
@@ -575,7 +959,11 @@ impl App {
                 {
                     return;
                 }
-                app.settings.cpu_core_limit = index as u32;
+                app.settings.cpu_core_limit = if index as u32 == app.physical_core_count() {
+                    0
+                } else {
+                    index as u32
+                };
                 app.persist_settings();
             }
         });
@@ -725,13 +1113,263 @@ impl App {
         }
         self.ui_dirty = true;
     }
+    fn restore_benchmark_preferences(&mut self, preferences: BenchmarkPreferences) {
+        self.run_overrides.clear();
+        self.vector_choices.clear();
+        for (id, preference) in &preferences.tests {
+            if let Some(custom) = &preference.custom {
+                self.run_overrides.insert(id.clone(), custom.clone());
+            }
+            if configurable_cpu_compute(id)
+                && let Some(option) = &preference.selected_option
+                && let Some(index) = VECTOR_CHOICE_IDS
+                    .iter()
+                    .position(|choice| *choice == option)
+            {
+                self.vector_choices.insert(id.clone(), index);
+            }
+        }
+        self.benchmark_preferences = preferences;
+    }
+    fn snapshot_benchmark_preferences(&self) -> BenchmarkPreferences {
+        let mut preferences = BenchmarkPreferences::default();
+        let ids = self
+            .run_overrides
+            .keys()
+            .chain(self.vector_choices.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in ids {
+            let custom = self.run_overrides.get(id).and_then(|custom| {
+                if settings_valid(&custom.settings)
+                    && validated_run_settings(&custom.settings, &custom.dataset_text, id).is_ok()
+                {
+                    Some(custom.clone())
+                } else {
+                    self.benchmark_preferences
+                        .tests
+                        .get(id)
+                        .and_then(|saved| saved.custom.clone())
+                }
+            });
+            let selected_option = if configurable_cpu_compute(id) {
+                Some(VECTOR_CHOICE_IDS[self.compute_choice(id)].to_owned())
+            } else {
+                None
+            };
+            if selected_option.as_deref() == Some("custom") && custom.is_none() {
+                continue;
+            }
+            preferences.tests.insert(
+                id.clone(),
+                SavedBenchmarkPreference {
+                    selected_option,
+                    custom,
+                },
+            );
+        }
+        preferences
+    }
+    fn persist_benchmark_preferences(&mut self) {
+        self.ui_dirty = true;
+        let preferences = self.snapshot_benchmark_preferences();
+        if !self.benchmark_preferences_writable {
+            self.benchmark_preferences = preferences;
+            return;
+        }
+        if preferences == self.benchmark_preferences {
+            return;
+        }
+        match write_json(&self.benchmark_preferences_path, &preferences) {
+            Ok(()) => {
+                self.benchmark_preferences = preferences;
+                self.benchmark_preferences_status =
+                    "Per-test choices and custom settings saved to benchmark-settings.json.".into();
+            }
+            Err(error) => {
+                self.benchmark_preferences_status = format!(
+                    "Per-test changes apply for this session, but could not be saved: {error}"
+                )
+            }
+        }
+    }
+    fn reset_vector_configuration(&mut self) {
+        if self.active_request.is_some() {
+            return;
+        }
+        let id = self.selected.as_deref().unwrap_or(CPU_VECTOR_ID).to_owned();
+        if !configurable_cpu_compute(&id) {
+            return;
+        }
+        self.run_overrides.remove(&id);
+        self.vector_choices.remove(&id);
+        self.persist_benchmark_preferences();
+    }
+    #[cfg(test)]
+    fn vector_choice(&self) -> usize {
+        self.compute_choice(CPU_VECTOR_ID)
+    }
+    fn compute_choice(&self, id: &str) -> usize {
+        self.vector_choices.get(id).copied().unwrap_or_else(|| {
+            if self.run_overrides.contains_key(id) {
+                2
+            } else {
+                VECTOR_DEFAULT_CHOICE
+            }
+        })
+    }
+    fn select_vector_choice(&mut self, index: i32) {
+        let Some(id) = self
+            .selected
+            .clone()
+            .filter(|id| configurable_cpu_compute(id))
+        else {
+            return;
+        };
+        if self.active_request.is_some() || !(0..3).contains(&index) {
+            return;
+        }
+        if index == 2 {
+            self.run_overrides.entry(id.clone()).or_insert_with(|| {
+                let mut settings = self.settings.clone();
+                settings.vector_preset = 6;
+                settings.vector_sweep = false;
+                TestOverride {
+                    settings,
+                    dataset_text: self.dataset_text.clone(),
+                }
+            });
+        }
+        self.vector_choices.insert(id, index as usize);
+        self.persist_benchmark_preferences();
+    }
     fn effective_settings(&self, id: &str) -> Result<AppSettings, String> {
+        if configurable_cpu_compute(id) && self.compute_choice(id) != 2 {
+            let mut settings = self.settings.clone();
+            settings.cpu_core_limit = 0;
+            settings.dataset_mode = 0;
+            settings.vector_preset = if self.compute_choice(id) == 0 { 1 } else { 5 };
+            settings.vector_sweep = !(buffered_cpu_compute(id) && self.compute_choice(id) == 0);
+            if (buffered_cpu_compute(id) || self.compute_choice(id) == 1)
+                && !self.compute_slider_range(id, &settings).available()
+            {
+                return Err("Not enough available RAM for the automatic data-size sweep.".into());
+            }
+            return Ok(settings);
+        }
         let (settings, text) = self
             .run_overrides
             .get(id)
             .map(|config| (&config.settings, config.dataset_text.as_str()))
             .unwrap_or((&self.settings, self.dataset_text.as_str()));
-        validated_run_settings(settings, text, id)
+        let mut settings = validated_run_settings(settings, text, id)?;
+        if id == CPU_RAM_BANDWIDTH_ID && settings.ram_bandwidth_custom {
+            let range = self.ram_bandwidth_slider_range(&settings);
+            if !range.available() {
+                return Err(
+                    "Not enough available RAM for a RAM-sized payload and both buffers.".into(),
+                );
+            }
+            settings.ram_bandwidth_bytes = range.clamp(settings.ram_bandwidth_bytes);
+        }
+        if configurable_cpu_compute(id) && settings.vector_preset == 6 {
+            let range = self.compute_slider_range(id, &settings);
+            if !range.available() {
+                return Err(
+                    "Not enough available RAM for the selected workers and allocation budget."
+                        .into(),
+                );
+            }
+            settings.vector_size = format!(
+                "{} B",
+                range.clamp(vector_size_bytes(&settings.vector_size)?)
+            );
+        }
+        Ok(settings)
+    }
+    fn ram_bandwidth_slider_range(&self, settings: &AppSettings) -> DatasetSliderRange {
+        let mut memory = sysinfo::System::new();
+        memory.refresh_memory();
+        let workers = if settings.cpu_core_limit == 0 {
+            self.physical_core_count()
+        } else {
+            settings.cpu_core_limit.min(self.physical_core_count())
+        };
+        let caches = self
+            .devices
+            .iter()
+            .find(|device| device.category == DeviceCategory::Cpu)
+            .map(|device| device.caches.as_slice())
+            .unwrap_or(&[]);
+        let highest = caches.iter().map(|cache| cache.level).max().unwrap_or(0);
+        let llc = caches
+            .iter()
+            .filter(|cache| cache.level == highest)
+            .map(|cache| cache.size_bytes.saturating_mul(cache.instances as u64))
+            .sum();
+        DatasetSliderRange::for_ram_bandwidth(workers, llc, memory.available_memory())
+    }
+    fn compute_slider_range(&self, id: &str, settings: &AppSettings) -> DatasetSliderRange {
+        let mut memory = sysinfo::System::new();
+        memory.refresh_memory();
+        let workers = if settings.cpu_core_limit == 0 {
+            self.physical_core_count()
+        } else {
+            settings.cpu_core_limit.min(self.physical_core_count())
+        };
+        let budget = gluj_bench_core::ram_allocation_budget(
+            memory.total_memory(),
+            memory.available_memory(),
+            settings.ram_budget_percent,
+        );
+        if id == CPU_MATRIX_ID {
+            DatasetSliderRange::for_matrix(workers, budget)
+        } else if id == CPU_ASCII_ID {
+            DatasetSliderRange::for_ascii(workers, budget)
+        } else if id == CPU_INT64_ID {
+            DatasetSliderRange::for_integer(workers, budget)
+        } else {
+            DatasetSliderRange::new(workers, budget)
+        }
+    }
+    fn edit_vector_slider(&mut self, position: f32) {
+        if self.active_request.is_some() || !position.is_finite() {
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let Some(config) = self.run_overrides.get(&id) else {
+            return;
+        };
+        if id == CPU_RAM_BANDWIDTH_ID {
+            if !config.settings.ram_bandwidth_custom {
+                return;
+            }
+            let range = self.ram_bandwidth_slider_range(&config.settings);
+            if !range.available() {
+                return;
+            }
+            self.run_overrides
+                .get_mut(&id)
+                .unwrap()
+                .settings
+                .ram_bandwidth_bytes = range.bytes(position);
+            self.persist_benchmark_preferences();
+            return;
+        }
+        if !configurable_cpu_compute(&id) || config.settings.vector_preset != 6 {
+            return;
+        }
+        let range = self.compute_slider_range(&id, &config.settings);
+        if !range.available() {
+            return;
+        }
+        self.run_overrides
+            .get_mut(&id)
+            .unwrap()
+            .settings
+            .vector_size = format!("{} B", range.bytes(position));
+        self.persist_benchmark_preferences();
     }
     fn edit_configuration(&mut self, local: bool, field: &str, index: i32) {
         if self.active_request.is_some() || index < 0 {
@@ -753,19 +1391,28 @@ impl App {
         match field {
             "cpu" if index < 3 => settings.cpu_intensity = index as usize,
             "gpu" if index < 3 => settings.gpu_intensity = index as usize,
-            "cores" if index as u32 <= cores => settings.cpu_core_limit = index as u32,
+            "cores" if index as u32 <= cores => {
+                settings.cpu_core_limit = if index as u32 == cores {
+                    0
+                } else {
+                    index as u32
+                }
+            }
             "ram" if index < 8 => settings.ram_budget_percent = VRAM_BUDGET_OPTIONS[index as usize],
             "vram" if index < 8 => {
                 settings.vram_budget_percent = VRAM_BUDGET_OPTIONS[index as usize]
             }
             "dataset" if index < 3 => settings.dataset_mode = index as usize,
+            "ram-bandwidth-size" if index < 2 => settings.ram_bandwidth_custom = index == 1,
+            "vector-preset" if index < 7 => settings.vector_preset = index as usize,
+            "vector-mode" if index < 2 => settings.vector_sweep = index == 1,
             "offload" if index < 3 => {
                 settings.ram_offload_percent = OFFLOAD_PERCENT[index as usize]
             }
             _ => return,
         }
         if local {
-            self.ui_dirty = true;
+            self.persist_benchmark_preferences();
         } else {
             self.persist_settings();
         }
@@ -797,12 +1444,39 @@ impl App {
                 self.persist_settings();
             }
         }
+        if local {
+            self.persist_benchmark_preferences();
+        }
         self.ui_dirty = true;
     }
     fn queued_run(&self, id: &str) -> Result<QueuedRun, String> {
+        let settings = self.effective_settings(id)?;
+        if configurable_cpu_compute(id) && settings.vector_preset == 6 {
+            let workers = if settings.cpu_core_limit == 0 {
+                self.physical_core_count()
+            } else {
+                settings.cpu_core_limit.min(self.physical_core_count())
+            }
+            .max(1);
+            let minimum = if id == CPU_MATRIX_ID {
+                12288
+            } else if id == CPU_ASCII_ID {
+                64
+            } else if id == CPU_INT64_ID {
+                1024
+            } else {
+                768
+            } * u64::from(workers);
+            if vector_size_bytes(&settings.vector_size)? < minimum {
+                return Err(format!(
+                    "Dataset must be at least {} bytes for {workers} selected workers.",
+                    minimum
+                ));
+            }
+        }
         Ok(QueuedRun {
             benchmark_id: id.into(),
-            settings: self.effective_settings(id)?,
+            settings,
             gpu_id: self.selected_gpu_id.clone(),
             physical_cores: self.physical_core_count(),
         })
@@ -1080,7 +1754,15 @@ impl App {
         window
             .set_vram_budget_name(format!("{}% of VRAM", app.settings.vram_budget_percent).into());
         window.set_ram_budget_name(format!("{}% of RAM", app.settings.ram_budget_percent).into());
-        let mut core_options = vec![SharedString::from("Automatic · all physical cores")];
+        let mut core_options = vec![SharedString::from(format!(
+            "All {} physical core{} (automatic)",
+            app.physical_core_count(),
+            if app.physical_core_count() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ))];
         core_options.extend((1..=app.physical_core_count()).map(|n| {
             SharedString::from(format!(
                 "{n} physical core{}",
@@ -1106,14 +1788,141 @@ impl App {
         );
         let selected_id = app.selected.as_deref().unwrap_or("");
         let local = app.run_overrides.get(selected_id);
-        let settings = local.map(|c| &c.settings).unwrap_or(&app.settings);
+        if window.get_configuration_test_id().as_str() != selected_id
+            || window.get_test_override_enabled() != local.is_some()
+        {
+            window.set_configuration_scroll_offset(0.0);
+        }
+        window.set_configuration_test_id(selected_id.into());
+        let effective_settings = app.effective_settings(selected_id);
+        let settings = effective_settings
+            .as_ref()
+            .unwrap_or_else(|_| local.map(|c| &c.settings).unwrap_or(&app.settings));
+        let core_count = app.physical_core_count();
+        window.set_cpu_core_maximum(core_count as f32);
+        window.set_cpu_core_value(if app.settings.cpu_core_limit == 0 {
+            core_count
+        } else {
+            app.settings.cpu_core_limit.min(core_count)
+        } as f32);
+        window.set_test_core_value(if settings.cpu_core_limit == 0 {
+            core_count
+        } else {
+            settings.cpu_core_limit.min(core_count)
+        } as f32);
+        window.set_test_cpu_index(settings.cpu_intensity as i32);
+        window.set_test_gpu_index(settings.gpu_intensity as i32);
+        window.set_test_ram_index(
+            VRAM_BUDGET_OPTIONS
+                .iter()
+                .position(|percent| *percent == settings.ram_budget_percent)
+                .unwrap_or(0) as i32,
+        );
+        window.set_test_vram_index(
+            VRAM_BUDGET_OPTIONS
+                .iter()
+                .position(|percent| *percent == settings.vram_budget_percent)
+                .unwrap_or(1) as i32,
+        );
+        window.set_test_offload_index(
+            OFFLOAD_PERCENT
+                .iter()
+                .position(|percent| *percent == settings.ram_offload_percent)
+                .unwrap_or(1) as i32,
+        );
+        window.set_test_dataset_index(settings.dataset_mode as i32);
         window.set_test_override_enabled(local.is_some());
         window
             .set_test_is_cpu(selected_id.starts_with("cpu.") || selected_id.starts_with("memory."));
         window.set_test_is_gpu(selected_id.starts_with("gpu."));
-        window.set_test_is_scaling(selected_id.ends_with(".scaling"));
+        window.set_test_is_scaling(
+            selected_id.ends_with(".scaling") || matches!(selected_id, CPU_ASCII_ID | CPU_INT64_ID),
+        );
+        window.set_test_is_configurable_compute(configurable_cpu_compute(selected_id));
+        window.set_test_is_matrix(selected_id == CPU_MATRIX_ID);
+        window.set_test_is_ascii(selected_id == CPU_ASCII_ID);
+        window.set_test_is_int64(selected_id == CPU_INT64_ID);
+        window.set_test_is_ram_bandwidth(selected_id == CPU_RAM_BANDWIDTH_ID);
+        window.set_test_ram_bandwidth_custom(settings.ram_bandwidth_custom);
+        window.set_test_ram_bandwidth_index(i32::from(settings.ram_bandwidth_custom));
+        window.set_test_vector_choice_index(app.compute_choice(selected_id) as i32);
+        window.set_test_vector_can_reset(
+            app.compute_choice(selected_id) != VECTOR_DEFAULT_CHOICE
+                || app.run_overrides.contains_key(selected_id),
+        );
+        window.set_test_vector_legacy(settings.vector_preset == 0);
+        window.set_test_vector_register(
+            register_arithmetic(selected_id) && settings.vector_preset == 1,
+        );
+        window.set_test_vector_custom(settings.vector_preset == 6);
+        window.set_test_vector_preset_index(settings.vector_preset as i32);
+        window.set_test_vector_mode_index(i32::from(settings.vector_sweep));
+        let range = if selected_id == CPU_RAM_BANDWIDTH_ID {
+            app.ram_bandwidth_slider_range(settings)
+        } else {
+            app.compute_slider_range(selected_id, settings)
+        };
+        let bytes = range.clamp(if selected_id == CPU_RAM_BANDWIDTH_ID {
+            settings.ram_bandwidth_bytes
+        } else {
+            vector_size_bytes(&settings.vector_size).unwrap_or(range.minimum)
+        });
+        window.set_test_vector_size(format_binary_size(bytes as f64).into());
+        window.set_test_vector_size_position(range.position(bytes));
+        window.set_test_vector_size_available(range.available());
+        window.set_test_vector_size_range(if range.available() {
+            if selected_id == CPU_RAM_BANDWIDTH_ID {
+                format!("{} to {} of payload across all workers. The limit reserves space for both buffers and leaves available-memory headroom.", format_binary_size(range.minimum as f64), format_binary_size(range.maximum as f64))
+            } else { format!("{} to {} · current RAM budget and available memory. The scale spans KiB through GiB.", format_binary_size(range.minimum as f64), format_binary_size(range.maximum as f64)) }
+        } else { "Not enough available RAM for this allocation.".into() }.into());
+        let mut matrix_automatic_bytes = None;
+        let vector_preview = match settings.vector_preset {
+            1 if buffered_cpu_compute(selected_id) => {
+                let workers = if settings.cpu_core_limit == 0 { app.physical_core_count() } else { settings.cpu_core_limit.min(app.physical_core_count()) }.max(1);
+                let target = app.benchmarks.iter().find(|benchmark| benchmark.id == selected_id)
+                    .and_then(|benchmark| benchmark.metadata.get("automatic_compute_dataset_sizes"))
+                    .and_then(|sizes| sizes.split(',').nth(workers as usize - 1))
+                    .and_then(|bytes| bytes.parse::<u64>().ok()).unwrap_or(if selected_id == CPU_ASCII_ID { 64 * 1024 } else { 256 * 1024 } * u64::from(workers));
+                let actual = range.clamp(target);
+                matrix_automatic_bytes = Some(actual);
+                if selected_id == CPU_ASCII_ID {
+                    format!("{} input total · {} per worker", format_binary_size(actual as f64), format_binary_size(actual as f64 / workers as f64))
+                } else {
+                    let dimension = gluj_bench_core::cpu_matrix_dimension(actual / u64::from(workers));
+                    format!("{} total · 32 × {dimension} × {dimension} per worker", format_binary_size(actual as f64))
+                }
+            },
+            1 => "Register arithmetic · no streaming allocation".to_owned(),
+            2..=4 => {
+                let workers = if settings.cpu_core_limit == 0 { app.physical_core_count() } else { settings.cpu_core_limit.min(app.physical_core_count()) };
+                app.benchmarks.iter().find(|benchmark| benchmark.id == selected_id)
+                    .and_then(|benchmark| benchmark.metadata.get(&format!("cache_l{}_dataset_sizes", settings.vector_preset - 1)))
+                    .and_then(|sizes| sizes.split(',').nth(workers.saturating_sub(1) as usize))
+                    .and_then(|bytes| bytes.parse::<u64>().ok())
+                    .map(|bytes| {
+                        if selected_id == CPU_MATRIX_ID {
+                            let dimension = gluj_bench_core::cpu_matrix_dimension(bytes / u64::from(workers.max(1)));
+                            format!("{} total · 32 × {dimension} × {dimension} per worker", format_binary_size(bytes as f64))
+                        } else { format!("Target allocation: {} total · {} per worker", format_binary_size(bytes as f64), format_binary_size(bytes as f64 / workers.max(1) as f64)) }
+                    })
+                    .unwrap_or_else(|| "Cache sizing unavailable for the selected workers.".into())
+            },
+            6 => vector_size_bytes(&settings.vector_size).map(|bytes| {
+                let workers = if settings.cpu_core_limit == 0 { app.physical_core_count() } else { settings.cpu_core_limit.min(app.physical_core_count()) }.max(1) as u64;
+                let actual = range.clamp(bytes);
+                if selected_id == CPU_MATRIX_ID {
+                    let dimension = gluj_bench_core::cpu_matrix_dimension(actual / workers);
+                    format!("{} total · 32 × {dimension} × {dimension} per worker", format_binary_size(actual as f64))
+                } else { format!("Target allocation: {} total (aligned to {} workers)", format_binary_size(actual as f64), workers) }
+            }).unwrap_or_else(|error| error),
+            _ => "RAM targets resolve against the allocation budget and available memory at run time.".into(),
+        };
+        window.set_test_vector_preview(vector_preview.clone().into());
         window.set_test_is_offload(gpu_offload(selected_id));
-        window.set_test_has_ram(cpu_scaling(selected_id) || gpu_offload(selected_id));
+        window.set_test_has_ram(
+            (cpu_scaling(selected_id) || gpu_offload(selected_id))
+                && !(register_arithmetic(selected_id) && settings.vector_preset == 1),
+        );
         window.set_test_cpu_name(INTENSITY_NAMES[settings.cpu_intensity].into());
         window.set_test_gpu_name(INTENSITY_NAMES[settings.gpu_intensity].into());
         window.set_test_core_name(if settings.cpu_core_limit == 0 {
@@ -1133,10 +1942,43 @@ impl App {
                 .unwrap_or_else(|| app.dataset_text.clone())
                 .into(),
         );
-        let effective = app.effective_settings(selected_id);
+        let effective = app.queued_run(selected_id).map(|run| run.settings);
         window.set_test_configuration_valid(effective.is_ok());
         window.set_test_configuration_summary(
             match effective {
+                Ok(_)
+                    if buffered_cpu_compute(selected_id)
+                        && app.compute_choice(selected_id) == 0 =>
+                {
+                    format!(
+                        "{} · all {} CPU cores",
+                        format_binary_size(matrix_automatic_bytes.unwrap_or(0) as f64),
+                        app.physical_core_count()
+                    )
+                }
+                Ok(_)
+                    if register_arithmetic(selected_id) && app.compute_choice(selected_id) == 0 =>
+                {
+                    format!(
+                        "Measures calculation speed using all {} CPU cores.",
+                        app.physical_core_count()
+                    )
+                }
+                Ok(settings)
+                    if configurable_cpu_compute(selected_id)
+                        && app.compute_choice(selected_id) == 1 =>
+                {
+                    format!(
+                        "Up to {} · all {} CPU cores",
+                        format_binary_size(
+                            app.compute_slider_range(selected_id, &settings).maximum as f64
+                        ),
+                        app.physical_core_count()
+                    )
+                }
+                Ok(settings) if configurable_cpu_compute(selected_id) => {
+                    configuration_summary(&settings, selected_id)
+                }
                 Ok(settings) => format!(
                     "{} · {}",
                     if local.is_some() {
@@ -1152,7 +1994,14 @@ impl App {
         );
         window.set_cpu_intensity_name(INTENSITY_NAMES[app.settings.cpu_intensity].into());
         window.set_gpu_intensity_name(INTENSITY_NAMES[app.settings.gpu_intensity].into());
-        window.set_settings_status(app.settings_status.clone().into());
+        window.set_settings_status(
+            format!(
+                "{} {}",
+                app.settings_status, app.benchmark_preferences_status
+            )
+            .trim()
+            .into(),
+        );
         window.set_load_description(
             format!(
                 "CPU activity target: {}% · GPU activity target: {}%",
@@ -1550,6 +2399,15 @@ fn load_results(path: &std::path::Path) -> Result<Vec<BenchmarkResult>, String> 
         return Err("unsupported results file version".into());
     }
     for result in &mut file.results {
+        if result.benchmark_id == "cpu.performance.avx2.f32_fma" {
+            result.benchmark_id = CPU_VECTOR_ID.into();
+            result
+                .workload_metadata
+                .insert("vector_preset".into(), "register".into());
+            result
+                .workload_metadata
+                .insert("dataset_mode".into(), "register".into());
+        }
         // Retire the old pseudo-utilization fields while preserving actual measurements.
         result.metrics.retain(|m| {
             !m.name.ends_with(".gpu_busy_estimate") && !m.name.ends_with(".gpu_wait_estimate")
@@ -1662,6 +2520,16 @@ fn remember_result(saved: &mut Vec<BenchmarkResult>, result: &BenchmarkResult) {
                 != result.workload_metadata.get("dataset_mode")
             || old.workload_metadata.get("requested_dataset_bytes")
                 != result.workload_metadata.get("requested_dataset_bytes")
+            || old.workload_metadata.get("vector_preset")
+                != result.workload_metadata.get("vector_preset")
+            || old.workload_metadata.get("matrix_preset")
+                != result.workload_metadata.get("matrix_preset")
+            || old.workload_metadata.get("ascii_preset")
+                != result.workload_metadata.get("ascii_preset")
+            || old.workload_metadata.get("int64_preset")
+                != result.workload_metadata.get("int64_preset")
+            || (result.benchmark_id == CPU_RAM_BANDWIDTH_ID
+                && ram_bandwidth_payload(old) != ram_bandwidth_payload(result))
     });
     saved.push(result.clone());
     // Keep one latest result per workload/setup, with a bounded portable archive.
@@ -1790,7 +2658,7 @@ fn result_load_percent(result: &BenchmarkResult) -> u32 {
 }
 
 fn result_load_signature(result: &BenchmarkResult) -> (u32, u32, u32, u32) {
-    let vram = if component_family(result) == "gpu" && result.benchmark_id.ends_with(".scaling") {
+    let vram = if component_family(result) == "gpu" && scaling_result(result) {
         result
             .workload_metadata
             .get("vram_budget_percent")
@@ -1952,8 +2820,17 @@ fn result_section(result: &BenchmarkResult) -> i32 {
     }
 }
 
+fn ram_bandwidth_payload(result: &BenchmarkResult) -> Option<u64> {
+    result
+        .workload_metadata
+        .get("actual_payload_bytes")
+        .or_else(|| result.workload_metadata.get("payload_bytes"))
+        .and_then(|value| value.parse().ok())
+}
 fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bool {
     result_load_signature(left) == result_load_signature(right)
+        && (left.benchmark_id != CPU_RAM_BANDWIDTH_ID
+            || ram_bandwidth_payload(left) == ram_bandwidth_payload(right))
         && [
             "ram_offload_percent",
             "requested_dataset_bytes",
@@ -1962,6 +2839,12 @@ fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bo
             "compute_profile_revision",
             "latency_profile_revision",
             "cpu_pacing_revision",
+            "vector_preset",
+            "matrix_preset",
+            "ascii_preset",
+            "int64_preset",
+            "kernel_revision",
+            "resolved_dataset_bytes",
         ]
         .iter()
         .all(|key| left.workload_metadata.get(*key) == right.workload_metadata.get(*key))
@@ -2228,7 +3111,7 @@ fn result_row(
     } else {
         title.to_owned()
     };
-    let diagnosis = if result.benchmark_id.ends_with(".scaling") {
+    let diagnosis = if scaling_result(result) {
         match (
             result
                 .workload_metadata
@@ -2324,8 +3207,7 @@ fn result_row(
         tuning_actions: ModelRc::new(VecModel::from(tuning.actions)),
         tuning_quality: tuning.quality.into(),
         gpu_timing_available: !gpu_timing_svg.is_empty(),
-        gpu_timing_visible: result.benchmark_id.starts_with("gpu.")
-            && result.benchmark_id.ends_with(".scaling"),
+        gpu_timing_visible: result.benchmark_id.starts_with("gpu.") && scaling_result(result),
         gpu_timing_chart: slint::Image::load_from_svg_data(gpu_timing_svg.as_bytes())
             .ok()
             .unwrap_or_default(),
@@ -2347,7 +3229,12 @@ fn result_row(
                 .iter()
                 .map(|(bytes, compute)| {
                     let mut text = format!(
-                        "Compute: {} (min {}, max {}; {} samples)",
+                        "{}: {} (min {}, max {}; {} samples)",
+                        if result.benchmark_id == CPU_ASCII_ID {
+                            "Scanning speed"
+                        } else {
+                            "Compute"
+                        },
                         format_metric(compute.value, &compute.unit),
                         format_metric(compute.statistics.minimum, &compute.unit),
                         format_metric(compute.statistics.maximum, &compute.unit),
@@ -2406,7 +3293,12 @@ fn result_row(
         }
         .into(),
         title: title.into(),
-        description: test_description(&result.benchmark_id).into(),
+        description: test_description(if register_vector(result) {
+            "cpu.performance.avx2.f32_fma"
+        } else {
+            &result.benchmark_id
+        })
+        .into(),
         everyday_use: test_usage(&result.benchmark_id).into(),
         metric_guide: format!(
             "{} {}",
@@ -2419,7 +3311,9 @@ fn result_row(
         .into(),
         device: device.into(),
         elapsed: format!("{:.2} ms", result.elapsed_ns as f64 / 1e6).into(),
-        primary_name: if result.benchmark_id.ends_with(".scaling") {
+        primary_name: if result.benchmark_id == CPU_ASCII_ID && scaling_result(result) {
+            "Scanning speed at largest input".into()
+        } else if scaling_result(result) {
             "Largest tested data set compute".into()
         } else {
             primary
@@ -2468,9 +3362,10 @@ fn metric_explanation(unit: &str, read_write_copy: bool) -> String {
         "MB/s" => {
             "MB/s means millions of bytes processed per second; higher means more throughput."
         }
-        "strings/s" | "primes/s" => {
-            "The metric counts items processed per second; higher means more throughput."
+        "strings/s" => {
+            "Strings/s counts 64-byte ASCII records scanned per second. GB/s counts the corresponding input bytes read; higher means more scanning throughput."
         }
+        "primes/s" => "The metric counts items processed per second; higher means more throughput.",
         _ => "Compare metrics from the same test to see changes in performance.",
     };
     if read_write_copy {
@@ -2494,7 +3389,11 @@ fn test_lab_details(benchmark: &BenchmarkDescriptor) -> String {
                 || benchmark.id == "gpu.bandwidth.vram"
         ),
     );
-    if benchmark.id == "cpu.performance.matrix.fp32.scaling" {
+    if benchmark.id == CPU_INT64_ID {
+        details.push_str("\n\nREADING THE INT64 PROFILE\nCompute speed measures the existing register workload: eight independent 64-bit wrapping multiply/add accumulators. Memory-backed presets use separate input and output arrays per worker, with eight independent values performing 16 multiply/add rounds before one output write. Every dataset size uses the same recurrence and amount of work per value. Each multiply and each add count as one operation. Overflow keeps the low 64 bits. Dataset sizes count both arrays across selected workers, rounded down to blocks of 64 values (1024 bytes per worker minimum). Cache presets target 75% of selected cache instances. Effective GB/s counts one input read and one output write per value; cache traffic, write allocation and physical RAM-bus utilization are not measured. The streamed workload is compared with its own small-data baseline, and an auxiliary register reference is measured before and after the run. Barriers preserve each arithmetic round against compiler simplification; this is performance of the fixed kernel, not a theoretical instruction peak.");
+    } else if benchmark.id == CPU_ASCII_ID {
+        details.push_str("\n\nREADING THE SCAN PROFILE\nEvery input size uses the same fixed ASCII pattern and counts the letter e. Each operation scans one 64-byte record; effective input traffic is 64 bytes per operation. Workers own separate input buffers. Allocation, initialization and warmup are excluded from timing. AVX2 byte comparisons are used when available, with a scalar fallback. The default targets 75% of detected L2 cache divided among selected workers, or 64 KiB per worker when unavailable. Cache presets are sizing targets, not measured residency. Custom inputs round down to complete records per worker within the RAM budget. Sweeps compare the scan with its own small-input baseline; there is no arithmetic reference.");
+    } else if benchmark.id == "cpu.performance.matrix.fp32.scaling" {
         details.push_str("\n\nREADING THE MATRIX PROFILE\nEach CPU worker multiplies A[32,K] by B[K,N] to produce C[32,N], with K=N growing from 32 as the dataset increases. Dataset size includes all input and output matrices across selected workers. The blocked AVX2/FMA kernel reuses weight data across 32 rows. The RAM budget setting applies to total buffers and leaves available-memory headroom. Exact core allocation uses one worker per physical core. Changing workers also changes per-worker matrix dimensions; inspect shapes and aggregate dataset sizes when comparing.\n\nREADING THE METRICS\nTOPS counts 2×M×N×K floating-point operations per complete product. GB/s counts scalar input reads, vector weight reads, and output reads/writes within the cache blocks. Reused data can be served by cache, so effective GB/s can exceed physical RAM bandwidth. Arithmetic intensity here uses those kernel accesses, not just each matrix's unique bytes. Compare this matrix profile with its own small-data baseline; its reuse differs from the vector test.");
     } else if benchmark.id == "cpu.performance.avx2.f32_fma.scaling" {
         details.push_str("\n\nREADING THE SCALING PROFILE\nThe test compares increasingly large FP32 arrays with the current run's register-only AVX2/FMA reference. Dataset size is the total of two input arrays and one output array across all selected CPU workers; each worker handles an equal, separate share. The RAM budget setting limits total allocation and leaves available-memory headroom. Exact core allocation uses one worker per physical core. Compare at the same largest tested dataset size when changing cores.\n\nMEMORY PRESSURE\nTOPS counts multiply and add operations; GB/s counts two input reads and one output write. The kernel performs 16 FMAs per value to keep the compute-to-data ratio fixed. Effective traffic excludes write allocation and cache-line writeback, so it is not physical RAM-bus utilization. Sustained slowdown suggests cache or RAM pressure; exact cache boundaries and stall time are not measured.");
@@ -2531,10 +3430,10 @@ fn test_takeaway(id: &str) -> &'static str {
             "Measures dependent RAM reads with 64 KiB locality to reduce translation overhead. Lower nanoseconds per access is better."
         }
         "cpu.performance.matrix.fp32.scaling" => {
-            "Shows how CPU FP32 matrix throughput changes as weight matrices grow beyond cache into RAM."
+            "Measures CPU matrix calculation speed with different amounts of data."
         }
         "cpu.performance.avx2.f32_fma.scaling" => {
-            "Shows how CPU vector throughput changes as FP32 data grows beyond cache into RAM."
+            "Measures CPU calculation speed with different amounts of data."
         }
         _ if gpu_offload(id) => {
             "Measures GPU calculation speed with your chosen share of data in system RAM. Choose the offload percentage and dataset in Settings or override them for this test."
@@ -2596,7 +3495,28 @@ fn gpu_offload(id: &str) -> bool {
 }
 
 fn cpu_scaling(id: &str) -> bool {
-    id.starts_with("cpu.performance.") && id.ends_with(".scaling")
+    (id.starts_with("cpu.performance.") && id.ends_with(".scaling"))
+        || matches!(id, CPU_ASCII_ID | CPU_INT64_ID)
+}
+
+fn register_vector(result: &BenchmarkResult) -> bool {
+    result.benchmark_id == CPU_VECTOR_ID
+        && result
+            .workload_metadata
+            .get("vector_preset")
+            .map(String::as_str)
+            == Some("register")
+}
+
+fn scaling_result(result: &BenchmarkResult) -> bool {
+    let revision = result
+        .workload_metadata
+        .get("kernel_revision")
+        .map(String::as_str);
+    (result.benchmark_id.ends_with(".scaling")
+        || (result.benchmark_id == CPU_ASCII_ID && revision == Some("ascii-scan-1"))
+        || (result.benchmark_id == CPU_INT64_ID && revision == Some("int64-streaming-1")))
+        && !register_vector(result)
 }
 
 fn cpu_matrix_tier_shape(result: &BenchmarkResult, bytes: u64) -> Option<String> {
@@ -2628,6 +3548,15 @@ fn cpu_matrix_tier_shape(result: &BenchmarkResult, bytes: u64) -> Option<String>
 }
 
 fn tuning_takeaway(result: &BenchmarkResult) -> String {
+    if result.benchmark_id == CPU_INT64_ID && !scaling_result(result) {
+        return "Register-resident 64-bit wrapping multiply/add. Choose a cache or RAM dataset to examine memory pressure.".into();
+    }
+    if result.benchmark_id == CPU_ASCII_ID && scaling_result(result) {
+        return "Compare scanning speed and input GB/s at matching sizes and worker counts.".into();
+    }
+    if register_vector(result) {
+        return "Register-resident AVX2/FMA throughput. Choose a cache or RAM dataset to examine memory pressure.".into();
+    }
     if gpu_offload(&result.benchmark_id) {
         return gluj_bench_core::GPU_OFFLOAD_TUNING_TAKEAWAY.into();
     }
@@ -2774,6 +3703,10 @@ fn memory_pressure_summary(result: &BenchmarkResult) -> String {
 }
 
 fn tuning_breakdown(result: &BenchmarkResult) -> String {
+    if result.benchmark_id == CPU_ASCII_ID && scaling_result(result) {
+        let tiers = scaling_compute_tiers(result);
+        return tiers.last().map(|(bytes, metric)| format!("Input: {}\nScanning speed: {}\nEach operation scans one 64-byte ASCII record. Workers: {}\n{}", format_binary_size(*bytes as f64), format_metric(metric.value, &metric.unit), result.workload_metadata.get("thread_count").map(String::as_str).unwrap_or("not recorded"), memory_pressure_summary(result))).unwrap_or_default();
+    }
     let Some((bytes, largest)) = scaling_compute_tiers(result).last().copied() else {
         return String::new();
     };
@@ -3200,7 +4133,7 @@ fn test_usage(id: &str) -> &'static str {
 }
 
 fn result_facts(result: &BenchmarkResult, primary: Option<&Metric>) -> [(String, String); 4] {
-    if result.benchmark_id.ends_with(".scaling") {
+    if scaling_result(result) {
         return scaling_facts(result);
     }
     let consistency = primary.map_or_else(
@@ -3225,6 +4158,12 @@ fn result_facts(result: &BenchmarkResult, primary: Option<&Metric>) -> [(String,
     );
     let (workload_label, workload_value) = matrix_shape(result)
         .map(|shape| ("MATRIX TILE".into(), shape))
+        .or_else(|| {
+            (result.benchmark_id == CPU_RAM_BANDWIDTH_ID)
+                .then(|| ram_bandwidth_payload(result))
+                .flatten()
+                .map(|bytes| ("RAM PAYLOAD".into(), format_binary_size(bytes as f64)))
+        })
         .or_else(|| {
             metadata_size(result, "working_set_bytes").map(|size| ("WORKING SET".into(), size))
         })
@@ -3282,6 +4221,34 @@ fn result_facts(result: &BenchmarkResult, primary: Option<&Metric>) -> [(String,
 
 fn scaling_facts(result: &BenchmarkResult) -> [(String, String); 4] {
     let tiers = scaling_compute_tiers(result);
+    if result.benchmark_id == CPU_ASCII_ID {
+        let baseline = tiers
+            .iter()
+            .take(3)
+            .max_by(|a, b| a.1.value.total_cmp(&b.1.value));
+        let largest = tiers.last();
+        return [
+            (
+                "SMALL-INPUT BASELINE".into(),
+                baseline
+                    .map(|(_, m)| format_metric(m.value, &m.unit))
+                    .unwrap_or_else(|| "N/A".into()),
+            ),
+            (
+                "LARGEST INPUT".into(),
+                largest
+                    .map(|(bytes, _)| format_binary_size(*bytes as f64))
+                    .unwrap_or_else(|| "N/A".into()),
+            ),
+            ("RECORD SIZE".into(), "64 B ASCII".into()),
+            (
+                "AT LARGEST INPUT".into(),
+                largest
+                    .map(|(_, m)| format_metric(m.value, &m.unit))
+                    .unwrap_or_else(|| "N/A".into()),
+            ),
+        ];
+    }
     let transition_size = result
         .workload_metadata
         .get("bandwidth_transition_working_set_bytes")
@@ -3297,7 +4264,9 @@ fn scaling_facts(result: &BenchmarkResult) -> [(String, String); 4] {
     });
     [
         (
-            if cpu_scaling(&result.benchmark_id) {
+            if result.benchmark_id == CPU_INT64_ID {
+                "INT64 REGISTER REFERENCE".into()
+            } else if cpu_scaling(&result.benchmark_id) {
                 "AVX2 FP32 REFERENCE".into()
             } else if result.benchmark_id == "gpu.performance.fp32.scaling"
                 || gpu_offload(&result.benchmark_id)
@@ -3343,14 +4312,15 @@ fn scaling_facts(result: &BenchmarkResult) -> [(String, String); 4] {
 }
 
 fn chart_tiers(result: &BenchmarkResult) -> Vec<(u64, &Metric)> {
-    if !result.benchmark_id.ends_with(".scaling") {
+    if !scaling_result(result) {
         return Vec::new();
     }
     scaling_compute_tiers(result)
         .into_iter()
         .filter(|(bytes, metric)| {
             *bytes > 0
-                && metric.unit == "operations/s"
+                && (metric.unit == "operations/s"
+                    || (result.benchmark_id == CPU_ASCII_ID && metric.unit == "strings/s"))
                 && metric.value.is_finite()
                 && metric.value > 0.0
         })
@@ -3428,8 +4398,20 @@ fn scaling_chart_interactive(
                 },
             }
         };
+    let ascii = result.benchmark_id == CPU_ASCII_ID;
+    let compute_unit = if ascii { "M records/s" } else { "TOPS" };
     for (bandwidth, top, color, title, scale) in [
-        (false, 42.0, "#73dcca", "Compute throughput · TOPS", 1e12),
+        (
+            false,
+            42.0,
+            "#73dcca",
+            if ascii {
+                "Text scanning speed · M records/s"
+            } else {
+                "Compute throughput · TOPS"
+            },
+            if ascii { 1e6 } else { 1e12 },
+        ),
         (
             true,
             232.0,
@@ -3497,7 +4479,7 @@ fn scaling_chart_interactive(
                 format!(
                     "{:.1} {}",
                     value / scale,
-                    if bandwidth { "GB/s" } else { "TOPS" }
+                    if bandwidth { "GB/s" } else { compute_unit }
                 ),
                 13.0,
                 "",
@@ -3518,7 +4500,7 @@ fn scaling_chart_interactive(
                     *bytes,
                     metric,
                     [x(*bytes), y(metric.value), top + 120.0],
-                    (title, scale, if bandwidth { "GB/s" } else { "TOPS" }),
+                    (title, scale, if bandwidth { "GB/s" } else { compute_unit }),
                     if bandwidth {
                         Color::from_rgb_u8(120, 169, 255)
                     } else {
@@ -3614,7 +4596,7 @@ fn scaling_compute_tiers(result: &BenchmarkResult) -> Vec<(u64, &Metric)> {
 }
 
 fn featured_metric(result: &BenchmarkResult) -> Option<&Metric> {
-    if result.benchmark_id.ends_with(".scaling") {
+    if scaling_result(result) {
         scaling_compute_tiers(result)
             .last()
             .map(|(_, metric)| *metric)
@@ -3642,7 +4624,27 @@ fn metadata_size(result: &BenchmarkResult, key: &str) -> Option<String> {
 }
 
 fn result_summary(result: &BenchmarkResult) -> String {
-    if result.benchmark_id.ends_with(".scaling") {
+    if result.benchmark_id == CPU_INT64_ID && !scaling_result(result) {
+        return "Register-resident INT64 multiply/add · no streaming dataset".into();
+    }
+    if result.benchmark_id == CPU_ASCII_ID && scaling_result(result) {
+        let tiers = scaling_compute_tiers(result);
+        return tiers
+            .last()
+            .map(|(bytes, metric)| {
+                format!(
+                    "Largest input: {} at {} · {} input size(s) · one 64-byte record per operation",
+                    format_binary_size(*bytes as f64),
+                    format_metric(metric.value, &metric.unit),
+                    tiers.len()
+                )
+            })
+            .unwrap_or_default();
+    }
+    if register_vector(result) {
+        return "Register-resident AVX2 FP32 compute · no streaming dataset".into();
+    }
+    if scaling_result(result) {
         let compute_tiers = scaling_compute_tiers(result);
         if let (Some(first), Some(last)) = (compute_tiers.first(), compute_tiers.last()) {
             let tier_label = if compute_tiers.len() == 1 {
@@ -3653,7 +4655,9 @@ fn result_summary(result: &BenchmarkResult) -> String {
             let reference = result.metrics.iter().find(|m| {
                 m.name == "measured_compute_ceiling" && m.value.is_finite() && m.value > 0.0
             });
-            let reference_label = if cpu_scaling(&result.benchmark_id) {
+            let reference_label = if result.benchmark_id == CPU_INT64_ID {
+                "INT64 register"
+            } else if cpu_scaling(&result.benchmark_id) {
                 "AVX2 FP32"
             } else if result.benchmark_id == "gpu.performance.fp32.scaling"
                 || gpu_offload(&result.benchmark_id)

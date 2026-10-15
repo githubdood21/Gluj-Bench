@@ -73,8 +73,8 @@ Descriptions and tuning guidance start with a short takeaway. Expand their dropd
 | CPU bandwidth | L1, L2 and L3 data-cache bandwidth; system RAM read, write and copy bandwidth |
 | RAM latency | Random-object and localized dependent reads beyond last-level cache, reported in ns per access |
 | CPU cache latency | Separate L1, L2 and L3 warmed dependent-read measurements in ns per access |
-| CPU performance | FP32/FP64 arithmetic, AVX2/FMA, integer arithmetic, single-thread integer throughput, ASCII scanning, prime sieve, DEFLATE compression/decompression, AES rounds and POPCNT |
-| CPU scaling | AVX2 FP32 vector throughput and blocked FP32 matrix throughput across increasing aggregate datasets |
+| CPU performance | FP32/FP64 arithmetic, AVX2 FP64/FMA, integer arithmetic, single-thread integer throughput, ASCII scanning, prime sieve, DEFLATE compression/decompression, AES rounds and POPCNT |
+| CPU configurable compute | AVX2 FP32 vector, blocked FP32 matrix, INT64 multiply/add, and ASCII scan, with automatic measurements, cache/RAM/custom presets and dataset sweeps |
 | GPU bandwidth | Estimated effective cache bandwidth, GPU-accessible memory read/write/copy bandwidth, and host-device transfers |
 | GPU performance | Register-resident FP16, FP32 and FP64 vector throughput; supported dense FP16 and INT8 matrix calculations |
 | GPU scaling | Memory-backed FP32 vector and dense FP16 matrix profiles across increasing working sets |
@@ -112,6 +112,10 @@ The CPU scaling allocation also uses no more than 80% of currently available RAM
 
 Reduced allocation or activity can improve responsiveness and may reduce heat or power use, but it can also lower measured throughput. GPU timestamp measurements exclude pacing intervals; wall-clock transfer measurements include them. Settings do not impose a temperature limit or guarantee stability.
 
+## RAM bandwidth size
+
+**System RAM bandwidth** retains its existing automatic sizing and read/write/copy methods. Enable the per-test override to choose **Custom size** with a payload slider. The payload is shared across all selected workers and stays above the existing cache-separation minimum; it rounds down to complete 64-byte worker shares. Its maximum follows current available memory, reserving both source and destination buffers, using at most 80% of available memory and leaving at least 2 GiB available. The selected mode and size save with the override. Results record requested and actual payload sizes and buffer allocation, and saved comparisons keep different payload sizes separate. L1/L2/L3 bandwidth sizing is unchanged.
+
 ## CPU cache latency
 
 Under **CPU memory**, **L1/L2/L3 cache read latency** each use one pinned thread and the cache instance attached to that core. Shared cache capacities are not summed across processor complexes. L1 uses 75% of its detected capacity. L2 and L3 aim for four times the preceding level's capacity, capped at 75% of the target cache. A test is unavailable if the working set cannot exceed twice the preceding level's capacity or required topology is missing.
@@ -133,7 +137,7 @@ Both results measure the CPU-to-memory path under their respective conditions, i
 
 ## Scaling performance
 
-A scaling profile measures progressively larger datasets to expose how cache reuse and memory traffic affect calculation throughput. Each profile measures a register-resident compute reference before and after the sweep. The **latest post-sweep reference** drives the reported delta and tuning guidance; the initial reference is used to assess drift. These are measured references, not theoretical peaks from a hardware specification.
+A scaling profile measures progressively larger datasets to expose how cache reuse and memory traffic affect throughput. Arithmetic profiles measure a register-resident compute reference before and after the sweep. The **latest post-sweep reference** drives the reported delta and tuning guidance; the initial reference is used to assess drift. These are measured references, not theoretical peaks from a hardware specification. ASCII scan compares the same scan across input sizes without an arithmetic reference.
 
 Expanded results include:
 
@@ -145,11 +149,50 @@ Expanded results include:
 
 ### CPU vector and matrix profiles
 
+**AVX2 FP32 vector compute** combines the register and memory-backed tests in one benchmark. Choose what you want to measure:
+
+- **Compute speed:** the first-use default; automatically runs register-resident arithmetic using all physical cores, without a large dataset.
+- **Performance across data sizes:** automatically sweeps from small to large datasets using all physical cores, within the global RAM budget and available-memory limits.
+- **Customize this test:** opens the full data presets, size slider, single/sweep mode, physical-core allocation, workload intensity and RAM budget controls. No override checkbox is needed. Switching to an automatic choice preserves your custom configuration for later; **Reset to defaults** clears it and returns to Compute speed.
+
+The app restores the last selected choice and custom settings on later launches. First-use defaults reflect each workload's ordinary measurement; the three-choice redesign is being extended one family at a time.
+
+Automatic choices use the global workload intensity and RAM budget. Full customization provides these data presets:
+
+- **Register compute:** register-resident arithmetic without streaming arrays.
+- **Automatic L1/L2/L3 cache:** uses 75% of each selected cache instance, divided among workers sharing it. Equal worker allocations use the smallest available share. The configuration shows the resolved aggregate allocation; missing cache topology reports an error. Cache residency remains a sizing target, not a measured hit rate.
+- **Automatic RAM budget:** uses the RAM allocation budget and available-memory headroom at run time.
+- **Custom size:** a slider spans the minimum vector block through the current RAM allocation limit, with KiB/MiB/GiB labels. The scale covers small cache-sized data and large memory datasets. The maximum follows the RAM budget, current available memory and 2 GiB of headroom; the chosen allocation adapts when those limits or the worker count change.
+
+Memory-backed presets support **One dataset** or **Sweep to target**. Sizes include both input arrays and the output across all selected workers, rounded down to whole vector blocks. The minimum is 768 bytes per worker. Explicit sizes above the budget fail rather than being silently reduced. **Use global dataset settings** preserves the existing global automatic/single/sweep behavior. Overrides are saved per test and queued runs retain their selected configuration.
+
+Physical-core allocation uses whole-number sliders in global settings and test overrides. The upper end selects all available physical cores; single-thread tests still use one worker. Switching benchmarks restores each test's override state and control values.
+
+The benchmark retains its existing scaling ID for saved-result compatibility. Historical register results load into the same workload family with the register preset recorded. Register and memory-backed results retain separate comparison configurations.
+
+**AVX2 FP32 matrix compute** offers **Matrix calculation speed** (the first-use default), **Performance across data sizes**, and **Customize this test**. Matrix calculation speed measures the actual blocked matrix multiplication kernel at one automatically selected dataset size. It targets 75% of each selected L2 cache instance, divided among workers sharing it; when L2 topology is unavailable it targets 256 KiB per worker. The target is capped by the RAM allocation budget and available-memory limits, then rounded down to a valid matrix shape.
+
+Matrix customization includes compute-sized, L1/L2/L3, RAM-budget and custom-size presets; a size slider; one dataset or a sweep; physical cores; workload intensity; and a RAM budget. Every worker multiplies A[32,K] by B[K,N], with K=N and dimensions aligned to eight values. The minimum allocation is 12 KiB per worker; the slider and previews account for input, weight and output matrices and display actual rounded dimensions. There is no register-only matrix mode. The measured AVX2 vector reference remains auxiliary comparison context; the featured throughput comes from the matrix kernel. Matrix and vector choices and custom settings save independently, and Reset to defaults restores the selected benchmark's first-use choice.
+
 The AVX2 FP32 vector profile gives each worker two input arrays and one output array. It performs 16 FMAs per value, keeping a fixed compute-to-data ratio of about 2.67 operations per byte of effective traffic.
 
 The FP32 matrix profile uses blocked AVX2/FMA multiplication. Each worker owns A[32,K], B[K,N] and C[32,N], with K=N increasing through the sweep. The fixed 32-row batch reuses weights across rows. Dataset sizes are the **aggregate allocation across all workers**, not the size per core.
 
 Matrix GB/s counts effective accesses within the kernel, including data served repeatedly from cache. Vector traffic counts two input reads and an output write, excluding write allocation and cache-line writeback. Neither figure is direct RAM-controller utilization. Changing the core count also changes the per-worker matrix dimensions; inspect those shapes and the aggregate dataset size when comparing configurations.
+
+### CPU INT64 multiply-add
+
+**64-bit integer multiply-add** now offers **Compute speed** (the first-use register default), **Performance across data sizes**, and **Customize this test**. Its choice and custom settings save independently. Custom configuration supports register arithmetic, L1/L2/L3 cache targets, RAM-budget or custom-size buffers, single measurements or sweeps, and physical-core and data-size sliders.
+
+The existing register workload remains eight independent wrapping multiply/add accumulators. The streamed kernel loads eight independent values from an input array, applies 16 rounds of the same eight multiply/add pairs, and writes an output array. Each multiply and add count separately; overflow keeps the low 64 bits. Compiler barriers preserve every arithmetic round. All streamed sizes use the same work per value. Allocation counts both arrays across selected workers and rounds down to 64-value blocks (1024 bytes per worker minimum). Effective traffic counts one 8-byte read and one 8-byte write per value, excluding write allocation and cache-line writeback.
+
+Streamed results report operations/s, effective GB/s, sample ranges, actual buffer sizes, and the current INT64 register reference. Register and streamed loop overheads differ; use the streamed small-data baseline to assess input-size sensitivity. Initialization and warmup are untimed, with cancellation checked during buffer preparation and processing. The original benchmark ID and register measurements are preserved, while the new streamed kernel revision stays separate in saved comparisons. The single-thread INT64 benchmark remains unchanged.
+
+### CPU ASCII scan
+
+**ASCII string scan** uses the same three choices: **Text scanning speed**, **Performance across data sizes**, and **Customize this test**. The default scans one automatically sized input using all physical cores, targeting 75% of detected L2 cache shared among selected workers, or 64 KiB per worker when that topology is unavailable. Cache-sized, RAM-budget and custom inputs support a single measurement or a sweep. Custom size and physical-core sliders use the current allocation limits; choices save independently for this benchmark.
+
+Every size counts the letter `e` in the same fixed ASCII pattern. Each operation scans one 64-byte record. Input size is the aggregate across workers, rounded down to complete records per worker, with a minimum of 64 bytes per worker. Results report records per second and effective input GB/s (64 bytes per record), with sample ranges. Sweeps compare the scan with its own small-input baseline. Input initialization and warmup are untimed, and preparation and scans check cancellation. The original benchmark ID is preserved; old results retain their original metrics and are kept separate from the new kernel revision.
 
 ### GPU vector and matrix profiles
 
@@ -172,7 +215,7 @@ Older saved results keep their throughput data and ask for a rerun to obtain mea
 
 ### Global defaults and per-test overrides
 
-**Settings** stores global defaults. The selected benchmark shows its effective **Run configuration** before running. Enable **Override global settings for this test** to change its applicable CPU/GPU activity, physical cores, RAM/VRAM budgets, RAM offload share, and scaling dataset. Overrides are kept per test for this session; turn the override off to return to the current global defaults. A queued run captures its settings and target GPU when queued. **Run all in this category** uses each test's effective configuration.
+**Settings** stores global defaults in `settings.json`. The selected benchmark shows its effective **Run configuration** before running. AVX2 FP32 vector/matrix compute, INT64 multiply-add and ASCII scan provide the three choices described above, with full configuration under **Customize this test**. Other benchmarks use **Override global settings for this test** to change their applicable CPU/GPU activity, physical cores, RAM/VRAM budgets, RAM offload share, and scaling dataset. Per-test choices and valid custom settings save separately in `benchmark-settings.json` beside the app and are restored on later launches. Turning an override off removes that saved override and returns to the current global defaults. Invalid edits retain the last valid saved configuration. An unreadable or invalid preferences file is preserved, with changes available for the session and a message in Settings. Current hardware and allocation limits are checked again before running. A queued run captures its settings and target GPU when queued. **Run all in this category** uses each test's effective configuration.
 
 Scaling tests have three dataset modes:
 

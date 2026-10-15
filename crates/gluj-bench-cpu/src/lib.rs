@@ -1,6 +1,8 @@
+mod ascii_scaling;
 mod cache_latency;
 mod compute;
 mod compute_scaling;
+mod integer_scaling;
 mod kernels;
 mod latency;
 mod matrix_scaling;
@@ -212,6 +214,78 @@ impl CpuBandwidthProvider {
             return Err("insufficient_available_memory".into());
         }
         usize::try_from(payload).map_err(|_| "working_set_too_large".into())
+    }
+
+    fn configured_ram_payload(
+        &self,
+        topology: &CpuTopology,
+        config: &BenchmarkConfig,
+        workers: usize,
+        available: u64,
+    ) -> Result<usize, BenchmarkError> {
+        match config
+            .options
+            .get("ram_bandwidth_mode")
+            .map(String::as_str)
+            .unwrap_or("automatic")
+        {
+            "automatic" => self
+                .ram_payload(topology)
+                .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason)),
+            "custom" => {
+                let requested = config
+                    .options
+                    .get("ram_bandwidth_bytes")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        BenchmarkError::new(
+                            "invalid_config",
+                            "Choose a positive RAM bandwidth payload size.",
+                        )
+                    })?;
+                let highest = topology
+                    .caches
+                    .iter()
+                    .map(|cache| cache.level)
+                    .max()
+                    .unwrap_or(0);
+                let llc = topology
+                    .caches
+                    .iter()
+                    .filter(|cache| cache.level == highest)
+                    .map(|cache| cache.size_bytes.saturating_mul(cache.instances as u64))
+                    .sum();
+                let (minimum, maximum) =
+                    gluj_bench_core::ram_bandwidth_payload_range(llc, available, workers as u32);
+                if requested < minimum {
+                    return Err(BenchmarkError::new(
+                        "invalid_config",
+                        format!(
+                            "RAM bandwidth payload must be at least {minimum} bytes to stay beyond the cache range."
+                        ),
+                    ));
+                }
+                if requested > maximum {
+                    return Err(BenchmarkError::new(
+                        "dataset_exceeds_budget",
+                        format!(
+                            "RAM bandwidth payload is {requested} bytes; available memory allows {maximum} bytes with space for both buffers."
+                        ),
+                    ));
+                }
+                let alignment = 64 * workers.max(1) as u64;
+                usize::try_from(requested / alignment * alignment).map_err(|_| {
+                    BenchmarkError::new(
+                        "working_set_too_large",
+                        "RAM bandwidth payload exceeds the address range.",
+                    )
+                })
+            }
+            _ => Err(BenchmarkError::new(
+                "invalid_config",
+                "RAM bandwidth size mode must be automatic or custom.",
+            )),
+        }
     }
 
     fn cache_descriptor(&self, level: u8) -> BenchmarkDescriptor {
@@ -493,9 +567,14 @@ impl CpuBandwidthProvider {
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let topology = self.topology.as_ref().map_err(Clone::clone)?;
         let locations = topology::selected_workers(topology, config, false)?;
-        let payload = self
-            .ram_payload(topology)
-            .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;
+        let mut memory = sysinfo::System::new();
+        memory.refresh_memory();
+        let payload = self.configured_ram_payload(
+            topology,
+            config,
+            locations.len(),
+            memory.available_memory(),
+        )?;
         let target_ns = config.target_duration_ms.saturating_mul(1_000_000) / config.samples as u64;
         let mut metrics = Vec::new();
         let mut total_elapsed = 0u64;
@@ -536,6 +615,31 @@ impl CpuBandwidthProvider {
         });
         let mut workload_metadata = BTreeMap::new();
         workload_metadata.insert("payload_bytes".into(), payload.to_string());
+        let actual_payload = (payload / locations.len().max(1))
+            .max(64)
+            .next_multiple_of(64)
+            * locations.len().max(1);
+        workload_metadata.insert(
+            "ram_bandwidth_mode".into(),
+            config
+                .options
+                .get("ram_bandwidth_mode")
+                .cloned()
+                .unwrap_or_else(|| "automatic".into()),
+        );
+        workload_metadata.insert("actual_payload_bytes".into(), actual_payload.to_string());
+        workload_metadata.insert(
+            "allocated_test_buffer_bytes".into(),
+            (actual_payload as u64 * 2).to_string(),
+        );
+        if config
+            .options
+            .get("ram_bandwidth_mode")
+            .is_some_and(|mode| mode == "custom")
+            && let Some(requested) = config.options.get("ram_bandwidth_bytes")
+        {
+            workload_metadata.insert("requested_payload_bytes".into(), requested.clone());
+        }
         workload_metadata.insert("write_copy_policy".into(), "non_temporal_streaming".into());
         workload_metadata.insert("read_policy".into(), "temporal".into());
         workload_metadata.insert("cache_state".into(), "flushed_before_each_sweep".into());
@@ -607,18 +711,36 @@ impl BenchmarkProvider for CpuBandwidthProvider {
                 self.topology.as_ref(),
             ));
         }
-        items.extend(compute::descriptors(
+        items.extend(
+            compute::descriptors(&self.cpu_device, self.topology.is_ok())
+                .into_iter()
+                .filter(|item| {
+                    item.id != "cpu.performance.avx2.f32_fma"
+                        && item.id != ascii_scaling::ID
+                        && item.id != integer_scaling::ID
+                }),
+        );
+        items.push(ascii_scaling::descriptor(
             &self.cpu_device,
-            self.topology.is_ok(),
+            self.topology.as_ref().ok(),
         ));
-        items.push(compute_scaling::descriptor(
-            &self.cpu_device,
-            self.topology.is_ok(),
-        ));
-        items.push(compute_scaling::matrix_descriptor(
-            &self.cpu_device,
-            self.topology.is_ok(),
-        ));
+        let mut vector = compute_scaling::descriptor(&self.cpu_device, self.topology.is_ok());
+        if let Ok(topology) = &self.topology {
+            compute_scaling::cache_previews(&mut vector, topology);
+        }
+        items.push(vector);
+        let mut matrix =
+            compute_scaling::matrix_descriptor(&self.cpu_device, self.topology.is_ok());
+        if let Ok(topology) = &self.topology {
+            compute_scaling::cache_previews(&mut matrix, topology);
+        }
+        items.push(matrix);
+        let mut integer =
+            compute_scaling::integer_descriptor(&self.cpu_device, self.topology.is_ok());
+        if let Ok(topology) = &self.topology {
+            compute_scaling::cache_previews(&mut integer, topology);
+        }
+        items.push(integer);
         items
     }
     fn run(
@@ -649,7 +771,19 @@ impl BenchmarkProvider for CpuBandwidthProvider {
                 self.topology.as_ref().map_err(Clone::clone)?,
             );
         }
-        if benchmark_id == compute_scaling::ID || benchmark_id == matrix_scaling::ID {
+        if benchmark_id == ascii_scaling::ID {
+            return ascii_scaling::run(
+                config,
+                cancellation,
+                progress,
+                &self.cpu_device,
+                self.topology.as_ref().map_err(Clone::clone)?,
+            );
+        }
+        if benchmark_id == compute_scaling::ID
+            || benchmark_id == matrix_scaling::ID
+            || benchmark_id == integer_scaling::ID
+        {
             return compute_scaling::run(
                 benchmark_id,
                 config,
@@ -766,6 +900,13 @@ mod tests {
             .map(|item| item.id)
             .collect();
         assert!(!ids.contains(&"cpu.bandwidth.cache.l0".into()));
+        assert!(!ids.contains(&"cpu.performance.avx2.f32_fma".into()));
+        assert_eq!(
+            ids.iter()
+                .filter(|id| id.as_str() == compute_scaling::ID)
+                .count(),
+            1
+        );
         assert!(ids.contains(&"cpu.bandwidth.cache.l1".into()));
         assert!(ids.contains(&"cpu.bandwidth.cache.l3".into()));
         assert!(ids.contains(&"cpu.bandwidth.memory".into()));
@@ -774,6 +915,69 @@ mod tests {
         for level in 1..=3 {
             assert!(ids.contains(&format!("cpu.latency.cache.l{level}")));
         }
+    }
+
+    #[test]
+    fn ram_bandwidth_custom_payload_validates_without_changing_automatic_sizing() {
+        let mut provider = CpuBandwidthProvider::discover();
+        provider.available_memory = 16 * 1024 * MIB;
+        let workers = [0, 1, 2].map(|index| ProcessorLocation { group: 0, index });
+        let topology = CpuTopology {
+            representative: workers[0],
+            physical_cores: workers.to_vec(),
+            core_threads: BTreeMap::new(),
+            representative_caches: BTreeMap::new(),
+            cache_targets: vec![],
+            caches: vec![cache(3, 8 * MIB, 7).descriptor],
+        };
+        let mut config = BenchmarkConfig::default();
+        assert_eq!(
+            provider
+                .configured_ram_payload(&topology, &config, 3, 8 * 1024 * MIB)
+                .unwrap(),
+            provider.ram_payload(&topology).unwrap()
+        );
+        config
+            .options
+            .insert("ram_bandwidth_mode".into(), "custom".into());
+        let (minimum, maximum) =
+            gluj_bench_core::ram_bandwidth_payload_range(8 * MIB, 8 * 1024 * MIB, 3);
+        config
+            .options
+            .insert("ram_bandwidth_bytes".into(), (minimum + 65).to_string());
+        let actual = provider
+            .configured_ram_payload(&topology, &config, 3, 8 * 1024 * MIB)
+            .unwrap() as u64;
+        assert_eq!(actual, minimum);
+        assert_eq!(actual % 192, 0);
+        config
+            .options
+            .insert("ram_bandwidth_bytes".into(), (minimum - 1).to_string());
+        assert_eq!(
+            provider
+                .configured_ram_payload(&topology, &config, 3, 8 * 1024 * MIB)
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
+        config
+            .options
+            .insert("ram_bandwidth_bytes".into(), (maximum + 1).to_string());
+        assert_eq!(
+            provider
+                .configured_ram_payload(&topology, &config, 3, 8 * 1024 * MIB)
+                .unwrap_err()
+                .code,
+            "dataset_exceeds_budget"
+        );
+        config
+            .options
+            .insert("ram_bandwidth_bytes".into(), "garbage".into());
+        assert!(
+            provider
+                .configured_ram_payload(&topology, &config, 3, 8 * 1024 * MIB)
+                .is_err()
+        );
     }
     #[test]
     fn rejects_unstable_sample_counts() {
@@ -784,6 +988,76 @@ mod tests {
         assert_eq!(
             CpuBandwidthProvider::validate(&config).unwrap_err().code,
             "invalid_config"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "runs a short custom-size RAM bandwidth benchmark on the current machine"]
+    fn ram_bandwidth_custom_smoke() {
+        let mut provider = CpuBandwidthProvider::discover();
+        let topology = provider.topology.as_ref().unwrap();
+        let highest = topology
+            .caches
+            .iter()
+            .map(|cache| cache.level)
+            .max()
+            .unwrap_or(0);
+        let llc = topology
+            .caches
+            .iter()
+            .filter(|cache| cache.level == highest)
+            .map(|cache| cache.size_bytes * cache.instances as u64)
+            .sum();
+        let (minimum, maximum) =
+            gluj_bench_core::ram_bandwidth_payload_range(llc, provider.available_memory, 1);
+        assert!(minimum <= maximum);
+        let config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            options: BTreeMap::from([
+                ("cpu_core_limit".into(), "1".into()),
+                ("ram_bandwidth_mode".into(), "custom".into()),
+                ("ram_bandwidth_bytes".into(), minimum.to_string()),
+            ]),
+        };
+        let result = provider
+            .run(
+                "cpu.bandwidth.memory",
+                &config,
+                &CancellationToken::default(),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            result
+                .metrics
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "write", "copy"]
+        );
+        assert!(
+            result
+                .metrics
+                .iter()
+                .all(|m| m.value.is_finite() && m.value > 0.0 && m.statistics.sample_count == 3)
+        );
+        assert_eq!(
+            result.workload_metadata["actual_payload_bytes"],
+            minimum.to_string()
+        );
+        assert_eq!(
+            result.workload_metadata["allocated_test_buffer_bytes"],
+            (minimum * 2).to_string()
+        );
+        assert_eq!(
+            result.workload_metadata["copy_byte_definition"],
+            "useful_payload"
+        );
+        assert_eq!(
+            result.workload_metadata["cache_state"],
+            "flushed_before_each_sweep"
         );
     }
 }
