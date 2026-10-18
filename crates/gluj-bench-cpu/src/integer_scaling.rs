@@ -67,8 +67,13 @@ impl Buffers {
             if cancellation.is_cancelled() {
                 return false;
             }
-            for (source, destination) in input.chunks_exact(8).zip(output.chunks_exact_mut(8)) {
-                let mut values: [u64; 8] = source.try_into().unwrap();
+            for (source, destination) in input
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(output.as_chunks_mut::<8>().0.iter_mut())
+            {
+                let mut values = *source;
                 for _ in 0..REUSE {
                     for lane in 0..8 {
                         // Preserve each multiply/add round: modulo arithmetic can

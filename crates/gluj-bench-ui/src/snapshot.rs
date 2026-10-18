@@ -684,7 +684,7 @@ pub(super) fn copy(image: &Rendered) -> Result<(), String> {
     dib[8..12].copy_from_slice(&(-(image.height as i32)).to_le_bytes());
     dib[12..14].copy_from_slice(&1_u16.to_le_bytes());
     dib[14..16].copy_from_slice(&32_u16.to_le_bytes());
-    for pixel in image.rgba.chunks_exact(4) {
+    for pixel in image.rgba.as_chunks::<4>().0 {
         dib.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
     }
     clipboard_win::raw::set(clipboard_win::formats::CF_DIB, &dib).map_err(|e| e.to_string())?;
