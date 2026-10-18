@@ -22,7 +22,7 @@ use std::{
 
 slint::include_modules!();
 
-const HARDWARE_METADATA_CACHE_VERSION: u32 = 22;
+const HARDWARE_METADATA_CACHE_VERSION: u32 = 27;
 const BENCHMARK_TARGET_DURATION_MS: u64 = 2_000;
 const BENCHMARK_SAMPLES: u32 = 5;
 
@@ -32,6 +32,7 @@ mod configuration_tests;
 mod gpu_timings;
 mod render_pacing;
 mod result_visuals;
+mod snapshot;
 mod tuning_visuals;
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -60,10 +61,13 @@ fn main() -> Result<(), slint::PlatformError> {
             let should_refresh = {
                 let mut app = app.borrow_mut();
                 app.receive_worker_events();
+                app.receive_snapshot_events();
                 std::mem::take(&mut app.ui_dirty)
             };
             if should_refresh {
                 App::refresh(&window, &app.borrow());
+            } else if app.borrow().snapshot.ui_dirty.get() {
+                App::refresh_snapshot(&window, &app.borrow());
             }
         }
     });
@@ -185,6 +189,8 @@ struct App {
     selected: Option<String>,
     expanded_device_id: Option<String>,
     result_details_expanded: bool,
+    snapshot: snapshot::SnapshotState,
+    result_presentations: RefCell<VecDeque<(usize, ResultRow)>>,
     results: Vec<BenchmarkResult>,
     saved_results: Vec<BenchmarkResult>,
     baseline_results: Vec<BenchmarkResult>,
@@ -237,8 +243,6 @@ struct AppSettings {
     vector_preset: usize,
     vector_sweep: bool,
     vector_size: String,
-    ram_bandwidth_custom: bool,
-    ram_bandwidth_bytes: u64,
 }
 impl Default for AppSettings {
     fn default() -> Self {
@@ -254,8 +258,6 @@ impl Default for AppSettings {
             vector_preset: 0,
             vector_sweep: true,
             vector_size: "256 MiB".into(),
-            ram_bandwidth_custom: false,
-            ram_bandwidth_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -307,14 +309,55 @@ const CPU_MATRIX_ID: &str = "cpu.performance.matrix.fp32.scaling";
 const CPU_ASCII_ID: &str = "cpu.performance.string.ascii";
 const CPU_INT64_ID: &str = "cpu.performance.integer.i64";
 const CPU_RAM_BANDWIDTH_ID: &str = "cpu.bandwidth.memory";
-fn configurable_cpu_compute(id: &str) -> bool {
-    matches!(
-        id,
-        CPU_VECTOR_ID | CPU_MATRIX_ID | CPU_ASCII_ID | CPU_INT64_ID
-    )
+const GPU_OFFLOAD_ID: &str = "gpu.performance.fp32.offload.scaling";
+const GPU_VECTOR_ID: &str = "gpu.performance.fp32.scaling";
+const GPU_MATRIX_ID: &str = "gpu.performance.matrix.fp16.scaling";
+const GPU_INT8_MATRIX_ID: &str = "gpu.performance.matrix.int8.scaling";
+fn gpu_matrix_compute(id: &str) -> bool {
+    matches!(id, GPU_MATRIX_ID | GPU_INT8_MATRIX_ID)
+}
+
+fn configurable_gpu_compute(id: &str) -> bool {
+    gpu_offload(id) || matches!(id, GPU_VECTOR_ID | GPU_MATRIX_ID | GPU_INT8_MATRIX_ID)
+}
+fn gpu_preset_key(id: &str) -> &'static str {
+    if gpu_offload(id) {
+        "gpu_offload_preset"
+    } else if id == GPU_INT8_MATRIX_ID {
+        "gpu_int8_matrix_preset"
+    } else if id == GPU_MATRIX_ID {
+        "gpu_matrix_preset"
+    } else {
+        "gpu_preset"
+    }
+}
+
+fn configurable_compute(id: &str) -> bool {
+    configurable_gpu_compute(id)
+        || matches!(
+            id,
+            CPU_VECTOR_ID | CPU_MATRIX_ID | CPU_ASCII_ID | CPU_INT64_ID
+        )
+}
+fn compute_default_choice(id: &str) -> usize {
+    if gpu_offload(id) {
+        1
+    } else {
+        VECTOR_DEFAULT_CHOICE
+    }
+}
+fn compute_choice_ids(id: &str) -> [&'static str; 3] {
+    if gpu_offload(id) {
+        ["single_dataset", "data_sizes", "custom"]
+    } else {
+        VECTOR_CHOICE_IDS
+    }
 }
 fn register_arithmetic(id: &str) -> bool {
-    matches!(id, CPU_VECTOR_ID | CPU_INT64_ID)
+    matches!(
+        id,
+        CPU_VECTOR_ID | CPU_INT64_ID | GPU_VECTOR_ID | GPU_MATRIX_ID | GPU_INT8_MATRIX_ID
+    )
 }
 fn buffered_cpu_compute(id: &str) -> bool {
     matches!(id, CPU_MATRIX_ID | CPU_ASCII_ID)
@@ -361,14 +404,25 @@ struct DatasetSliderRange {
 }
 
 impl DatasetSliderRange {
-    fn for_ram_bandwidth(workers: u32, last_level_cache: u64, available: u64) -> Self {
-        let (minimum, maximum) =
-            gluj_bench_core::ram_bandwidth_payload_range(last_level_cache, available, workers);
+    fn for_gpu(
+        local: u64,
+        storage: u64,
+        offset: u64,
+        percent: u32,
+        shared_available: Option<u64>,
+    ) -> Self {
+        let (minimum, maximum, alignment) = gluj_bench_core::gpu_fp32_dataset_range(
+            local,
+            storage,
+            offset,
+            percent,
+            shared_available,
+        );
         Self {
             minimum,
             maximum,
+            alignment,
             matrix_workers: None,
-            alignment: 64 * u64::from(workers.max(1)),
         }
     }
     fn for_integer(workers: u32, budget: u64) -> Self {
@@ -455,18 +509,18 @@ fn validated_run_settings(
     id: &str,
 ) -> Result<AppSettings, String> {
     let mut settings = settings.clone();
-    if configurable_cpu_compute(id) && settings.vector_preset == 6 {
-        vector_size_bytes(&settings.vector_size)?;
+    if gpu_offload(id) && ![0, 2, 5, 6].contains(&settings.vector_preset) {
+        return Err("Choose a memory-backed offload data preset.".into());
     }
-    if id == CPU_RAM_BANDWIDTH_ID
-        && settings.ram_bandwidth_custom
-        && settings.ram_bandwidth_bytes == 0
-    {
-        return Err("Choose a positive RAM bandwidth payload size.".into());
+    if configurable_gpu_compute(id) && ![0, 1, 2, 5, 6].contains(&settings.vector_preset) {
+        return Err("Choose a supported GPU data preset.".into());
+    }
+    if configurable_compute(id) && settings.vector_preset == 6 {
+        vector_size_bytes(&settings.vector_size)?;
     }
     if (id.ends_with(".scaling") || matches!(id, CPU_ASCII_ID | CPU_INT64_ID))
         && settings.dataset_mode != 0
-        && !(configurable_cpu_compute(id) && settings.vector_preset != 0)
+        && !(configurable_compute(id) && settings.vector_preset != 0)
     {
         settings.dataset_mib = text
             .trim()
@@ -484,23 +538,6 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
     let settings = &run.settings;
     let id = &run.benchmark_id;
     let mut options = serde_json::Map::new();
-    if id == CPU_RAM_BANDWIDTH_ID {
-        options.insert(
-            "ram_bandwidth_mode".into(),
-            if settings.ram_bandwidth_custom {
-                "custom"
-            } else {
-                "automatic"
-            }
-            .into(),
-        );
-        if settings.ram_bandwidth_custom {
-            options.insert(
-                "ram_bandwidth_bytes".into(),
-                settings.ram_bandwidth_bytes.to_string().into(),
-            );
-        }
-    }
     options.insert(
         "vram_budget_percent".into(),
         settings.vram_budget_percent.to_string().into(),
@@ -562,7 +599,38 @@ fn run_options(run: &QueuedRun) -> serde_json::Map<String, Value> {
             "legacy".into(),
         );
     }
-    if configurable_cpu_compute(id) && settings.vector_preset != 0 {
+    if configurable_gpu_compute(id) && settings.vector_preset != 0 {
+        let preset = match settings.vector_preset {
+            1 => "register",
+            2 => "small",
+            5 if gpu_offload(id) => "budget",
+            5 => "vram",
+            6 => "custom",
+            _ => unreachable!("validated GPU preset"),
+        };
+        options.insert(gpu_preset_key(id).into(), preset.into());
+        options.insert(
+            "dataset_mode".into(),
+            if preset == "register" {
+                "register"
+            } else if settings.vector_sweep {
+                "sweep"
+            } else {
+                "single"
+            }
+            .into(),
+        );
+        options.remove("dataset_bytes");
+        if preset == "custom" {
+            options.insert(
+                "dataset_bytes".into(),
+                vector_size_bytes(&settings.vector_size)
+                    .expect("queued settings validated")
+                    .to_string()
+                    .into(),
+            );
+        }
+    } else if configurable_compute(id) && settings.vector_preset != 0 {
         let preset = if settings.vector_preset == 6 {
             "custom"
         } else {
@@ -617,7 +685,10 @@ fn configuration_summary(settings: &AppSettings, id: &str) -> String {
             "GPU activity {}%",
             INTENSITY_PERCENT[settings.gpu_intensity]
         ));
-        if id.ends_with(".scaling") {
+        if id.ends_with(".scaling")
+            && !(gpu_offload(id) && settings.ram_offload_percent == 100)
+            && !(configurable_gpu_compute(id) && settings.vector_preset == 1)
+        {
             parts.push(format!("VRAM budget {}%", settings.vram_budget_percent));
         }
     } else {
@@ -641,9 +712,18 @@ fn configuration_summary(settings: &AppSettings, id: &str) -> String {
     if gpu_offload(id) {
         parts.push(format!("{}% RAM offload", settings.ram_offload_percent));
     }
-    if configurable_cpu_compute(id) && settings.vector_preset != 0 {
+    if configurable_compute(id) && settings.vector_preset != 0 {
         parts.push(
-            if buffered_cpu_compute(id) && settings.vector_preset == 1 {
+            if configurable_gpu_compute(id) {
+                match settings.vector_preset {
+                    1 => "Register compute",
+                    2 => "Small dataset",
+                    5 if gpu_offload(id) => "Automatic RAM/VRAM budget",
+                    5 => "Automatic VRAM budget",
+                    6 => "Custom size",
+                    _ => "Use global dataset settings",
+                }
+            } else if buffered_cpu_compute(id) && settings.vector_preset == 1 {
                 if id == CPU_ASCII_ID {
                     "Automatic scan-sized input"
                 } else {
@@ -678,16 +758,6 @@ fn configuration_summary(settings: &AppSettings, id: &str) -> String {
             _ => "Automatic dataset sweep".into(),
         });
     }
-    if id == CPU_RAM_BANDWIDTH_ID {
-        parts.push(if settings.ram_bandwidth_custom {
-            format!(
-                "RAM payload: {}",
-                format_binary_size(settings.ram_bandwidth_bytes as f64)
-            )
-        } else {
-            "Automatic RAM payload".into()
-        });
-    }
     parts.join(" · ")
 }
 
@@ -711,14 +781,20 @@ fn load_benchmark_preferences(path: &std::path::Path) -> Result<BenchmarkPrefere
         }
         Err(error) => return Err(error.to_string()),
     };
-    let preferences: BenchmarkPreferences =
+    let mut preferences: BenchmarkPreferences =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     if preferences.version != 1 {
         return Err("Unsupported benchmark-settings.json version.".into());
     }
-    for (id, preference) in &preferences.tests {
+    for (id, preference) in &mut preferences.tests {
+        if gpu_offload(id)
+            && preference.selected_option.is_none()
+            && let Some(custom) = &mut preference.custom
+        {
+            custom.settings.vector_preset = 0;
+        }
         if let Some(option) = &preference.selected_option {
-            if !configurable_cpu_compute(id) || !VECTOR_CHOICE_IDS.contains(&option.as_str()) {
+            if !configurable_compute(id) || !compute_choice_ids(id).contains(&option.as_str()) {
                 return Err(format!("Invalid saved option for {id}."));
             }
             if option == "custom" && preference.custom.is_none() {
@@ -743,7 +819,6 @@ fn settings_valid(settings: &AppSettings) -> bool {
         && settings.dataset_mode <= 2
         && settings.vector_preset <= 6
         && vector_size_bytes(&settings.vector_size).is_ok()
-        && settings.ram_bandwidth_bytes > 0
         && (1..=1_048_576).contains(&settings.dataset_mib)
         && OFFLOAD_PERCENT.contains(&settings.ram_offload_percent)
 }
@@ -776,6 +851,8 @@ impl App {
             selected: None,
             expanded_device_id: None,
             result_details_expanded: false,
+            snapshot: snapshot::SnapshotState::default(),
+            result_presentations: RefCell::default(),
             results: vec![],
             saved_results: vec![],
             baseline_results: vec![],
@@ -850,6 +927,72 @@ impl App {
     }
     fn wire(window: &MainWindow, app: &Rc<RefCell<Self>>) {
         window.on_chart_point_at(chart_hover::nearest);
+        let weak_app = Rc::downgrade(app);
+        let snapshot_window = window.as_weak();
+        window.on_toggle_snapshot_result(move |index, selected| {
+            if let Some(app) = weak_app.upgrade() {
+                let mut app = app.borrow_mut();
+                if app.active_request.is_some() {
+                    return;
+                }
+                if let Some(row) = app.snapshot.choices.get_mut(index.max(0) as usize) {
+                    row.selected = selected;
+                }
+                app.update_snapshot();
+                if let Some(window) = snapshot_window.upgrade() {
+                    App::refresh_snapshot(&window, &app);
+                }
+            }
+        });
+        let weak_app = Rc::downgrade(app);
+        let snapshot_window = window.as_weak();
+        window.on_snapshot_action(move |action| {
+            let Some(app) = weak_app.upgrade() else {
+                return;
+            };
+            if app.borrow().active_request.is_some() {
+                return;
+            }
+            // Native file dialogs can pump window events: never hold a RefCell borrow across them.
+            if action == "save" {
+                let picture = app.borrow().snapshot.image.clone();
+                if let Some(picture) = picture
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG snapshot", &["png"])
+                        .set_file_name("Gluj-Bench-snapshot.png")
+                        .save_file()
+                {
+                    app.borrow_mut().save_snapshot_in_background(picture, path);
+                    if let Some(window) = snapshot_window.upgrade() {
+                        App::refresh_snapshot(&window, &app.borrow());
+                    }
+                }
+                return;
+            }
+            if action == "import" {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Gluj-Bench snapshot", &["png"])
+                    .pick_file()
+                {
+                    app.borrow_mut().import_snapshot_in_background(path);
+                    if let Some(window) = snapshot_window.upgrade() {
+                        App::refresh_snapshot(&window, &app.borrow());
+                    }
+                }
+                return;
+            }
+            let mut app = app.borrow_mut();
+            match action.as_str() {
+                "open" => app.open_snapshot(),
+                "highlights" => app.reset_snapshot_highlights(),
+                "close" => app.close_snapshot(),
+                "copy" => app.copy_snapshot_in_background(),
+                _ => {}
+            }
+            if let Some(window) = snapshot_window.upgrade() {
+                App::refresh_snapshot(&window, &app);
+            }
+        });
         let weak = Rc::downgrade(app);
         window.on_select_default_configuration(move |field, index| {
             if let Some(app) = weak.upgrade() {
@@ -968,79 +1111,109 @@ impl App {
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_page(move |page| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
-                app.page = page;
-                app.ui_dirty = true;
+                app.page = page.clamp(0, 3);
+                if let Some(window) = navigation_window.upgrade() {
+                    window.set_page(app.page);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_suite(move |suite| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.select_suite(suite.as_str());
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    App::refresh_benchmark_panel(&window, &app);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_gpu(move |index| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.select_gpu(index);
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    App::refresh_benchmark_panel(&window, &app);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_benchmark(move |id| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.selected = Some(id.to_string());
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    App::refresh_benchmark_panel(&window, &app);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_toggle_device_details(move |id| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.expanded_device_id = (app.expanded_device_id.as_deref() != Some(id.as_str()))
                     .then(|| id.to_string());
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    window.set_expanded_device_id(
+                        app.expanded_device_id.clone().unwrap_or_default().into(),
+                    );
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_toggle_result_details(move || {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.result_details_expanded = !app.result_details_expanded;
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    window.set_result_details_expanded(app.result_details_expanded);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_result_component(move |index| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.result_component = index.max(0) as usize;
                 app.result_selection = 0;
                 app.comparison_selection = 0;
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    App::refresh_results(&window, &app);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_comparison(move |index| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.comparison_selection = index.max(0) as usize;
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    App::refresh_results(&window, &app);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
+        let navigation_window = window.as_weak();
         window.on_select_result_row(move |index| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.result_selection = index.max(0) as usize;
                 app.result_details_expanded = false;
-                app.ui_dirty = true;
+                if let Some(window) = navigation_window.upgrade() {
+                    window.set_result_details_expanded(false);
+                    App::refresh_results(&window, &app);
+                }
             }
         });
         let app_weak = Rc::downgrade(app);
@@ -1072,6 +1245,8 @@ impl App {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.results.clear();
+                app.result_presentations.borrow_mut().clear();
+                app.snapshot = snapshot::SnapshotState::default();
                 app.result_component = 0;
                 app.result_selection = 0;
                 app.result_details_expanded = false;
@@ -1117,16 +1292,53 @@ impl App {
         self.run_overrides.clear();
         self.vector_choices.clear();
         for (id, preference) in &preferences.tests {
+            let retired_gpu_register = matches!(
+                id.as_str(),
+                "gpu.performance.fp32"
+                    | "gpu.performance.matrix.fp16"
+                    | "gpu.performance.matrix.int8"
+            );
+            let legacy_share = match id.as_str() {
+                "gpu.performance.fp32.offload50.scaling" => Some(50),
+                "gpu.performance.fp32.offload75.scaling" => Some(75),
+                "gpu.performance.fp32.offload100.scaling" => Some(100),
+                _ => None,
+            };
+            let id = if legacy_share.is_some() {
+                GPU_OFFLOAD_ID
+            } else if retired_gpu_register {
+                if id == "gpu.performance.matrix.int8" {
+                    GPU_INT8_MATRIX_ID
+                } else if id == "gpu.performance.matrix.fp16" {
+                    GPU_MATRIX_ID
+                } else {
+                    GPU_VECTOR_ID
+                }
+            } else {
+                id.as_str()
+            };
             if let Some(custom) = &preference.custom {
-                self.run_overrides.insert(id.clone(), custom.clone());
+                let mut custom = custom.clone();
+                if let Some(share) = legacy_share {
+                    custom.settings.ram_offload_percent = share;
+                }
+                if gpu_offload(id) && preference.selected_option.is_none() {
+                    custom.settings.vector_preset = 0;
+                }
+
+                if retired_gpu_register {
+                    custom.settings.vector_preset = 1;
+                    custom.settings.vector_sweep = false;
+                }
+                self.run_overrides.insert(id.to_owned(), custom);
             }
-            if configurable_cpu_compute(id)
+            if configurable_compute(id)
                 && let Some(option) = &preference.selected_option
-                && let Some(index) = VECTOR_CHOICE_IDS
+                && let Some(index) = compute_choice_ids(id)
                     .iter()
                     .position(|choice| *choice == option)
             {
-                self.vector_choices.insert(id.clone(), index);
+                self.vector_choices.insert(id.to_owned(), index);
             }
         }
         self.benchmark_preferences = preferences;
@@ -1151,8 +1363,8 @@ impl App {
                         .and_then(|saved| saved.custom.clone())
                 }
             });
-            let selected_option = if configurable_cpu_compute(id) {
-                Some(VECTOR_CHOICE_IDS[self.compute_choice(id)].to_owned())
+            let selected_option = if configurable_compute(id) {
+                Some(compute_choice_ids(id)[self.compute_choice(id)].to_owned())
             } else {
                 None
             };
@@ -1197,7 +1409,7 @@ impl App {
             return;
         }
         let id = self.selected.as_deref().unwrap_or(CPU_VECTOR_ID).to_owned();
-        if !configurable_cpu_compute(&id) {
+        if !configurable_compute(&id) {
             return;
         }
         self.run_overrides.remove(&id);
@@ -1213,16 +1425,12 @@ impl App {
             if self.run_overrides.contains_key(id) {
                 2
             } else {
-                VECTOR_DEFAULT_CHOICE
+                compute_default_choice(id)
             }
         })
     }
     fn select_vector_choice(&mut self, index: i32) {
-        let Some(id) = self
-            .selected
-            .clone()
-            .filter(|id| configurable_cpu_compute(id))
-        else {
+        let Some(id) = self.selected.clone().filter(|id| configurable_compute(id)) else {
             return;
         };
         if self.active_request.is_some() || !(0..3).contains(&index) {
@@ -1243,16 +1451,25 @@ impl App {
         self.persist_benchmark_preferences();
     }
     fn effective_settings(&self, id: &str) -> Result<AppSettings, String> {
-        if configurable_cpu_compute(id) && self.compute_choice(id) != 2 {
+        if configurable_compute(id) && self.compute_choice(id) != 2 {
             let mut settings = self.settings.clone();
             settings.cpu_core_limit = 0;
             settings.dataset_mode = 0;
-            settings.vector_preset = if self.compute_choice(id) == 0 { 1 } else { 5 };
-            settings.vector_sweep = !(buffered_cpu_compute(id) && self.compute_choice(id) == 0);
-            if (buffered_cpu_compute(id) || self.compute_choice(id) == 1)
+            settings.vector_preset = if !gpu_offload(id) && self.compute_choice(id) == 0 {
+                1
+            } else {
+                5
+            };
+            settings.vector_sweep =
+                !((buffered_cpu_compute(id) || gpu_offload(id)) && self.compute_choice(id) == 0);
+            if (buffered_cpu_compute(id) || gpu_offload(id) || self.compute_choice(id) == 1)
                 && !self.compute_slider_range(id, &settings).available()
             {
-                return Err("Not enough available RAM for the automatic data-size sweep.".into());
+                return Err(if configurable_gpu_compute(id) {
+                    "The selected GPU has no usable dataset range within its VRAM and device limits.".into()
+                } else {
+                    "Not enough available RAM for the automatic data-size sweep.".into()
+                });
             }
             return Ok(settings);
         }
@@ -1262,22 +1479,29 @@ impl App {
             .map(|config| (&config.settings, config.dataset_text.as_str()))
             .unwrap_or((&self.settings, self.dataset_text.as_str()));
         let mut settings = validated_run_settings(settings, text, id)?;
-        if id == CPU_RAM_BANDWIDTH_ID && settings.ram_bandwidth_custom {
-            let range = self.ram_bandwidth_slider_range(&settings);
-            if !range.available() {
-                return Err(
-                    "Not enough available RAM for a RAM-sized payload and both buffers.".into(),
-                );
-            }
-            settings.ram_bandwidth_bytes = range.clamp(settings.ram_bandwidth_bytes);
+        if gpu_offload(id)
+            && matches!(settings.vector_preset, 2 | 5 | 6)
+            && !self.compute_slider_range(id, &settings).available()
+        {
+            return Err("No usable offload dataset range within the RAM/VRAM budgets and selected GPU limits.".into());
         }
-        if configurable_cpu_compute(id) && settings.vector_preset == 6 {
+
+        if gpu_matrix_compute(id)
+            && matches!(settings.vector_preset, 2 | 5 | 6)
+            && !self.compute_slider_range(id, &settings).available()
+        {
+            return Err("Matrix operand datasets require matching storage-buffer support and a usable GPU memory budget. Choose Compute speed to use registers.".into());
+        }
+
+        if configurable_compute(id) && settings.vector_preset == 6 {
             let range = self.compute_slider_range(id, &settings);
             if !range.available() {
-                return Err(
+                return Err(if configurable_gpu_compute(id) {
+                    "The selected GPU has no usable dataset range within its VRAM and device limits.".into()
+                } else {
                     "Not enough available RAM for the selected workers and allocation budget."
-                        .into(),
-                );
+                        .into()
+                });
             }
             settings.vector_size = format!(
                 "{} B",
@@ -1286,29 +1510,118 @@ impl App {
         }
         Ok(settings)
     }
-    fn ram_bandwidth_slider_range(&self, settings: &AppSettings) -> DatasetSliderRange {
-        let mut memory = sysinfo::System::new();
-        memory.refresh_memory();
-        let workers = if settings.cpu_core_limit == 0 {
-            self.physical_core_count()
-        } else {
-            settings.cpu_core_limit.min(self.physical_core_count())
-        };
-        let caches = self
-            .devices
-            .iter()
-            .find(|device| device.category == DeviceCategory::Cpu)
-            .map(|device| device.caches.as_slice())
-            .unwrap_or(&[]);
-        let highest = caches.iter().map(|cache| cache.level).max().unwrap_or(0);
-        let llc = caches
-            .iter()
-            .filter(|cache| cache.level == highest)
-            .map(|cache| cache.size_bytes.saturating_mul(cache.instances as u64))
-            .sum();
-        DatasetSliderRange::for_ram_bandwidth(workers, llc, memory.available_memory())
-    }
     fn compute_slider_range(&self, id: &str, settings: &AppSettings) -> DatasetSliderRange {
+        if configurable_gpu_compute(id) {
+            let device = self
+                .devices
+                .iter()
+                .find(|device| Some(device.id.as_str()) == self.selected_gpu_id.as_deref());
+            let property = |key: &str| {
+                device
+                    .and_then(|device| device.properties.get(key))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            let mut memory = sysinfo::System::new();
+            memory.refresh_memory();
+            if gpu_offload(id) {
+                let (minimum, mut maximum, alignment) =
+                    gluj_bench_core::gpu_fp32_offload_dataset_range(
+                        gluj_bench_core::vram_budget_bytes(
+                            property("device_local_memory_bytes"),
+                            settings.vram_budget_percent,
+                        )
+                        .saturating_sub(16 * 1024 * 1024),
+                        gluj_bench_core::gpu_offload_ram_budget(
+                            memory.total_memory(),
+                            memory.available_memory(),
+                            property("host_memory_heap_bytes"),
+                            settings.ram_budget_percent,
+                        ),
+                        property("max_storage_buffer_binding_size"),
+                        property("min_storage_buffer_offset_alignment"),
+                        settings.ram_offload_percent,
+                    );
+                if !device
+                    .and_then(|d| d.properties.get("device_type"))
+                    .is_some_and(|kind| kind == "DiscreteGpu")
+                {
+                    maximum = 0;
+                }
+                return DatasetSliderRange {
+                    minimum,
+                    maximum,
+                    alignment,
+                    matrix_workers: None,
+                };
+            }
+            let shared = device
+                .and_then(|device| device.properties.get("device_type"))
+                .is_some_and(|kind| {
+                    if gpu_matrix_compute(id) {
+                        kind != "DiscreteGpu"
+                    } else {
+                        matches!(kind.as_str(), "IntegratedGpu" | "Cpu")
+                    }
+                })
+                .then_some(memory.available_memory());
+            if gpu_matrix_compute(id) {
+                let shape = device
+                    .and_then(|device| {
+                        device.properties.get(if id == GPU_INT8_MATRIX_ID {
+                            "cooperative_matrix_int8_shape"
+                        } else {
+                            "cooperative_matrix_fp16_shape"
+                        })
+                    })
+                    .and_then(|shape| {
+                        shape
+                            .split('x')
+                            .map(str::parse::<u64>)
+                            .collect::<Result<Vec<_>, _>>()
+                            .ok()
+                    })
+                    .filter(|shape| shape.len() == 3)
+                    .unwrap_or_else(|| vec![0; 3]);
+                let (minimum, mut maximum, alignment) = (if id == GPU_INT8_MATRIX_ID {
+                    gluj_bench_core::gpu_int8_matrix_dataset_range
+                } else {
+                    gluj_bench_core::gpu_fp16_matrix_dataset_range
+                })(
+                    property("device_local_memory_bytes"),
+                    property("max_storage_buffer_binding_size"),
+                    [shape[0], shape[1], shape[2]],
+                    property("vulkan_subgroup_size"),
+                    settings.vram_budget_percent,
+                    shared,
+                );
+                if !device
+                    .and_then(|d| {
+                        d.properties.get(if id == GPU_INT8_MATRIX_ID {
+                            "storage_buffer_8bit_access"
+                        } else {
+                            "storage_buffer_16bit_access"
+                        })
+                    })
+                    .is_some_and(|v| v == "true")
+                {
+                    maximum = 0;
+                }
+                return DatasetSliderRange {
+                    minimum,
+                    maximum,
+                    alignment,
+                    matrix_workers: None,
+                };
+            }
+            return DatasetSliderRange::for_gpu(
+                property("device_local_memory_bytes"),
+                property("max_storage_buffer_binding_size"),
+                property("min_storage_buffer_offset_alignment"),
+                settings.vram_budget_percent,
+                shared,
+            );
+        }
         let mut memory = sysinfo::System::new();
         memory.refresh_memory();
         let workers = if settings.cpu_core_limit == 0 {
@@ -1341,23 +1654,7 @@ impl App {
         let Some(config) = self.run_overrides.get(&id) else {
             return;
         };
-        if id == CPU_RAM_BANDWIDTH_ID {
-            if !config.settings.ram_bandwidth_custom {
-                return;
-            }
-            let range = self.ram_bandwidth_slider_range(&config.settings);
-            if !range.available() {
-                return;
-            }
-            self.run_overrides
-                .get_mut(&id)
-                .unwrap()
-                .settings
-                .ram_bandwidth_bytes = range.bytes(position);
-            self.persist_benchmark_preferences();
-            return;
-        }
-        if !configurable_cpu_compute(&id) || config.settings.vector_preset != 6 {
+        if !configurable_compute(&id) || config.settings.vector_preset != 6 {
             return;
         }
         let range = self.compute_slider_range(&id, &config.settings);
@@ -1403,8 +1700,9 @@ impl App {
                 settings.vram_budget_percent = VRAM_BUDGET_OPTIONS[index as usize]
             }
             "dataset" if index < 3 => settings.dataset_mode = index as usize,
-            "ram-bandwidth-size" if index < 2 => settings.ram_bandwidth_custom = index == 1,
             "vector-preset" if index < 7 => settings.vector_preset = index as usize,
+            "offload-preset" if index < 4 => settings.vector_preset = [0, 2, 5, 6][index as usize],
+            "gpu-preset" if index < 5 => settings.vector_preset = [0, 1, 2, 5, 6][index as usize],
             "vector-mode" if index < 2 => settings.vector_sweep = index == 1,
             "offload" if index < 3 => {
                 settings.ram_offload_percent = OFFLOAD_PERCENT[index as usize]
@@ -1451,7 +1749,13 @@ impl App {
     }
     fn queued_run(&self, id: &str) -> Result<QueuedRun, String> {
         let settings = self.effective_settings(id)?;
-        if configurable_cpu_compute(id) && settings.vector_preset == 6 {
+        if configurable_gpu_compute(id) && settings.vector_preset == 6 {
+            if vector_size_bytes(&settings.vector_size)?
+                < self.compute_slider_range(id, &settings).minimum
+            {
+                return Err("GPU dataset is below the supported minimum.".into());
+            }
+        } else if configurable_compute(id) && settings.vector_preset == 6 {
             let workers = if settings.cpu_core_limit == 0 {
                 self.physical_core_count()
             } else {
@@ -1645,6 +1949,7 @@ impl App {
                                         };
                                     }
                                     self.results.push(result);
+                                    self.refresh_snapshot_choices();
                                     let latest = self.results.last().unwrap();
                                     let key = result_component_key(latest);
                                     let benchmark = latest.benchmark_id.clone();
@@ -1743,6 +2048,44 @@ impl App {
         }
     }
     fn refresh(window: &MainWindow, app: &Self) {
+        // Full data updates invalidate derived charts. Navigation reuses these presentations.
+        app.result_presentations.borrow_mut().clear();
+        Self::refresh_configuration(window, app);
+        Self::refresh_status(window, app);
+        Self::refresh_gpu_selector(window, app);
+        Self::refresh_devices(window, app);
+        Self::refresh_benchmark_list(window, app);
+        Self::refresh_benchmark_details(window, app);
+        Self::refresh_results(window, app);
+    }
+    fn refresh_benchmark_panel(window: &MainWindow, app: &Self) {
+        Self::refresh_configuration(window, app);
+        Self::refresh_status(window, app);
+        Self::refresh_gpu_selector(window, app);
+        Self::refresh_benchmark_list(window, app);
+        Self::refresh_benchmark_details(window, app);
+    }
+    fn cached_result_row(&self, result: &BenchmarkResult) -> ResultRow {
+        let index = self
+            .results
+            .iter()
+            .position(|r| std::ptr::eq(r, result))
+            .unwrap();
+        let mut cache = self.result_presentations.borrow_mut();
+        if let Some(position) = cache.iter().position(|(key, _)| *key == index) {
+            let entry = cache.remove(position).unwrap();
+            let row = entry.1.clone();
+            cache.push_back(entry);
+            return row;
+        }
+        let row = result_row(result, &self.devices, &self.benchmarks);
+        if cache.len() == 8 {
+            cache.pop_front();
+        }
+        cache.push_back((index, row.clone()));
+        row
+    }
+    fn refresh_configuration(window: &MainWindow, app: &Self) {
         window.set_app_version(env!("CARGO_PKG_VERSION").into());
         window.set_system_ready(
             app.worker.online()
@@ -1838,16 +2181,15 @@ impl App {
         window.set_test_is_scaling(
             selected_id.ends_with(".scaling") || matches!(selected_id, CPU_ASCII_ID | CPU_INT64_ID),
         );
-        window.set_test_is_configurable_compute(configurable_cpu_compute(selected_id));
+        window.set_test_is_configurable_compute(configurable_compute(selected_id));
         window.set_test_is_matrix(selected_id == CPU_MATRIX_ID);
+        window.set_test_is_gpu_matrix(gpu_matrix_compute(selected_id));
+        window.set_test_is_gpu_int8_matrix(selected_id == GPU_INT8_MATRIX_ID);
         window.set_test_is_ascii(selected_id == CPU_ASCII_ID);
         window.set_test_is_int64(selected_id == CPU_INT64_ID);
-        window.set_test_is_ram_bandwidth(selected_id == CPU_RAM_BANDWIDTH_ID);
-        window.set_test_ram_bandwidth_custom(settings.ram_bandwidth_custom);
-        window.set_test_ram_bandwidth_index(i32::from(settings.ram_bandwidth_custom));
         window.set_test_vector_choice_index(app.compute_choice(selected_id) as i32);
         window.set_test_vector_can_reset(
-            app.compute_choice(selected_id) != VECTOR_DEFAULT_CHOICE
+            app.compute_choice(selected_id) != compute_default_choice(selected_id)
                 || app.run_overrides.contains_key(selected_id),
         );
         window.set_test_vector_legacy(settings.vector_preset == 0);
@@ -1855,28 +2197,61 @@ impl App {
             register_arithmetic(selected_id) && settings.vector_preset == 1,
         );
         window.set_test_vector_custom(settings.vector_preset == 6);
-        window.set_test_vector_preset_index(settings.vector_preset as i32);
-        window.set_test_vector_mode_index(i32::from(settings.vector_sweep));
-        let range = if selected_id == CPU_RAM_BANDWIDTH_ID {
-            app.ram_bandwidth_slider_range(settings)
+        window.set_test_vector_preset_index(if gpu_offload(selected_id) {
+            [0, 2, 5, 6]
+                .iter()
+                .position(|preset| *preset == settings.vector_preset)
+                .unwrap_or(0) as i32
+        } else if configurable_gpu_compute(selected_id) {
+            [0, 1, 2, 5, 6]
+                .iter()
+                .position(|preset| *preset == settings.vector_preset)
+                .unwrap_or(0) as i32
         } else {
-            app.compute_slider_range(selected_id, settings)
-        };
-        let bytes = range.clamp(if selected_id == CPU_RAM_BANDWIDTH_ID {
-            settings.ram_bandwidth_bytes
-        } else {
-            vector_size_bytes(&settings.vector_size).unwrap_or(range.minimum)
+            settings.vector_preset as i32
         });
+        window.set_test_vector_mode_index(i32::from(settings.vector_sweep));
+        let range = app.compute_slider_range(selected_id, settings);
+        let bytes = range.clamp(vector_size_bytes(&settings.vector_size).unwrap_or(range.minimum));
         window.set_test_vector_size(format_binary_size(bytes as f64).into());
         window.set_test_vector_size_position(range.position(bytes));
         window.set_test_vector_size_available(range.available());
-        window.set_test_vector_size_range(if range.available() {
-            if selected_id == CPU_RAM_BANDWIDTH_ID {
-                format!("{} to {} of payload across all workers. The limit reserves space for both buffers and leaves available-memory headroom.", format_binary_size(range.minimum as f64), format_binary_size(range.maximum as f64))
-            } else { format!("{} to {} · current RAM budget and available memory. The scale spans KiB through GiB.", format_binary_size(range.minimum as f64), format_binary_size(range.maximum as f64)) }
-        } else { "Not enough available RAM for this allocation.".into() }.into());
+        window.set_test_vector_size_range(
+            if range.available() {
+                format!(
+                    "{} to {} · {}. The scale spans KiB through GiB.",
+                    format_binary_size(range.minimum as f64),
+                    format_binary_size(range.maximum as f64),
+                    if gpu_offload(selected_id) {
+                        "RAM/VRAM budgets, available RAM and GPU buffer limits"
+                    } else if configurable_gpu_compute(selected_id) {
+                        "selected GPU, VRAM budget and device buffer limits"
+                    } else {
+                        "current RAM budget and available memory"
+                    }
+                )
+            } else {
+                if configurable_gpu_compute(selected_id) {
+                    "GPU dataset limits unavailable or too small.".into()
+                } else {
+                    "Not enough available RAM for this allocation.".into()
+                }
+            }
+            .into(),
+        );
         let mut matrix_automatic_bytes = None;
         let vector_preview = match settings.vector_preset {
+            2 if gpu_offload(selected_id) => format!("Small mixed-memory dataset: {}. {}% in system RAM.", format_binary_size(range.minimum as f64), settings.ram_offload_percent),
+            5 if gpu_offload(selected_id) => format!("Up to {} total across input/output buffers; {}% system RAM, {}% VRAM.", format_binary_size(range.maximum as f64), settings.ram_offload_percent, 100 - settings.ram_offload_percent),
+            1 if selected_id == GPU_INT8_MATRIX_ID => "INT8 matrix multiply-accumulate in registers with 32-bit accumulation".into(),
+            2 if selected_id == GPU_INT8_MATRIX_ID => format!("Small INT8 operand dataset: {}. 32-bit output is allocated separately.", format_binary_size(range.minimum as f64)),
+            5 if selected_id == GPU_INT8_MATRIX_ID => format!("Up to {} in INT8 operands; space is reserved for 32-bit output.", format_binary_size(range.maximum as f64)),
+            1 if selected_id == GPU_MATRIX_ID => "FP16 matrix multiply-accumulate in registers · FP32 accumulation".into(),
+            2 if selected_id == GPU_MATRIX_ID => format!("Small FP16 operand dataset: {}. FP32 output is allocated separately.", format_binary_size(range.minimum as f64)),
+            5 if selected_id == GPU_MATRIX_ID => format!("Up to {} in FP16 operands; space is reserved for FP32 output.", format_binary_size(range.maximum as f64)),
+            1 if configurable_gpu_compute(selected_id) => "GPU register arithmetic · no large streaming allocation".into(),
+            2 if configurable_gpu_compute(selected_id) => format!("Small input/output dataset: {}. Cache residency is not assumed.", format_binary_size(range.minimum as f64)),
+            5 if configurable_gpu_compute(selected_id) => format!("Up to {} in GPU input/output buffers; resolved at run time.", format_binary_size(range.maximum as f64)),
             1 if buffered_cpu_compute(selected_id) => {
                 let workers = if settings.cpu_core_limit == 0 { app.physical_core_count() } else { settings.cpu_core_limit.min(app.physical_core_count()) }.max(1);
                 let target = app.benchmarks.iter().find(|benchmark| benchmark.id == selected_id)
@@ -1910,7 +2285,15 @@ impl App {
             6 => vector_size_bytes(&settings.vector_size).map(|bytes| {
                 let workers = if settings.cpu_core_limit == 0 { app.physical_core_count() } else { settings.cpu_core_limit.min(app.physical_core_count()) }.max(1) as u64;
                 let actual = range.clamp(bytes);
-                if selected_id == CPU_MATRIX_ID {
+                if gpu_offload(selected_id) {
+                    format!("{} total: {} in system RAM, {} in VRAM", format_binary_size(actual as f64), format_binary_size(actual as f64 * settings.ram_offload_percent as f64 / 100.0), format_binary_size(actual as f64 * (100 - settings.ram_offload_percent) as f64 / 100.0))
+                } else if selected_id == GPU_INT8_MATRIX_ID {
+                    format!("{} across INT8 operand buffers; 32-bit output allocated separately", format_binary_size(actual as f64))
+                } else if selected_id == GPU_MATRIX_ID {
+                    format!("{} across FP16 operand buffers; FP32 output allocated separately", format_binary_size(actual as f64))
+                } else if configurable_gpu_compute(selected_id) {
+                    format!("{} total across GPU input/output buffers", format_binary_size(actual as f64))
+                } else if selected_id == CPU_MATRIX_ID {
                     let dimension = gluj_bench_core::cpu_matrix_dimension(actual / workers);
                     format!("{} total · 32 × {dimension} × {dimension} per worker", format_binary_size(actual as f64))
                 } else { format!("Target allocation: {} total (aligned to {} workers)", format_binary_size(actual as f64), workers) }
@@ -1946,6 +2329,24 @@ impl App {
         window.set_test_configuration_valid(effective.is_ok());
         window.set_test_configuration_summary(
             match effective {
+                Ok(settings) if gpu_offload(selected_id) && app.compute_choice(selected_id) != 2 => {
+                    let range = app.compute_slider_range(selected_id, &settings);
+                    format!("{} up to {} total; {}% system RAM, {}% VRAM. GPU compute runs in every mode.",
+                        if settings.vector_sweep { "Sweep" } else { "One automatic dataset" }, format_binary_size(range.maximum as f64), settings.ram_offload_percent, 100 - settings.ram_offload_percent)
+                }
+                Ok(_) if configurable_gpu_compute(selected_id) && app.compute_choice(selected_id) == 0 => {
+                    if selected_id == GPU_INT8_MATRIX_ID { "Measures INT8 matrix calculation speed with 32-bit accumulation on the selected GPU.".into() } else if selected_id == GPU_MATRIX_ID { "Measures FP16 matrix calculation speed with FP32 accumulation on the selected GPU.".into() } else { "Measures FP32 calculation speed on the selected GPU.".into() }
+                }
+                Ok(settings)
+                    if configurable_gpu_compute(selected_id) && app.compute_choice(selected_id) == 1 =>
+                {
+                    format!(
+                        "Small through large GPU datasets, up to {} within the VRAM budget.",
+                        format_binary_size(
+                            app.compute_slider_range(selected_id, &settings).maximum as f64
+                        )
+                    )
+                }
                 Ok(_)
                     if buffered_cpu_compute(selected_id)
                         && app.compute_choice(selected_id) == 0 =>
@@ -1965,7 +2366,7 @@ impl App {
                     )
                 }
                 Ok(settings)
-                    if configurable_cpu_compute(selected_id)
+                    if configurable_compute(selected_id)
                         && app.compute_choice(selected_id) == 1 =>
                 {
                     format!(
@@ -1976,7 +2377,7 @@ impl App {
                         app.physical_core_count()
                     )
                 }
-                Ok(settings) if configurable_cpu_compute(selected_id) => {
+                Ok(settings) if configurable_compute(selected_id) => {
                     configuration_summary(&settings, selected_id)
                 }
                 Ok(settings) => format!(
@@ -2010,6 +2411,8 @@ impl App {
             )
             .into(),
         );
+    }
+    fn refresh_status(window: &MainWindow, app: &Self) {
         window.set_page(app.page);
         window.set_status(app.status.clone().into());
         window.set_worker_online(app.worker.online());
@@ -2025,6 +2428,8 @@ impl App {
         window
             .set_available_device_count(app.devices.iter().filter(|d| d.available).count() as i32);
         window.set_benchmark_count(app.benchmarks.len() as i32);
+    }
+    fn refresh_gpu_selector(window: &MainWindow, app: &Self) {
         let gpu_devices: Vec<_> = app
             .devices
             .iter()
@@ -2050,6 +2455,8 @@ impl App {
                 .unwrap_or("No compatible GPU selected")
                 .into(),
         );
+    }
+    fn refresh_devices(window: &MainWindow, app: &Self) {
         let devices: Vec<DeviceRow> = app
             .devices
             .iter()
@@ -2093,6 +2500,8 @@ impl App {
             })
             .collect();
         window.set_devices(ModelRc::new(VecModel::from(devices)));
+    }
+    fn refresh_benchmark_list(window: &MainWindow, app: &Self) {
         let benchmarks: Vec<BenchmarkRow> = app
             .benchmarks
             .iter()
@@ -2122,6 +2531,8 @@ impl App {
             })
             .collect();
         window.set_benchmarks(ModelRc::new(VecModel::from(benchmarks)));
+    }
+    fn refresh_benchmark_details(window: &MainWindow, app: &Self) {
         let selected = app
             .selected
             .as_ref()
@@ -2208,6 +2619,8 @@ impl App {
             }
             .into(),
         );
+    }
+    fn refresh_results(window: &MainWindow, app: &Self) {
         let mut components: Vec<String> = Vec::new();
         for result in &app.results {
             let component = result_component_key(result);
@@ -2246,6 +2659,8 @@ impl App {
         window.set_result_components(ModelRc::new(VecModel::from(names.clone())));
         window.set_result_component_name(names.get(component_index).cloned().unwrap_or_default());
         window.set_result_count(app.results.len() as i32);
+        Self::refresh_snapshot(window, app);
+
         window.set_results_file_status(app.results_file_status.clone().into());
         let groups = component_results(
             &app.results,
@@ -2288,8 +2703,9 @@ impl App {
         let rows = groups
             .iter()
             .map(|group| {
-                let latest = result_row(group[0], &app.devices, &app.benchmarks);
+                let primary = featured_metric(group[0]);
                 SummaryRow {
+                    configuration: result_configuration_label(group[0]).into(),
                     section: result_section(group[0]),
                     bandwidth: ["read", "write", "copy"].iter().all(|name| {
                         group[0]
@@ -2325,21 +2741,12 @@ impl App {
                         comparison_key,
                     )
                     .into(),
-                    title: if group[0].benchmark_id.ends_with(".scaling") {
-                        format!(
-                            "{} · {}",
-                            latest.title,
-                            scaling_compute_tiers(group[0])
-                                .last()
-                                .map(|(bytes, _)| format_binary_size(*bytes as f64))
-                                .unwrap_or_default()
-                        )
-                        .into()
-                    } else {
-                        latest.title
-                    },
-                    metric: latest.primary_name,
-                    latest: latest.primary_value,
+                    title: result_title(group[0], &app.benchmarks).into(),
+                    metric: result_primary_name(group[0]).into(),
+                    latest: primary
+                        .map(|metric| format_metric(metric.value, &metric.unit))
+                        .unwrap_or_else(|| "N/A".into())
+                        .into(),
                     best: best_primary(group)
                         .map(|m| format_metric(m.value, &m.unit))
                         .unwrap_or_else(|| "—".into())
@@ -2370,7 +2777,7 @@ impl App {
         window.set_selected_result(
             groups
                 .get(selection)
-                .map(|group| result_row(group[0], &app.devices, &app.benchmarks))
+                .map(|group| app.cached_result_row(group[0]))
                 .unwrap_or_default(),
         );
     }
@@ -2398,7 +2805,32 @@ fn load_results(path: &std::path::Path) -> Result<Vec<BenchmarkResult>, String> 
     if file.version != 1 {
         return Err("unsupported results file version".into());
     }
-    for result in &mut file.results {
+    normalize_results(&mut file.results);
+    Ok(file.results)
+}
+
+fn normalize_results(results: &mut [BenchmarkResult]) {
+    for result in results {
+        if matches!(
+            result.benchmark_id.as_str(),
+            "gpu.performance.fp32" | "gpu.performance.matrix.fp16" | "gpu.performance.matrix.int8"
+        ) {
+            let id = if result.benchmark_id == "gpu.performance.matrix.int8" {
+                GPU_INT8_MATRIX_ID
+            } else if result.benchmark_id == "gpu.performance.matrix.fp16" {
+                GPU_MATRIX_ID
+            } else {
+                GPU_VECTOR_ID
+            };
+            result.benchmark_id = id.into();
+            result.workload_metadata.insert(
+                gpu_preset_key(&result.benchmark_id).into(),
+                "register".into(),
+            );
+            result
+                .workload_metadata
+                .insert("dataset_mode".into(), "register".into());
+        }
         if result.benchmark_id == "cpu.performance.avx2.f32_fma" {
             result.benchmark_id = CPU_VECTOR_ID.into();
             result
@@ -2429,7 +2861,6 @@ fn load_results(path: &std::path::Path) -> Result<Vec<BenchmarkResult>, String> 
                 .or_insert_with(|| percent.to_string());
         }
     }
-    Ok(file.results)
 }
 
 fn save_results(path: &std::path::Path, results: &[BenchmarkResult]) -> Result<(), String> {
@@ -2498,6 +2929,35 @@ fn stamp_result(
     result
         .device_metadata
         .insert("saved_device_name".into(), device_name);
+    result.device_metadata.remove("saved_system_cpu_name");
+    if let Some(cpu) = devices.iter().find(|d| d.category == DeviceCategory::Cpu) {
+        result
+            .device_metadata
+            .insert("saved_system_cpu_name".into(), cpu.name.clone());
+    }
+    // Preserve run-time RAM context even for GPU results and portable snapshot imports.
+    for key in ["saved_system_ram_bytes", "saved_system_ram_speed_mts"] {
+        result.device_metadata.remove(key);
+    }
+    if let Some(memory) = devices
+        .iter()
+        .find(|d| d.category == DeviceCategory::Memory)
+    {
+        if let Some(bytes) = memory
+            .properties
+            .get("installed_bytes")
+            .or_else(|| memory.properties.get("total_bytes"))
+        {
+            result
+                .device_metadata
+                .insert("saved_system_ram_bytes".into(), bytes.clone());
+        }
+        if let Some(speed) = memory.properties.get("configured_speed_mts") {
+            result
+                .device_metadata
+                .insert("saved_system_ram_speed_mts".into(), speed.clone());
+        }
+    }
     result.device_metadata.insert("saved_setup".into(), setup);
     result.device_metadata.insert(
         "saved_at".into(),
@@ -2511,6 +2971,11 @@ fn stamp_result(
 
 fn remember_result(saved: &mut Vec<BenchmarkResult>, result: &BenchmarkResult) {
     saved.retain(|old| {
+        if configuration_result_rows(result) {
+            return old.benchmark_id != result.benchmark_id
+                || result_component_key(old) != result_component_key(result)
+                || !same_run_configuration(old, result);
+        }
         old.benchmark_id != result.benchmark_id
             || result_component_key(old) != result_component_key(result)
             || result_load_signature(old) != result_load_signature(result)
@@ -2528,6 +2993,13 @@ fn remember_result(saved: &mut Vec<BenchmarkResult>, result: &BenchmarkResult) {
                 != result.workload_metadata.get("ascii_preset")
             || old.workload_metadata.get("int64_preset")
                 != result.workload_metadata.get("int64_preset")
+            || old.workload_metadata.get("gpu_offload_preset")
+                != result.workload_metadata.get("gpu_offload_preset")
+            || old.workload_metadata.get("gpu_preset") != result.workload_metadata.get("gpu_preset")
+            || old.workload_metadata.get("gpu_int8_matrix_preset")
+                != result.workload_metadata.get("gpu_int8_matrix_preset")
+            || old.workload_metadata.get("gpu_matrix_preset")
+                != result.workload_metadata.get("gpu_matrix_preset")
             || (result.benchmark_id == CPU_RAM_BANDWIDTH_ID
                 && ram_bandwidth_payload(old) != ram_bandwidth_payload(result))
     });
@@ -2772,8 +3244,13 @@ fn component_label(result: &BenchmarkResult, devices: &[DeviceDescriptor]) -> St
         })
 }
 
-// Show RAM with its CPU, preserving the actual measurement device and workload.
-// Newest completed run is always first.
+// Configurable compute includes register runs of the same workload family.
+fn configuration_result_rows(result: &BenchmarkResult) -> bool {
+    configurable_compute(&result.benchmark_id) || result.benchmark_id.ends_with(".scaling")
+}
+
+// Show the latest three distinct configurations per workload and device/setup.
+// Repeated runs stay together for latest/best statistics, newest first.
 fn component_results<'a>(
     results: &'a [BenchmarkResult],
     device_id: &str,
@@ -2784,22 +3261,105 @@ fn component_results<'a>(
         .rev()
         .filter(|r| result_component_key(r) == device_id)
     {
+        let configurable = configuration_result_rows(result);
         if let Some(group) = groups.iter_mut().find(|g| {
             g[0].benchmark_id == result.benchmark_id
                 && g[0].device_id == result.device_id
-                && (!gpu_offload(&result.benchmark_id)
-                    || g[0].workload_metadata.get("ram_offload_percent")
-                        == result.workload_metadata.get("ram_offload_percent"))
+                && (!configurable || same_run_configuration(g[0], result))
         }) {
             group.push(result);
-        } else {
+        } else if !configurable
+            || groups
+                .iter()
+                .filter(|g| {
+                    g[0].benchmark_id == result.benchmark_id && g[0].device_id == result.device_id
+                })
+                .count()
+                < 3
+        {
             groups.push(vec![result]);
         }
     }
+    // Stable sorting preserves recency among configurations of the same workload.
     groups.sort_by(|a, b| {
         (result_section(a[0]), &a[0].benchmark_id).cmp(&(result_section(b[0]), &b[0].benchmark_id))
     });
     groups
+}
+
+fn result_configuration_label(result: &BenchmarkResult) -> String {
+    if !configuration_result_rows(result) {
+        return String::new();
+    }
+    let register = register_vector(result)
+        || register_gpu(result)
+        || (result.benchmark_id == CPU_INT64_ID && !scaling_result(result));
+    let mut parts = Vec::new();
+    if !register {
+        let preset = [
+            "vector_preset",
+            "matrix_preset",
+            "ascii_preset",
+            "int64_preset",
+            "gpu_preset",
+            "gpu_matrix_preset",
+            "gpu_int8_matrix_preset",
+            "gpu_offload_preset",
+        ]
+        .iter()
+        .find_map(|key| result.workload_metadata.get(*key));
+        if let Some(label) = preset.and_then(|preset| match preset.as_str() {
+            "custom" => Some("Custom"),
+            "small" => Some("Small data"),
+            "l1" => Some("L1 target"),
+            "l2" => Some("L2 target"),
+            "l3" => Some("L3 target"),
+            "ram" => Some("RAM budget"),
+            "vram" => Some("VRAM budget"),
+            "budget" => Some("Memory budget"),
+            "compute" => Some("Automatic compute data"),
+            _ => None,
+        }) {
+            parts.push(label.into());
+        }
+    }
+    if register {
+        parts.push("Register compute".into());
+    } else {
+        let single = result
+            .workload_metadata
+            .get("dataset_mode")
+            .is_some_and(|mode| mode == "single");
+        let size = metadata_size(result, "resolved_dataset_bytes")
+            .or_else(|| {
+                scaling_compute_tiers(result)
+                    .last()
+                    .map(|(bytes, _)| format_binary_size(*bytes as f64))
+            })
+            .or_else(|| metadata_size(result, "requested_dataset_bytes"));
+        parts.push(match size {
+            Some(size) => format!("{} {size}", if single { "One size:" } else { "Sweep to" }),
+            None => {
+                if single {
+                    "One dataset".into()
+                } else {
+                    "Data-size sweep".into()
+                }
+            }
+        });
+    }
+    let (load, _, cores, _) = result_load_signature(result);
+    if cores > 0 {
+        parts.push(format!("{cores} cores"));
+    }
+    parts.push(format!("{load}% activity"));
+    if let Some(reuse) = result.workload_metadata.get("matrix_tile_reuse") {
+        parts.push(format!("reuse {reuse}"));
+    }
+    if let Some(iterations) = result.workload_metadata.get("arithmetic_iterations") {
+        parts.push(format!("{iterations} iterations"));
+    }
+    parts.join(" · ")
 }
 
 fn result_section(result: &BenchmarkResult) -> i32 {
@@ -2843,6 +3403,10 @@ fn same_run_configuration(left: &BenchmarkResult, right: &BenchmarkResult) -> bo
             "matrix_preset",
             "ascii_preset",
             "int64_preset",
+            "gpu_preset",
+            "gpu_offload_preset",
+            "gpu_matrix_preset",
+            "gpu_int8_matrix_preset",
             "kernel_revision",
             "resolved_dataset_bytes",
         ]
@@ -3091,18 +3655,13 @@ fn suite_description(suite: &str) -> &'static str {
         _ => "Select a benchmark category.",
     }
 }
-fn result_row(
-    result: &BenchmarkResult,
-    devices: &[DeviceDescriptor],
-    benchmarks: &[BenchmarkDescriptor],
-) -> ResultRow {
-    let primary = featured_metric(result);
+fn result_title(result: &BenchmarkResult, benchmarks: &[BenchmarkDescriptor]) -> String {
     let title = benchmarks
         .iter()
         .find(|benchmark| benchmark.id == result.benchmark_id)
         .map(|benchmark| benchmark.name.as_str())
         .unwrap_or(result.benchmark_id.as_str());
-    let title = if gpu_offload(&result.benchmark_id) {
+    if gpu_offload(&result.benchmark_id) {
         result
             .workload_metadata
             .get("ram_offload_percent")
@@ -3110,7 +3669,28 @@ fn result_row(
             .unwrap_or_else(|| title.to_owned())
     } else {
         title.to_owned()
-    };
+    }
+}
+
+fn result_primary_name(result: &BenchmarkResult) -> String {
+    if result.benchmark_id == CPU_ASCII_ID && scaling_result(result) {
+        "Scanning speed at largest input".into()
+    } else if scaling_result(result) {
+        "Largest tested data set compute".into()
+    } else {
+        featured_metric(result)
+            .map(|metric| display_metric_name(&metric.name))
+            .unwrap_or_else(|| "No metric reported".into())
+    }
+}
+
+fn result_row(
+    result: &BenchmarkResult,
+    devices: &[DeviceDescriptor],
+    benchmarks: &[BenchmarkDescriptor],
+) -> ResultRow {
+    let primary = featured_metric(result);
+    let title = result_title(result, benchmarks);
     let diagnosis = if scaling_result(result) {
         match (
             result
@@ -3293,7 +3873,15 @@ fn result_row(
         }
         .into(),
         title: title.into(),
-        description: test_description(if register_vector(result) {
+        description: test_description(if register_gpu(result) {
+            if result.benchmark_id == GPU_INT8_MATRIX_ID {
+                "gpu.performance.matrix.int8"
+            } else if result.benchmark_id == GPU_MATRIX_ID {
+                "gpu.performance.matrix.fp16"
+            } else {
+                "gpu.performance.fp32"
+            }
+        } else if register_vector(result) {
             "cpu.performance.avx2.f32_fma"
         } else {
             &result.benchmark_id
@@ -3311,16 +3899,7 @@ fn result_row(
         .into(),
         device: device.into(),
         elapsed: format!("{:.2} ms", result.elapsed_ns as f64 / 1e6).into(),
-        primary_name: if result.benchmark_id == CPU_ASCII_ID && scaling_result(result) {
-            "Scanning speed at largest input".into()
-        } else if scaling_result(result) {
-            "Largest tested data set compute".into()
-        } else {
-            primary
-                .map(|metric| display_metric_name(&metric.name))
-                .unwrap_or_else(|| "No metric reported".into())
-                .into()
-        },
+        primary_name: result_primary_name(result).into(),
         primary_value: primary
             .map(|metric| format_metric(metric.value, &metric.unit))
             .unwrap_or_else(|| "N/A".into())
@@ -3436,13 +4015,16 @@ fn test_takeaway(id: &str) -> &'static str {
             "Measures CPU calculation speed with different amounts of data."
         }
         _ if gpu_offload(id) => {
-            "Measures GPU calculation speed with your chosen share of data in system RAM. Choose the offload percentage and dataset in Settings or override them for this test."
+            "Measures GPU FP32 calculation speed with data split between system RAM and VRAM. Use an automatic size sweep, one automatic dataset, or customize the size and RAM share."
         }
         "gpu.performance.fp32.scaling" => {
             "Shows how larger data sets affect graphics-card calculation throughput."
         }
         "gpu.performance.matrix.fp16.scaling" => {
-            "Shows how larger AI data sets affect matrix calculation throughput."
+            "Measures FP16 matrix calculation speed in registers or across different operand sizes."
+        }
+        "gpu.performance.matrix.int8.scaling" => {
+            "Measures INT8 matrix calculation speed in registers or across different operand sizes."
         }
         "gpu.bandwidth.host_link" => {
             "Measures how quickly data moves between system RAM and the graphics card."
@@ -3487,7 +4069,7 @@ fn test_takeaway(id: &str) -> &'static str {
 fn gpu_offload(id: &str) -> bool {
     matches!(
         id,
-        "gpu.performance.fp32.offload.scaling"
+        GPU_OFFLOAD_ID
             | "gpu.performance.fp32.offload50.scaling"
             | "gpu.performance.fp32.offload75.scaling"
             | "gpu.performance.fp32.offload100.scaling"
@@ -3507,6 +4089,13 @@ fn register_vector(result: &BenchmarkResult) -> bool {
             .map(String::as_str)
             == Some("register")
 }
+fn register_gpu(result: &BenchmarkResult) -> bool {
+    configurable_gpu_compute(&result.benchmark_id)
+        && result
+            .workload_metadata
+            .get(gpu_preset_key(&result.benchmark_id))
+            .is_some_and(|preset| preset == "register")
+}
 
 fn scaling_result(result: &BenchmarkResult) -> bool {
     let revision = result
@@ -3517,6 +4106,7 @@ fn scaling_result(result: &BenchmarkResult) -> bool {
         || (result.benchmark_id == CPU_ASCII_ID && revision == Some("ascii-scan-1"))
         || (result.benchmark_id == CPU_INT64_ID && revision == Some("int64-streaming-1")))
         && !register_vector(result)
+        && !register_gpu(result)
 }
 
 fn cpu_matrix_tier_shape(result: &BenchmarkResult, bytes: u64) -> Option<String> {
@@ -3548,6 +4138,15 @@ fn cpu_matrix_tier_shape(result: &BenchmarkResult, bytes: u64) -> Option<String>
 }
 
 fn tuning_takeaway(result: &BenchmarkResult) -> String {
+    if register_gpu(result) {
+        if result.benchmark_id == GPU_INT8_MATRIX_ID {
+            return "Register-resident INT8 matrix compute with 32-bit accumulation. Choose an operand dataset to inspect size sensitivity.".into();
+        }
+        if result.benchmark_id == GPU_MATRIX_ID {
+            return "Register-resident FP16 matrix throughput with FP32 accumulation. Choose an operand dataset to inspect size sensitivity.".into();
+        }
+        return "Register-resident GPU FP32 throughput. Choose a memory-backed dataset to inspect size sensitivity.".into();
+    }
     if result.benchmark_id == CPU_INT64_ID && !scaling_result(result) {
         return "Register-resident 64-bit wrapping multiply/add. Choose a cache or RAM dataset to examine memory pressure.".into();
     }
@@ -3998,7 +4597,10 @@ fn test_description(id: &str) -> &'static str {
             "First measures FP32 calculation speed with most work kept in GPU registers, creating a measured compute ceiling rather than a theoretical peak. It then repeats calculations with increasingly large data sets up to your VRAM budget, showing the performance gap as memory traffic grows."
         }
         "gpu.performance.matrix.fp16.scaling" => {
-            "First measures FP16 matrix calculation speed with operands kept in GPU registers. It then multiplies grids of 16-bit numbers while increasing input data from cache-sized sets toward your VRAM budget. Each size reports TOPS, effective input traffic in GB/s, and a delta from the measured compute ceiling. This is a measured reference, not a theoretical peak."
+            "Choose Compute speed for register-resident FP16 matrix multiply-accumulate with FP32 accumulation, Performance across data sizes for an automatic operand-size sweep, or Customize this test for a preset or size slider. Size covers the two FP16 operand buffers; FP32 output and overhead are reserved separately. Memory-backed runs keep the same tile and reuse count, reporting TOPS, effective operand traffic in GB/s and measured GPU timings. They compare against a separately measured register reference."
+        }
+        "gpu.performance.matrix.int8.scaling" => {
+            "Choose Compute speed for register-resident INT8 matrix multiply-accumulate with 32-bit accumulation, Performance across data sizes for an automatic operand-size sweep, or Customize this test for a preset or size slider. Size covers the two INT8 operand buffers; 32-bit output and overhead are reserved separately. Memory-backed runs keep the same tile and reuse count, reporting TOPS, effective operand traffic in GB/s and measured GPU timings. They compare against a separately measured register reference."
         }
         _ if id.starts_with("gpu.performance.matrix.sparse.") => {
             "Tests matrix calculations designed to skip selected zero values. This requires a supported sparse calculation path and specially structured input data; its speed applies to workloads with the matching structure."
@@ -4104,6 +4706,9 @@ fn test_usage(id: &str) -> &'static str {
         }
         "gpu.performance.matrix.fp16.scaling" => {
             "Useful for understanding neural-network calculations, including processing an AI prompt and working with larger model weights. Small sets benefit from cache; larger sets depend more on VRAM. This measures one building block of AI performance; model design, batch size, and software also affect how quickly an AI app responds."
+        }
+        "gpu.performance.matrix.int8.scaling" => {
+            "Useful for compact integer matrix calculations, including quantized neural-network operations. Compare how operand size affects throughput; application performance also depends on data reuse, memory layout and software."
         }
         _ if gpu_offload(id) => {
             "Useful for exploring the cost of GPU access to offloaded data. Compare the same dataset across the three offload shares and inspect nominal host traffic in the expanded measurements. The CPU memory controller, interconnect, PCIe link, GPU caches and shader all affect this result; it does not isolate pure PCIe bandwidth or predict complete application speed."
@@ -4624,6 +5229,15 @@ fn metadata_size(result: &BenchmarkResult, key: &str) -> Option<String> {
 }
 
 fn result_summary(result: &BenchmarkResult) -> String {
+    if register_gpu(result) {
+        if result.benchmark_id == GPU_INT8_MATRIX_ID {
+            return "Register-resident INT8 matrix compute with 32-bit accumulation".into();
+        }
+        if result.benchmark_id == GPU_MATRIX_ID {
+            return "Register-resident FP16 matrix compute with FP32 accumulation".into();
+        }
+        return "Register-resident GPU FP32 compute · no large streaming dataset".into();
+    }
     if result.benchmark_id == CPU_INT64_ID && !scaling_result(result) {
         return "Register-resident INT64 multiply/add · no streaming dataset".into();
     }
@@ -4663,6 +5277,8 @@ fn result_summary(result: &BenchmarkResult) -> String {
                 || gpu_offload(&result.benchmark_id)
             {
                 "FP32 vector"
+            } else if result.benchmark_id == GPU_INT8_MATRIX_ID {
+                "INT8 matrix"
             } else {
                 "FP16 matrix"
             };

@@ -11,7 +11,7 @@
 
 Gluj-Bench is a free, vendor-neutral hardware benchmark for Windows. It measures CPU and GPU calculation throughput, cache and memory bandwidth, and how performance changes as a workload grows beyond cache into RAM or VRAM.
 
-Version **0.3.1** adds independent 95%, 99% and 100% workload-intensity controls alongside CPU cache/RAM latency, GPU RAM-offload scaling, measured GPU timings, configurable scaling datasets and interactive result graphs. Results are real metrics with units, repeated samples and recorded settings. There is no combined ranking or synthetic performance score, and no prediction of game frame rates or AI token speeds.
+Version **0.4.0** unifies configurable CPU and GPU compute workloads with simple automatic choices, full customization, and saved per-test settings. Results retain the latest three tested configurations per workload and hardware setup. Shareable PNG snapshots show selected results and hardware, embed the complete results list for comparison imports, and render in the background. Navigation updates directly on click and reuses existing result charts. Results remain measurements with units, repeated samples and recorded settings; there is no combined ranking or synthetic performance score.
 
 ## Get started
 
@@ -62,7 +62,7 @@ Runs use five repeated samples by default. A scaling benchmark repeats sampling 
   <img src="ScalingCompute.png" alt="FP16 matrix scaling results with compute throughput and effective traffic graphs" width="1000">
 </p>
 
-The selected component has one scrollable results page without workload pagination. CPU cache and system RAM measurements appear together. Memory rows show separate **read**, **write** and **copy** values in GB/s; compute rows show the latest and best compatible measurements.
+The selected component has one scrollable results page without workload pagination. CPU cache and system RAM measurements appear together. Memory rows show separate **read**, **write** and **copy** values in GB/s; compute rows show the latest and best compatible measurements. Configurable compute and scaling benchmarks show separate rows for the three most recently tested configurations per hardware setup. Rerunning a configuration moves its row to the top of that workload and updates its latest/best statistics; the row subtitle identifies its mode, size and activity settings.
 
 Descriptions and tuning guidance start with a short takeaway. Expand their dropdowns to inspect the explanation, statistics and reasoning. Scaling rows feature the **largest tested dataset**, rather than the fastest small dataset that fits in cache.
 
@@ -77,10 +77,20 @@ Descriptions and tuning guidance start with a short takeaway. Expand their dropd
 | CPU configurable compute | AVX2 FP32 vector, blocked FP32 matrix, INT64 multiply/add, and ASCII scan, with automatic measurements, cache/RAM/custom presets and dataset sweeps |
 | GPU bandwidth | Estimated effective cache bandwidth, GPU-accessible memory read/write/copy bandwidth, and host-device transfers |
 | GPU performance | Register-resident FP16, FP32 and FP64 vector throughput; supported dense FP16 and INT8 matrix calculations |
-| GPU scaling | Memory-backed FP32 vector and dense FP16 matrix profiles across increasing working sets |
+| GPU configurable compute | FP32 vector, FP16 matrix and INT8 matrix workloads, with register, automatic sweep and custom dataset modes |
 | GPU RAM offload | FP32 vector scaling with 50%, 75%, or 100% of input/output data in system RAM |
 
 FP8 and sparse matrix families are also represented in capability discovery. Their rows remain disabled when a compatible, verified runner is unavailable; dense matrix support alone does not imply sparse acceleration.
+
+### Share and import result snapshots
+
+On **Benchmark Results**, choose **Share results** to preview a PNG card. Completed compute and memory highlights are selected initially; use the checkboxes to choose other completed result rows. **Copy image** puts the card on the clipboard, while **Save PNG** writes the original snapshot file.
+
+Snapshot cards show the CPU/GPU target and device model for every selected result, plus recorded system RAM capacity and configured speed when available. RAM speed is reported in MT/s; missing hardware data is marked as not recorded. Older results retain their recorded hardware context.
+
+Snapshot previews render in the background. Changing the selected results cancels unfinished generation and uses the latest selection; Copy and Save become available when that preview is ready.
+
+The PNG metadata contains the entire completed-results list, including unselected rows and their recorded hardware/configuration, metrics and sample statistics. **Import snapshot** reads that data into the current session's comparison sources. Choose an **Imported** setup under **Compare with**; compatible settings and metrics are still required for a percentage comparison. Imported data does not become a new benchmark run or overwrite local saved results. Keep the original PNG, since image editing and sharing services can remove its metadata.
 
 ### Reading the units
 
@@ -112,9 +122,9 @@ The CPU scaling allocation also uses no more than 80% of currently available RAM
 
 Reduced allocation or activity can improve responsiveness and may reduce heat or power use, but it can also lower measured throughput. GPU timestamp measurements exclude pacing intervals; wall-clock transfer measurements include them. Settings do not impose a temperature limit or guarantee stability.
 
-## RAM bandwidth size
+## RAM bandwidth
 
-**System RAM bandwidth** retains its existing automatic sizing and read/write/copy methods. Enable the per-test override to choose **Custom size** with a payload slider. The payload is shared across all selected workers and stays above the existing cache-separation minimum; it rounds down to complete 64-byte worker shares. Its maximum follows current available memory, reserving both source and destination buffers, using at most 80% of available memory and leaving at least 2 GiB available. The selected mode and size save with the override. Results record requested and actual payload sizes and buffer allocation, and saved comparisons keep different payload sizes separate. L1/L2/L3 bandwidth sizing is unchanged.
+**System RAM bandwidth** uses its automatic payload sized beyond the last-level CPU cache. It keeps the existing read, write and copy methods; configurable dataset sizes are limited to supported compute workloads.
 
 ## CPU cache latency
 
@@ -155,7 +165,7 @@ Expanded results include:
 - **Performance across data sizes:** automatically sweeps from small to large datasets using all physical cores, within the global RAM budget and available-memory limits.
 - **Customize this test:** opens the full data presets, size slider, single/sweep mode, physical-core allocation, workload intensity and RAM budget controls. No override checkbox is needed. Switching to an automatic choice preserves your custom configuration for later; **Reset to defaults** clears it and returns to Compute speed.
 
-The app restores the last selected choice and custom settings on later launches. First-use defaults reflect each workload's ordinary measurement; the three-choice redesign is being extended one family at a time.
+The app restores the last selected choice and custom settings on later launches. First-use defaults reflect each workload's ordinary measurement; automatic choices and full customization apply to the supported CPU and GPU compute families described here.
 
 Automatic choices use the global workload intensity and RAM budget. Full customization provides these data presets:
 
@@ -196,7 +206,17 @@ Every size counts the letter `e` in the same fixed ASCII pattern. Each operation
 
 ### GPU vector and matrix profiles
 
-The FP32 vector profile streams progressively larger memory-backed arrays. The dense FP16 matrix profile streams cooperative-matrix operands with reuse. Both work toward the selected VRAM budget and report the actual aligned size reached, subject to device limits.
+**FP32 vector compute** combines the register test and memory-backed scaling profile. Its three choices are **Compute speed** (the first-use register default), **Performance across data sizes** (an automatic sweep toward the VRAM budget), and **Customize this test**. Choices and custom settings save independently, and changing automatic choices preserves the custom configuration. Existing register results and preferences migrate into the unified benchmark; existing scaling results remain available.
+
+**FP16 matrix compute** has the same three choices: **Compute speed** defaults to register-resident FP16 matrix multiply-accumulate with FP32 accumulation, **Performance across data sizes** sweeps FP16 operand sizes toward the VRAM budget, and **Customize this test** offers register, small, automatic VRAM and custom-size presets. Choices are saved independently per benchmark. The slider measures the two FP16 operand buffers and rounds to the supported matrix tile. FP32 output and allocation overhead are reserved separately; buffer limits and available shared memory can reduce the maximum. The memory-backed modes require 16-bit storage-buffer access in addition to FP16 cooperative-matrix support. The matrix tile and reuse count remain fixed across data sizes.
+
+**INT8 matrix compute** offers the same three choices, defaulting to register compute with 32-bit accumulation. Memory-backed modes stream two INT8 operand buffers with a fixed matrix tile and reuse count. The size slider counts those operands; 32-bit output and overhead are reserved separately. Register mode requires a compatible native INT8 cooperative-matrix configuration, while dataset modes additionally require 8-bit storage-buffer access. Signed/unsigned operand and accumulator types are recorded in each result, and settings are saved separately from FP16.
+
+**FP32 system-RAM offload scaling** defaults to **Performance across data sizes**, an automatic sweep within both memory budgets. **One automatic dataset** measures a single budget-sized workload; **Customize this test** offers small, automatic-budget and custom-size presets, a size slider, and 50%, 75% or 100% system-RAM shares. The GPU performs the same FP32 arithmetic in every mode, accessing the RAM portion directly. Size counts both inputs and the output across RAM and VRAM. Alignment preserves the exact split, and 100% system-RAM sizing ignores the VRAM budget. Saved choices and legacy custom payloads are preserved separately from ordinary FP32 vector compute.
+
+FP32 vector customization offers register arithmetic, a small dataset, the automatic VRAM budget, or a custom size slider, with one dataset or a sweep for memory-backed presets. The small preset is approximately 256 KiB after alignment and makes no claim about GPU cache residency. The slider counts both inputs and the output, respects the selected adapter's storage-buffer/index limits and VRAM budget, and leaves 16 MiB for allocation overhead. Shared-memory GPUs also retain available system-memory headroom. This is a budget-based limit; allocations can still fail if other work occupies GPU memory. Requested and actual aligned sizes are recorded. The existing Vulkan execution and end-to-end timing measurements are preserved for memory-backed runs; register-only runs show their throughput without a scaling graph.
+
+FP16 and INT8 matrix profiles stream cooperative-matrix operands with reuse toward the selected VRAM budget and report the actual aligned size reached. Their settings and the RAM-offload settings are saved independently.
 
 Their effective traffic can include cache-served data. A throughput drop as the working set grows suggests memory pressure for that workload; it does not directly measure GPU stall time or the exact percentage of memory congestion.
 
@@ -215,7 +235,7 @@ Older saved results keep their throughput data and ask for a rerun to obtain mea
 
 ### Global defaults and per-test overrides
 
-**Settings** stores global defaults in `settings.json`. The selected benchmark shows its effective **Run configuration** before running. AVX2 FP32 vector/matrix compute, INT64 multiply-add and ASCII scan provide the three choices described above, with full configuration under **Customize this test**. Other benchmarks use **Override global settings for this test** to change their applicable CPU/GPU activity, physical cores, RAM/VRAM budgets, RAM offload share, and scaling dataset. Per-test choices and valid custom settings save separately in `benchmark-settings.json` beside the app and are restored on later launches. Turning an override off removes that saved override and returns to the current global defaults. Invalid edits retain the last valid saved configuration. An unreadable or invalid preferences file is preserved, with changes available for the session and a message in Settings. Current hardware and allocation limits are checked again before running. A queued run captures its settings and target GPU when queued. **Run all in this category** uses each test's effective configuration.
+**Settings** stores global defaults in `settings.json`. The selected benchmark shows its effective **Run configuration** before running. AVX2 FP32 vector/matrix compute, INT64 multiply-add, ASCII scan, GPU FP32 vector compute, FP16/INT8 matrix compute and FP32 RAM offload provide the three choices described above, with full configuration under **Customize this test**. Other benchmarks use **Override global settings for this test** to change their applicable CPU/GPU activity, physical cores, RAM/VRAM budgets, RAM offload share, and scaling dataset. Per-test choices and valid custom settings save separately in `benchmark-settings.json` beside the app and are restored on later launches. Turning an override off removes that saved override and returns to the current global defaults. Invalid edits retain the last valid saved configuration. An unreadable or invalid preferences file is preserved, with changes available for the session and a message in Settings. Current hardware and allocation limits are checked again before running. A queued run captures its settings and target GPU when queued. **Run all in this category** uses each test's effective configuration.
 
 Scaling tests have three dataset modes:
 
@@ -223,7 +243,7 @@ Scaling tests have three dataset modes:
 - **Sweep up to chosen size:** a growing-dataset sweep with your chosen maximum.
 - **Test one chosen size:** samples one dataset instead of a sweep.
 
-Enter the chosen size as a whole number of **MiB**; 1024 MiB is 1 GiB. Buffers align downward to the kernel's supported alignment or matrix shape, and results show the actual tested size. CPU datasets aggregate all workers; GPU FP16 matrix sizes count operand data. Explicit sizes above the RAM/VRAM or device limit return an explanatory error instead of silently selecting a smaller dataset. Fixed-size cache/bandwidth and register-only compute tests retain their workload-defined datasets.
+Converted compute workloads use size sliders under **Customize this test**. For the global dataset controls, enter the chosen size as a whole number of **MiB**; 1024 MiB is 1 GiB. Buffers align downward to the kernel's supported alignment or matrix shape, and results show the actual tested size. CPU datasets aggregate all workers; GPU FP16 matrix sizes count operand data. Explicit sizes above the RAM/VRAM or device limit return an explanatory error instead of silently selecting a smaller dataset. Fixed-size cache/bandwidth and register-only compute tests retain their workload-defined datasets.
 
 ### GPU scaling with data offloaded to system RAM
 
@@ -249,7 +269,7 @@ Power use, temperatures and performance after a change are not measured by the s
 
 ### Example use case: checking a GPU frequency limit
 
-A local LLM may generate tokens at a rate limited by memory bandwidth. Gluj-Bench can help investigate a similar compute/memory imbalance: run the **FP16 matrix compute scaling** test (or the **FP32 compute scaling profile**), inspect the throughput drop at larger datasets, then use the latest tuning guidance to choose a small core-frequency-limit trial. Rerun the same dataset and settings to check whether at least 95% of its original throughput remains.
+A local LLM may generate tokens at a rate limited by memory bandwidth. Gluj-Bench can help investigate a similar compute/memory imbalance: run the **FP16 matrix compute** test (or the **FP32 compute scaling profile**), inspect the throughput drop at larger datasets, then use the latest tuning guidance to choose a small core-frequency-limit trial. Rerun the same dataset and settings to check whether at least 95% of its original throughput remains.
 
 For illustration, an actual LLM workload might deliver **100 tokens/s at 400 W** without a limit and **95 tokens/s at 250 W** with a lower core-frequency limit and unchanged memory clock: 5% less throughput for 37.5% less power. Reported GPU utilization could stay at 100% even while compute waits for memory. These are example numbers, not Gluj-Bench measurements or predicted savings.
 
@@ -262,16 +282,17 @@ Results and settings are portable files beside the executables. Hardware metadat
 | File | Location | Purpose |
 | --- | --- | --- |
 | `results.json` | Beside the executables | Latest result per benchmark, hardware setup and allocation settings, up to 128 entries |
-| `settings.json` | Beside the executables | Allocation budgets, CPU core selection and activity presets |
+| `settings.json` | Beside the executables | Global allocation budgets, CPU core selection and activity presets |
+| `benchmark-settings.json` | Beside the executables | Saved per-test automatic choices, overrides and custom configurations |
 | `hardware-metadata.json` | `%APPDATA%/Gluj-Bench/` | Cached hardware metadata for startup and comparison context |
 
-Keep `results.json` and `settings.json` when updating or moving the app. The application folder must be writable to persist them. Hardware metadata is refreshed separately.
+Keep `results.json`, `settings.json` and `benchmark-settings.json` when updating or moving the app. The application folder must be writable to persist them. Hardware metadata is refreshed separately.
 
 Run a benchmark again, then choose a saved setup under **Compare with**. Compute rows show percentage **Change**; the memory display switches between **Latest**, **Best** and **Change**. A positive change means higher throughput. The displayed best measurement comes from compatible runs in the current session; the saved file is a compact latest-result history, not an unlimited archive of every run.
 
 Comparisons require compatible units, workload definitions and recorded settings, including CPU allocation and scaling budgets. Different allocations are not silently treated as equivalent. **Clear view** clears the displayed runs while preserving the saved file. Save/load errors appear on the results page.
 
-Detected component properties identify saved setups. RAM modules or timings not exposed by discovery cannot be distinguished reliably. Retesting can still compare against the results loaded when the app started.
+Detected component properties identify saved setups. New results also retain system RAM capacity and configured speed when firmware reports them. Older results without that context show it as not recorded; RAM timings not exposed by discovery cannot be distinguished reliably. Retesting can still compare against the results loaded when the app started.
 
 ## Build from source
 
@@ -301,10 +322,10 @@ Wrapper builds place the executables in `target/x86_64-pc-windows-gnullvm/debug/
 
 VS Code provides a **Gluj-Bench UI (Debug)** launch configuration that builds the workspace before starting the UI. Install the recommended rust-analyzer and CodeLLDB extensions for that workflow.
 
-### Package version 0.3.1
+### Package version 0.4.0
 
 ```powershell
-.\scripts\package-release.ps1 -Version 0.3.1
+.\scripts\package-release.ps1 -Version 0.4.0
 ```
 
 The script verifies the Cargo version, builds the release workspace, and creates the Windows x64 ZIP and SHA-256 checksum under `dist/`. Pass `-SkipBuild` only when the matching release binaries have already been built. The Windows icon and version metadata are embedded in the UI executable; no separate icon installation is required.

@@ -19,9 +19,11 @@ pub(super) struct VulkanAdapterInfo {
     pub subgroup_size: u32,
     pub shader_float16: bool,
     pub storage_buffer_16bit_access: bool,
+    pub storage_buffer_8bit_access: bool,
     pub shader_int8: bool,
     pub shader_float64: bool,
     pub max_storage_buffer_range: u64,
+    pub min_storage_buffer_offset_alignment: u64,
     pub device_local_memory_bytes: u64,
     pub host_memory_heap_bytes: u64,
     pub extensions: BTreeSet<String>,
@@ -123,16 +125,19 @@ fn discover_with_instance(
 
         let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut storage_16bit = vk::PhysicalDevice16BitStorageFeatures::default();
+        let mut storage_8bit = vk::PhysicalDevice8BitStorageFeatures::default();
         let shader_float64 = {
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut float16_int8)
-                .push_next(&mut storage_16bit);
+                .push_next(&mut storage_16bit)
+                .push_next(&mut storage_8bit);
             // SAFETY: the output chain is valid and physical_device belongs to instance.
             unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
             features2.features.shader_float64 == vk::TRUE
         };
         let shader_float16 = float16_int8.shader_float16 == vk::TRUE;
         let shader_int8 = float16_int8.shader_int8 == vk::TRUE;
+        let storage_buffer_8bit_access = storage_8bit.storage_buffer8_bit_access == vk::TRUE;
         let storage_buffer_16bit_access = storage_16bit.storage_buffer16_bit_access == vk::TRUE;
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -203,9 +208,13 @@ fn discover_with_instance(
             subgroup_size: subgroup_properties.subgroup_size,
             shader_float16,
             storage_buffer_16bit_access,
+            storage_buffer_8bit_access,
             shader_int8,
             shader_float64,
             max_storage_buffer_range: properties.limits.max_storage_buffer_range as u64,
+            min_storage_buffer_offset_alignment: properties
+                .limits
+                .min_storage_buffer_offset_alignment,
             device_local_memory_bytes,
             host_memory_heap_bytes,
             extensions,
@@ -267,8 +276,12 @@ fn cooperative_support(
                     vk::ComponentTypeKHR::SINT8 | vk::ComponentTypeKHR::UINT8
                 )
                 && property.a_type == property.b_type
-                && property.c_type == vk::ComponentTypeKHR::SINT32
-                && property.result_type == vk::ComponentTypeKHR::SINT32
+                && matches!(
+                    (property.a_type, property.c_type),
+                    (vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32)
+                        | (vk::ComponentTypeKHR::UINT8, vk::ComponentTypeKHR::UINT32)
+                )
+                && property.result_type == property.c_type
         })
         .max_by_key(|property| property.m_size * property.n_size * property.k_size)
         .map(matrix_shape);

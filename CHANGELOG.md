@@ -4,6 +4,26 @@ All notable changes to Gluj-Bench are documented here. The project follows seman
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-19
+
+### Added
+
+- Unified configurable CPU AVX2 FP32 vector/matrix, INT64 multiply-add and ASCII scan workloads with simple automatic choices, full customization, size/core sliders and saved per-test preferences.
+- Unified GPU FP32 vector, FP16 matrix and INT8 matrix register/scaling workloads, plus simplified FP32 system-RAM offload configuration with independent settings and allocation safeguards.
+- Shareable result snapshots with selectable completed results, hardware labels, RAM capacity/configured speed, clipboard copying and PNG export. PNG metadata embeds the full completed-results list for comparison imports.
+- Firmware discovery of installed RAM capacity and configured transfer rates when available, with hardware context preserved in new results.
+
+### Changed
+
+- Show the latest three distinct tested configurations per workload and hardware setup, grouping compatible reruns for latest/best statistics.
+- Render snapshots and process snapshot files in background threads. Selection changes cancel obsolete generation and prevent stale previews or exports.
+- Apply page navigation and detail toggles directly on click, refresh benchmark panels independently, and reuse cached result presentations.
+
+### Fixed
+
+- Restore the correct per-test configuration and override controls when switching workloads.
+- Keep wrapped snapshot descriptions within their own rows and identify the exact CPU/GPU target for every selected result.
+
 ## [0.3.1] - 2026-10-07
 
 ### Fixed

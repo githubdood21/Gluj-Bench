@@ -15,9 +15,10 @@ pub use provider::{BenchmarkProvider, ProgressCallback};
 pub use registry::BenchmarkRegistry;
 pub use workload::{
     WorkloadGuard, configured_dataset, cpu_activity_percent, cpu_matrix_bytes,
-    cpu_matrix_dimension, gpu_activity_percent, gpu_burst_duration, pace_gpu,
-    ram_allocation_budget, ram_bandwidth_payload_range, vram_budget_bytes, vram_budget_percent,
-    worker_budget, workload_percent,
+    cpu_matrix_dimension, gpu_activity_percent, gpu_burst_duration, gpu_fp16_matrix_dataset_range,
+    gpu_fp32_dataset_range, gpu_fp32_offload_dataset_range, gpu_int8_matrix_dataset_range,
+    gpu_mixed_allocation_limit, gpu_offload_ram_budget, pace_gpu, ram_allocation_budget,
+    vram_budget_bytes, vram_budget_percent, worker_budget, workload_percent,
 };
 
 pub const PROTOCOL_VERSION: u32 = 2;

@@ -162,6 +162,7 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
                 metadata,
             }
         })
+        .filter(|descriptor| descriptor.id != FP32_ID)
         .collect::<Vec<_>>();
     let supported_device_ids = adapters
         .iter()
@@ -171,9 +172,9 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
     let available = !supported_device_ids.is_empty();
     descriptors.push(BenchmarkDescriptor {
         id: FP32_SCALING_ID.into(),
-        name: "FP32 compute scaling profile".into(),
+        name: "FP32 vector compute".into(),
         category: BenchmarkCategory::Gpu,
-        workload: "Memory-backed FP32 FMA throughput across increasing device-local working sets"
+        workload: "GPU FP32 calculations with register, small-data, VRAM or custom working sets"
             .into(),
         data_type: "fp32".into(),
         unit: "operations/s".into(),
@@ -248,6 +249,19 @@ pub(super) fn run(
     cancellation: &CancellationToken,
     progress: &mut ProgressCallback<'_>,
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    if benchmark_id == FP32_SCALING_ID
+        && config.options.get("gpu_preset").map(String::as_str) == Some("register")
+    {
+        let mut result = run(record, FP32_ID, config, cancellation, progress)?;
+        result.benchmark_id = FP32_SCALING_ID.into();
+        result
+            .workload_metadata
+            .insert("gpu_preset".into(), "register".into());
+        result
+            .workload_metadata
+            .insert("dataset_mode".into(), "register".into());
+        return Ok(result);
+    }
     if benchmark_id == FP32_SCALING_ID || benchmark_id == OFFLOAD_ID {
         return run_fp32_scaling(record, benchmark_id, config, cancellation, progress);
     }
@@ -439,18 +453,55 @@ fn run_fp32_scaling(
     let ram_percent = ram_budget_percent(config)?;
     let mut system = sysinfo::System::new();
     system.refresh_memory();
-    let ram_budget = ram_budget_bytes(
+    let ram_budget = gluj_bench_core::gpu_offload_ram_budget(
         system.total_memory(),
         system.available_memory(),
         record.vulkan.host_memory_heap_bytes,
         ram_percent,
     );
-    let allocation_budget = mixed_allocation_limit(vram_budget, ram_budget, offload);
+    let allocation_budget =
+        gluj_bench_core::gpu_mixed_allocation_limit(vram_budget, ram_budget, offload);
     let mut maximum = record
         .vulkan
         .max_storage_buffer_range
         .saturating_mul(3)
         .min(allocation_budget);
+    let (mut minimum, _, mut alignment) = gluj_bench_core::gpu_fp32_dataset_range(
+        record.vulkan.device_local_memory_bytes,
+        record.vulkan.max_storage_buffer_range,
+        record.vulkan.min_storage_buffer_offset_alignment,
+        budget_percent,
+        None,
+    );
+    if offload == 0 {
+        let shared = matches!(
+            record.vulkan.device_type,
+            ash::vk::PhysicalDeviceType::INTEGRATED_GPU | ash::vk::PhysicalDeviceType::CPU
+        )
+        .then_some(system.available_memory());
+        maximum = maximum.min(
+            gluj_bench_core::gpu_fp32_dataset_range(
+                record.vulkan.device_local_memory_bytes,
+                record.vulkan.max_storage_buffer_range,
+                record.vulkan.min_storage_buffer_offset_alignment,
+                budget_percent,
+                shared,
+            )
+            .1,
+        );
+    }
+    if offload > 0 && config.options.contains_key("gpu_offload_preset") {
+        let range = gluj_bench_core::gpu_fp32_offload_dataset_range(
+            vram_budget,
+            ram_budget,
+            record.vulkan.max_storage_buffer_range,
+            record.vulkan.min_storage_buffer_offset_alignment,
+            offload,
+        );
+        minimum = range.0;
+        maximum = maximum.min(range.1);
+        alignment = range.2;
+    }
     if let Some(value) = config.options.get("max_working_set_bytes") {
         let cap = value
             .parse::<u64>()
@@ -464,13 +515,47 @@ fn run_fp32_scaling(
             })?;
         maximum = maximum.min(cap);
     }
-    let (maximum, single_dataset) = gluj_bench_core::configured_dataset(config, maximum)?;
+    let (maximum, single_dataset) = if benchmark_id == FP32_SCALING_ID {
+        configured_fp32_dataset(config, maximum, minimum)?
+    } else {
+        configured_gpu_dataset(config, maximum, minimum, "gpu_offload_preset")?
+    };
+    let requested_maximum = maximum;
+    let maximum = if offload == 0 || config.options.contains_key("gpu_offload_preset") {
+        maximum / alignment * alignment
+    } else {
+        maximum
+    };
     let requested_sizes = if single_dataset {
         vec![maximum]
     } else {
         profile_sizes(maximum)
+            .into_iter()
+            .map(|size| {
+                if offload > 0 && config.options.contains_key("gpu_offload_preset") {
+                    size.max(minimum)
+                } else {
+                    size
+                }
+            })
+            .collect()
     };
-    if requested_sizes.len() < if single_dataset { 1 } else { 3 } {
+    if maximum
+        < if offload == 0 {
+            minimum
+        } else {
+            PROFILE_MIN_SIZE
+        }
+        || requested_sizes.len()
+            < if single_dataset
+                || config.options.contains_key("gpu_preset")
+                || config.options.contains_key("gpu_offload_preset")
+            {
+                1
+            } else {
+                3
+            }
+    {
         return Err(BenchmarkError::new(
             "insufficient_gpu_memory",
             "At least three working-set tiers are required within the RAM/VRAM budgets and storage-buffer limits.",
@@ -710,6 +795,28 @@ fn run_fp32_scaling(
         "working-set-sweep-2".into(),
     );
     metadata.insert("data_type".into(), "fp32".into());
+    if benchmark_id == FP32_SCALING_ID || offload > 0 {
+        metadata.insert(
+            "dataset_mode".into(),
+            if single_dataset { "single" } else { "sweep" }.into(),
+        );
+        let preset_key = if offload > 0 {
+            "gpu_offload_preset"
+        } else {
+            "gpu_preset"
+        };
+        if let Some(preset) = config.options.get(preset_key) {
+            metadata.insert(preset_key.into(), preset.clone());
+        }
+        metadata.insert(
+            "requested_dataset_bytes".into(),
+            requested_maximum.to_string(),
+        );
+        metadata.insert(
+            "resolved_dataset_bytes".into(),
+            sizes.last().unwrap().to_string(),
+        );
+    }
     metadata.insert("arithmetic_iterations".into(), loop_count.to_string());
     metadata.insert(
         "allocation_budget_bytes".into(),
@@ -720,7 +827,7 @@ fn run_fp32_scaling(
         harness.maximum_working_set_bytes.to_string(),
     );
     metadata.insert("allocation_limit_note".into(), if offload == 0 {
-        "VRAM budget limited by storage-buffer range, with 16 MiB reserved for allocation overhead."
+        "VRAM budget limited by storage-buffer range and alignment, with 16 MiB reserved for overhead. Shared-memory GPUs also retain available system-memory headroom."
     } else {
         "RAM budget is limited by the host heap and 80% of available RAM, leaving at least 2 GiB and reserving 16 MiB for overhead. Any VRAM region also respects the VRAM budget. Driver storage-buffer limits and alignment cap the total."
     }.into());
@@ -849,6 +956,74 @@ fn run_fp32_scaling(
     })
 }
 
+fn configured_fp32_dataset(
+    config: &BenchmarkConfig,
+    limit: u64,
+    minimum: u64,
+) -> Result<(u64, bool), BenchmarkError> {
+    configured_gpu_dataset(config, limit, minimum, "gpu_preset")
+}
+
+pub(super) fn configured_gpu_dataset(
+    config: &BenchmarkConfig,
+    limit: u64,
+    minimum: u64,
+    preset_key: &str,
+) -> Result<(u64, bool), BenchmarkError> {
+    let preset = config
+        .options
+        .get(preset_key)
+        .map(String::as_str)
+        .unwrap_or("legacy");
+    if preset == "legacy" {
+        return gluj_bench_core::configured_dataset(config, limit);
+    }
+    let mode = config
+        .options
+        .get("dataset_mode")
+        .map(String::as_str)
+        .unwrap_or("single");
+    if !["single", "sweep", "automatic"].contains(&mode) {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "GPU dataset mode must be single or sweep.",
+        ));
+    }
+    let bytes = match preset {
+        "small" => minimum,
+        "vram" => limit,
+        "budget" if preset_key == "gpu_offload_preset" => limit,
+        "custom" => config
+            .options
+            .get("dataset_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                BenchmarkError::new("invalid_config", "Choose a positive GPU dataset size.")
+            })?,
+        _ => {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unknown GPU data preset.",
+            ));
+        }
+    };
+    if bytes < minimum {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            format!("GPU dataset must be at least {minimum} bytes."),
+        ));
+    }
+    if bytes > limit {
+        return Err(BenchmarkError::new(
+            "dataset_exceeds_budget",
+            format!(
+                "GPU dataset is {bytes} bytes; the selected VRAM budget and device limits allow {limit} bytes."
+            ),
+        ));
+    }
+    Ok((bytes, mode == "single"))
+}
+
 fn ram_budget_percent(config: &BenchmarkConfig) -> Result<u32, BenchmarkError> {
     let percent = config
         .options
@@ -869,28 +1044,6 @@ fn ram_budget_percent(config: &BenchmarkConfig) -> Result<u32, BenchmarkError> {
         ));
     }
     Ok(percent)
-}
-
-fn ram_budget_bytes(total: u64, available: u64, heap: u64, percent: u32) -> u64 {
-    (total / 100 * percent as u64)
-        .min(available / 100 * 80)
-        .min(available.saturating_sub(2 * 1024 * 1024 * 1024))
-        .min(heap)
-        .saturating_sub(16 * 1024 * 1024)
-}
-
-fn mixed_allocation_limit(vram: u64, ram: u64, offload: u32) -> u64 {
-    let host_limit = if offload == 0 {
-        u64::MAX
-    } else {
-        ram.saturating_mul(100) / offload as u64
-    };
-    let local_limit = if offload == 100 {
-        u64::MAX
-    } else {
-        vram.saturating_mul(100) / (100 - offload) as u64
-    };
-    host_limit.min(local_limit)
 }
 
 fn profile_sizes(maximum: u64) -> Vec<u64> {
@@ -995,19 +1148,289 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offload_presets_validate_data_sizes_and_exclude_register_mode() {
+        let mut config = BenchmarkConfig::default();
+        let resolve =
+            |c: &BenchmarkConfig| configured_gpu_dataset(c, 1032192, 294912, "gpu_offload_preset");
+        config
+            .options
+            .insert("gpu_offload_preset".into(), "budget".into());
+        config.options.insert("dataset_mode".into(), "sweep".into());
+        assert_eq!(resolve(&config).unwrap(), (1032192, false));
+        config
+            .options
+            .insert("gpu_offload_preset".into(), "small".into());
+        config
+            .options
+            .insert("dataset_mode".into(), "single".into());
+        assert_eq!(resolve(&config).unwrap(), (294912, true));
+        config
+            .options
+            .insert("gpu_offload_preset".into(), "custom".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "1032193".into());
+        assert_eq!(resolve(&config).unwrap_err().code, "dataset_exceeds_budget");
+        config
+            .options
+            .insert("dataset_bytes".into(), "294911".into());
+        assert!(resolve(&config).is_err());
+        config
+            .options
+            .insert("gpu_offload_preset".into(), "register".into());
+        assert!(resolve(&config).is_err());
+    }
+
+    #[test]
+    #[ignore = "runs direct system-RAM GPU compute for every supported offload share"]
+    fn gpu_offload_modes_smoke() {
+        use gluj_bench_core::BenchmarkProvider;
+        let mut provider = crate::GpuBandwidthProvider::discover();
+        let device = provider
+            .adapters
+            .iter()
+            .find(|r| {
+                r.supports_vulkan_timestamps()
+                    && r.vulkan.device_type == ash::vk::PhysicalDeviceType::DISCRETE_GPU
+                    && r.vulkan.host_memory_heap_bytes > 0
+            })
+            .expect("A discrete GPU with direct host-memory support is required")
+            .id
+            .clone();
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..Default::default()
+        };
+        config.options.insert("device_id".into(), device);
+        config
+            .options
+            .insert("max_working_set_bytes".into(), "1048576".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "737281".into());
+        for share in [50_u64, 75, 100] {
+            config
+                .options
+                .insert("ram_offload_percent".into(), share.to_string());
+            for (preset, mode) in [
+                ("small", "single"),
+                ("custom", "single"),
+                ("custom", "sweep"),
+                ("budget", "single"),
+                ("budget", "sweep"),
+            ] {
+                config
+                    .options
+                    .insert("gpu_offload_preset".into(), preset.into());
+                config.options.insert("dataset_mode".into(), mode.into());
+                let result = provider
+                    .run(
+                        OFFLOAD_ID,
+                        &config,
+                        &CancellationToken::default(),
+                        &mut |_| {},
+                    )
+                    .unwrap();
+                assert_eq!(result.benchmark_id, OFFLOAD_ID);
+                assert_eq!(result.workload_metadata["gpu_offload_preset"], preset);
+                let resolved = result.workload_metadata["resolved_dataset_bytes"]
+                    .parse::<u64>()
+                    .unwrap();
+                assert_eq!(resolved % 49152, 0);
+                assert!(
+                    resolved
+                        <= result.workload_metadata["requested_dataset_bytes"]
+                            .parse::<u64>()
+                            .unwrap()
+                );
+                assert_eq!(
+                    result.workload_metadata["host_allocated_test_buffer_bytes"]
+                        .parse::<u64>()
+                        .unwrap(),
+                    resolved * share / 100
+                );
+                assert_eq!(
+                    result.workload_metadata["device_allocated_test_buffer_bytes"]
+                        .parse::<u64>()
+                        .unwrap(),
+                    resolved * (100 - share) / 100
+                );
+                let tiers = result
+                    .metrics
+                    .iter()
+                    .filter(|m| m.name.ends_with(".compute"))
+                    .collect::<Vec<_>>();
+                assert!(!tiers.is_empty());
+                assert!(tiers.iter().all(|m| m.value > 0.0 && m.value.is_finite()));
+                if mode == "single" {
+                    assert_eq!(tiers.len(), 1);
+                }
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name.ends_with(".gpu_execution_time"))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn descriptors_keep_optional_hardware_types_visible() {
         let descriptors = descriptors(&[]);
-        assert_eq!(descriptors.len(), 5);
+        assert_eq!(descriptors.len(), 4);
         assert!(descriptors.iter().all(|descriptor| !descriptor.available));
         assert_eq!(descriptors[0].id, FP16_ID);
-        assert_eq!(descriptors[1].id, FP32_ID);
-        assert_eq!(descriptors[2].id, FP64_ID);
-        assert_eq!(descriptors[3].id, FP32_SCALING_ID);
+        assert_eq!(descriptors[1].id, FP64_ID);
+        assert_eq!(descriptors[2].id, FP32_SCALING_ID);
+        assert!(
+            !descriptors
+                .iter()
+                .any(|descriptor| descriptor.id == FP32_ID)
+        );
         assert_eq!(descriptors[0].metadata.get("api").unwrap(), "Vulkan");
         assert_eq!(
-            descriptors[3].metadata.get("profile_axis").unwrap(),
+            descriptors[2].metadata.get("profile_axis").unwrap(),
             "working_set_bytes"
         );
+    }
+
+    #[test]
+    fn gpu_presets_validate_custom_sizes_and_keep_legacy_requests() {
+        let mut config = BenchmarkConfig::default();
+        assert_eq!(
+            configured_fp32_dataset(&config, 1044480, 270336).unwrap(),
+            (1044480, false)
+        );
+        config.options.insert("gpu_preset".into(), "custom".into());
+        config
+            .options
+            .insert("dataset_mode".into(), "single".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "524289".into());
+        assert_eq!(
+            configured_fp32_dataset(&config, 1044480, 270336).unwrap(),
+            (524289, true)
+        );
+        config
+            .options
+            .insert("dataset_bytes".into(), "1048576".into());
+        assert_eq!(
+            configured_fp32_dataset(&config, 1044480, 270336)
+                .unwrap_err()
+                .code,
+            "dataset_exceeds_budget"
+        );
+        config
+            .options
+            .insert("dataset_bytes".into(), "262144".into());
+        assert!(configured_fp32_dataset(&config, 1044480, 270336).is_err());
+        config.options.insert("gpu_preset".into(), "small".into());
+        assert_eq!(
+            configured_fp32_dataset(&config, 1044480, 270336).unwrap(),
+            (270336, true)
+        );
+        config.options.insert("gpu_preset".into(), "vram".into());
+        config.options.insert("dataset_mode".into(), "sweep".into());
+        assert_eq!(
+            configured_fp32_dataset(&config, 1044480, 270336).unwrap(),
+            (1044480, false)
+        );
+        config.options.insert("gpu_preset".into(), "l2".into());
+        assert!(configured_fp32_dataset(&config, 1044480, 270336).is_err());
+    }
+
+    #[test]
+    #[ignore = "runs GPU FP32 register, small-data and custom-size workloads on the current machine"]
+    fn gpu_fp32_modes_smoke() {
+        use gluj_bench_core::BenchmarkProvider;
+        let mut provider = crate::GpuBandwidthProvider::discover();
+        let adapter = provider
+            .adapters
+            .iter()
+            .find(|record| {
+                record.supports_vulkan_timestamps()
+                    && record.vulkan.device_type != ash::vk::PhysicalDeviceType::CPU
+            })
+            .expect("A Vulkan GPU with timestamps is required for this hardware test");
+        let device_id = adapter.id.clone();
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..Default::default()
+        };
+        config.options.insert("device_id".into(), device_id);
+        config
+            .options
+            .insert("max_working_set_bytes".into(), "1048576".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "524289".into());
+        for (preset, mode) in [
+            ("register", "register"),
+            ("small", "single"),
+            ("custom", "single"),
+            ("custom", "sweep"),
+        ] {
+            config.options.insert("gpu_preset".into(), preset.into());
+            config.options.insert("dataset_mode".into(), mode.into());
+            let result = provider
+                .run(
+                    FP32_SCALING_ID,
+                    &config,
+                    &CancellationToken::default(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(result.benchmark_id, FP32_SCALING_ID);
+            assert_eq!(result.workload_metadata["gpu_preset"], preset);
+            if preset == "register" {
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|metric| metric.name == "throughput" && metric.value > 0.0)
+                );
+                assert_eq!(result.workload_metadata["dataset_mode"], "register");
+                assert!(
+                    !result
+                        .metrics
+                        .iter()
+                        .any(|metric| metric.name.starts_with("working_set_"))
+                );
+            } else {
+                let tiers = result
+                    .metrics
+                    .iter()
+                    .filter(|metric| metric.name.ends_with(".compute"))
+                    .collect::<Vec<_>>();
+                assert!(!tiers.is_empty());
+                if mode == "single" {
+                    assert_eq!(tiers.len(), 1);
+                }
+                assert!(
+                    tiers
+                        .iter()
+                        .all(|metric| metric.value.is_finite() && metric.value > 0.0)
+                );
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|metric| metric.name.ends_with(".gpu_execution_time"))
+                );
+                assert!(
+                    result.workload_metadata["resolved_dataset_bytes"]
+                        .parse::<u64>()
+                        .unwrap()
+                        <= result.workload_metadata["requested_dataset_bytes"]
+                            .parse::<u64>()
+                            .unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1015,18 +1438,33 @@ mod tests {
         let gib = 1024 * 1024 * 1024;
         let overhead = 16 * 1024 * 1024;
         assert_eq!(
-            ram_budget_bytes(64 * gib, 8 * gib, 32 * gib, 80),
+            gluj_bench_core::gpu_offload_ram_budget(64 * gib, 8 * gib, 32 * gib, 80),
             6 * gib - overhead
         );
-        assert_eq!(ram_budget_bytes(64 * gib, gib, 32 * gib, 80), 0);
         assert_eq!(
-            ram_budget_bytes(64 * gib, 40 * gib, gib, 80),
+            gluj_bench_core::gpu_offload_ram_budget(64 * gib, gib, 32 * gib, 80),
+            0
+        );
+        assert_eq!(
+            gluj_bench_core::gpu_offload_ram_budget(64 * gib, 40 * gib, gib, 80),
             gib - overhead
         );
-        assert_eq!(mixed_allocation_limit(2 * gib, 6 * gib, 50), 4 * gib);
-        assert_eq!(mixed_allocation_limit(2 * gib, 3 * gib, 75), 4 * gib);
-        assert_eq!(mixed_allocation_limit(0, 3 * gib, 100), 3 * gib);
-        assert_eq!(mixed_allocation_limit(2 * gib, 0, 0), 2 * gib);
+        assert_eq!(
+            gluj_bench_core::gpu_mixed_allocation_limit(2 * gib, 6 * gib, 50),
+            4 * gib
+        );
+        assert_eq!(
+            gluj_bench_core::gpu_mixed_allocation_limit(2 * gib, 3 * gib, 75),
+            4 * gib
+        );
+        assert_eq!(
+            gluj_bench_core::gpu_mixed_allocation_limit(0, 3 * gib, 100),
+            3 * gib
+        );
+        assert_eq!(
+            gluj_bench_core::gpu_mixed_allocation_limit(2 * gib, 0, 0),
+            2 * gib
+        );
         let mut config = BenchmarkConfig::default();
         assert_eq!(ram_budget_percent(&config).unwrap(), 20);
         for invalid in ["19", "81", "invalid"] {

@@ -13,6 +13,7 @@ use super::{
 pub(super) const FP16_MATRIX_ID: &str = "gpu.performance.matrix.fp16";
 pub(super) const FP16_MATRIX_SCALING_ID: &str = "gpu.performance.matrix.fp16.scaling";
 pub(super) const INT8_MATRIX_ID: &str = "gpu.performance.matrix.int8";
+pub(super) const INT8_MATRIX_SCALING_ID: &str = "gpu.performance.matrix.int8.scaling";
 pub(super) const FP8_MATRIX_ID: &str = "gpu.performance.matrix.fp8";
 pub(super) const SPARSE_FP16_MATRIX_ID: &str = "gpu.performance.matrix.sparse.fp16";
 pub(super) const SPARSE_INT8_MATRIX_ID: &str = "gpu.performance.matrix.sparse.int8";
@@ -20,6 +21,8 @@ pub(super) const SPARSE_FP8_MATRIX_ID: &str = "gpu.performance.matrix.sparse.fp8
 
 const FP16_SPV: &[u8] = include_bytes!("../shaders/spv/matrix_fp16.spv");
 const FP16_PROFILE_SPV: &[u8] = include_bytes!("../shaders/spv/matrix_profile_fp16.spv");
+const SINT8_PROFILE_SPV: &[u8] = include_bytes!("../shaders/spv/matrix_profile_int8.spv");
+const UINT8_PROFILE_SPV: &[u8] = include_bytes!("../shaders/spv/matrix_profile_uint8.spv");
 const SINT8_SPV: &[u8] = include_bytes!("../shaders/spv/matrix_int8.spv");
 const UINT8_SPV: &[u8] = include_bytes!("../shaders/spv/matrix_uint8.spv");
 const MATRIX_WORKGROUP_SIZE: u64 = 64;
@@ -66,7 +69,7 @@ impl MatrixKind {
             FP16_MATRIX_ID | FP16_MATRIX_SCALING_ID => record.cooperative.fp16.map(|shape| (Self::Fp16, shape)).ok_or_else(|| {
                 unsupported(record, "fp16_cooperative_matrix_unsupported", "The selected GPU does not advertise a Vulkan cooperative-matrix configuration with FP16 inputs and FP32 accumulation.")
             }),
-            INT8_MATRIX_ID => {
+            INT8_MATRIX_ID | INT8_MATRIX_SCALING_ID => {
                 let shape = record.cooperative.int8.ok_or_else(|| unsupported(
                     record,
                     "int8_cooperative_matrix_unsupported",
@@ -116,6 +119,45 @@ impl MatrixKind {
         }
     }
 
+    fn register_id(self) -> &'static str {
+        if self == Self::Fp16 {
+            FP16_MATRIX_ID
+        } else {
+            INT8_MATRIX_ID
+        }
+    }
+    fn profile_id(self) -> &'static str {
+        if self == Self::Fp16 {
+            FP16_MATRIX_SCALING_ID
+        } else {
+            INT8_MATRIX_SCALING_ID
+        }
+    }
+    fn preset_key(self) -> &'static str {
+        if self == Self::Fp16 {
+            "gpu_matrix_preset"
+        } else {
+            "gpu_int8_matrix_preset"
+        }
+    }
+    fn operand_bytes(self) -> u64 {
+        if self == Self::Fp16 { 2 } else { 1 }
+    }
+    fn profile_shader(self) -> &'static [u8] {
+        match self {
+            Self::Fp16 => FP16_PROFILE_SPV,
+            Self::Sint8 => SINT8_PROFILE_SPV,
+            Self::Uint8 => UINT8_PROFILE_SPV,
+        }
+    }
+    fn storage_supported(self, record: &AdapterRecord) -> bool {
+        if self == Self::Fp16 {
+            record.vulkan.storage_buffer_16bit_access
+        } else {
+            record.vulkan.storage_buffer_8bit_access
+        }
+    }
+
     fn shader(self) -> &'static [u8] {
         match self {
             Self::Fp16 => FP16_SPV,
@@ -131,6 +173,7 @@ pub(super) fn is_matrix_benchmark(id: &str) -> bool {
         FP16_MATRIX_ID
             | FP16_MATRIX_SCALING_ID
             | INT8_MATRIX_ID
+            | INT8_MATRIX_SCALING_ID
             | FP8_MATRIX_ID
             | SPARSE_FP16_MATRIX_ID
             | SPARSE_INT8_MATRIX_ID
@@ -252,7 +295,7 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
     .collect::<Vec<_>>();
     let supported_device_ids = adapters
         .iter()
-        .filter(|record| matrix_available(record, FP16_MATRIX_SCALING_ID))
+        .filter(|record| matrix_available(record, FP16_MATRIX_ID))
         .map(|record| record.id.clone())
         .collect::<Vec<_>>();
     let available = !supported_device_ids.is_empty();
@@ -260,10 +303,10 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
         1,
         BenchmarkDescriptor {
             id: FP16_MATRIX_SCALING_ID.into(),
-            name: "FP16 matrix compute scaling".into(),
+            name: "FP16 matrix compute".into(),
             category: BenchmarkCategory::Gpu,
             workload:
-                "Measures FP16 matrix calculation speed as data grows from cache-sized sets toward your selected VRAM budget"
+                "Measures FP16 matrix calculation speed in registers or across configurable operand sizes"
                     .into(),
             data_type: "fp16".into(),
             unit: "operations/s".into(),
@@ -298,13 +341,39 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
             ]),
         },
     );
+    let mut int8 = descriptors
+        .iter()
+        .find(|d| d.id == FP16_MATRIX_SCALING_ID)
+        .unwrap()
+        .clone();
+    int8.id = INT8_MATRIX_SCALING_ID.into();
+    int8.name = "INT8 matrix compute".into();
+    int8.workload = "Measures INT8 matrix calculation speed in registers or across configurable operand sizes, with 32-bit accumulation".into();
+    int8.data_type = "int8".into();
+    int8.display_order = 122;
+    int8.supported_device_ids = adapters
+        .iter()
+        .filter(|r| matrix_available(r, INT8_MATRIX_ID))
+        .map(|r| r.id.clone())
+        .collect();
+    int8.available = !int8.supported_device_ids.is_empty();
+    int8.unavailable_reason = if int8.available {
+        String::new()
+    } else if adapters.is_empty() {
+        "adapter_not_found".into()
+    } else {
+        "int8_cooperative_matrix_unsupported".into()
+    };
+    descriptors.insert(2, int8);
+    descriptors
+        .retain(|descriptor| !matches!(descriptor.id.as_str(), FP16_MATRIX_ID | INT8_MATRIX_ID));
     descriptors
 }
 
 fn hardware_support(record: &AdapterRecord, id: &str) -> bool {
     match id {
         FP16_MATRIX_ID | FP16_MATRIX_SCALING_ID => record.cooperative.fp16.is_some(),
-        INT8_MATRIX_ID => record.cooperative.int8.is_some(),
+        INT8_MATRIX_ID | INT8_MATRIX_SCALING_ID => record.cooperative.int8.is_some(),
         _ => false,
     }
 }
@@ -313,6 +382,7 @@ fn matrix_available(record: &AdapterRecord, id: &str) -> bool {
     record.supports_vulkan_timestamps()
         && MatrixKind::for_benchmark(record, id).is_ok()
         && (id != FP16_MATRIX_SCALING_ID || record.vulkan.storage_buffer_16bit_access)
+        && (id != INT8_MATRIX_SCALING_ID || record.vulkan.storage_buffer_8bit_access)
 }
 
 pub(super) fn run(
@@ -323,8 +393,19 @@ pub(super) fn run(
     progress: &mut ProgressCallback<'_>,
 ) -> Result<BenchmarkResult, BenchmarkError> {
     let (kind, shape) = MatrixKind::for_benchmark(record, benchmark_id)?;
-    if benchmark_id == FP16_MATRIX_SCALING_ID {
-        return run_fp16_matrix_scaling(record, kind, shape, config, cancellation, progress);
+    if benchmark_id == kind.profile_id() {
+        if config.options.get(kind.preset_key()).map(String::as_str) == Some("register") {
+            let mut result = run(record, kind.register_id(), config, cancellation, progress)?;
+            result.benchmark_id = kind.profile_id().into();
+            result
+                .workload_metadata
+                .insert(kind.preset_key().into(), "register".into());
+            result
+                .workload_metadata
+                .insert("dataset_mode".into(), "register".into());
+            return Ok(result);
+        }
+        return run_matrix_scaling(record, kind, shape, config, cancellation, progress);
     }
     if !record.supports_vulkan_timestamps() {
         return Err(BenchmarkError::new(
@@ -451,7 +532,7 @@ struct MatrixProfilePoint {
     retained_ratio: f64,
 }
 
-fn run_fp16_matrix_scaling(
+fn run_matrix_scaling(
     record: &AdapterRecord,
     kind: MatrixKind,
     shape: MatrixShape,
@@ -465,10 +546,17 @@ fn run_fp16_matrix_scaling(
             "This GPU does not expose Vulkan timestamps required for matrix timing.",
         ));
     }
-    if !record.vulkan.storage_buffer_16bit_access {
+    if !kind.storage_supported(record) {
         return Err(BenchmarkError::new(
-            "storage_buffer_16bit_access_unsupported",
-            "The selected GPU cannot load FP16 cooperative-matrix operands from Vulkan storage buffers.",
+            if kind == MatrixKind::Fp16 {
+                "storage_buffer_16bit_access_unsupported"
+            } else {
+                "storage_buffer_8bit_access_unsupported"
+            },
+            format!(
+                "The selected GPU cannot load {} cooperative-matrix operands from Vulkan storage buffers.",
+                kind.label()
+            ),
         ));
     }
     if record.vulkan.subgroup_size == 0
@@ -489,7 +577,7 @@ fn run_fp16_matrix_scaling(
         };
         run(
             record,
-            FP16_MATRIX_ID,
+            kind.register_id(),
             &crate::scaling::reference_config(config),
             cancellation,
             &mut reference_progress,
@@ -504,13 +592,19 @@ fn run_fp16_matrix_scaling(
     progress(ProgressUpdate {
         fraction: 0.01,
         phase: "gpu_matrix_profile_setup".into(),
-        message: "Selecting a saturation width for the FP16 matrix profile".into(),
+        message: format!(
+            "Selecting a saturation width for the {} matrix profile",
+            kind.label()
+        ),
     });
     let workgroups = autotune_workgroups(&context, kind, shape, cancellation)?;
-    let bytes_per_tile = matrix_profile_bytes_per_tile(shape);
+    let bytes_per_tile = matrix_profile_bytes_per_tile(shape, kind);
     let max_tiles_per_binding = (record.vulkan.max_storage_buffer_range
-        / (shape.m as u64 * shape.k as u64 * 2))
-        .min(record.vulkan.max_storage_buffer_range / (shape.k as u64 * shape.n as u64 * 2));
+        / (shape.m as u64 * shape.k as u64 * kind.operand_bytes()))
+    .min(
+        record.vulkan.max_storage_buffer_range
+            / (shape.k as u64 * shape.n as u64 * kind.operand_bytes()),
+    );
     let binding_limit = max_tiles_per_binding.saturating_mul(bytes_per_tile);
     let budget_percent = gluj_bench_core::vram_budget_percent(config)?;
     let allocation_budget =
@@ -524,27 +618,59 @@ fn run_fp16_matrix_scaling(
         memory_limit = memory_limit.min(record.vulkan.device_local_memory_bytes / 8);
     }
     let maximum = binding_limit.min(memory_limit);
-    let (maximum, single_dataset) = gluj_bench_core::configured_dataset(config, maximum)?;
+    let (minimum, safe_maximum, _) = {
+        let mut memory = sysinfo::System::new();
+        memory.refresh_memory();
+        (if kind == MatrixKind::Fp16 {
+            gluj_bench_core::gpu_fp16_matrix_dataset_range
+        } else {
+            gluj_bench_core::gpu_int8_matrix_dataset_range
+        })(
+            record.vulkan.device_local_memory_bytes,
+            record.vulkan.max_storage_buffer_range,
+            [u64::from(shape.m), u64::from(shape.n), u64::from(shape.k)],
+            u64::from(context.subgroup_size),
+            budget_percent,
+            (record.vulkan.device_type != vk::PhysicalDeviceType::DISCRETE_GPU)
+                .then_some(memory.available_memory()),
+        )
+    };
+    let limit = if config.options.contains_key(kind.preset_key()) {
+        maximum.min(safe_maximum)
+    } else {
+        maximum
+    };
+    let (maximum, single_dataset) =
+        crate::compute::configured_gpu_dataset(config, limit, minimum, kind.preset_key())?;
+    let requested_bytes = maximum;
+
     let requested_sizes = if single_dataset {
         vec![maximum]
     } else {
         matrix_profile_sizes(maximum)
     };
-    if requested_sizes.len() < if single_dataset { 1 } else { 3 } {
+    if requested_sizes.len()
+        < if single_dataset || config.options.contains_key(kind.preset_key()) {
+            1
+        } else {
+            3
+        }
+    {
         return Err(BenchmarkError::new(
             "insufficient_gpu_memory",
-            "At least three FP16 operand-size tiers are required for a matrix scaling profile.",
+            "The operand budget must support at least one selected dataset, or three tiers for a legacy matrix scaling profile.",
         ));
     }
     progress(ProgressUpdate {
         fraction: 0.04,
         phase: "gpu_matrix_profile_setup".into(),
         message: format!(
-            "Allocating FP16 matrix operands up to {}",
+            "Allocating {} matrix operands up to {}",
+            kind.label(),
             format_profile_size(maximum)
         ),
     });
-    let harness = MatrixProfileHarness::new(&context, shape, workgroups, maximum)?;
+    let harness = MatrixProfileHarness::new(&context, kind, shape, workgroups, maximum)?;
     let sizes = requested_sizes
         .into_iter()
         .map(|size| harness.actual_working_set(size))
@@ -573,7 +699,8 @@ fn run_fp16_matrix_scaling(
             fraction: 0.06 + index as f64 / sizes.len() as f64 * 0.89,
             phase: "gpu_matrix_profile_sweep".into(),
             message: format!(
-                "Measuring FP16 matrix throughput with {} of operands ({}/{})",
+                "Measuring {} matrix throughput with {} of operands ({}/{})",
+                kind.label(),
                 format_profile_size(working_set),
                 index + 1,
                 sizes.len()
@@ -683,6 +810,21 @@ fn run_fp16_matrix_scaling(
         "matrix_profile_revision".into(),
         "weight-streaming-1".into(),
     );
+    metadata.insert(
+        "dataset_mode".into(),
+        if single_dataset { "single" } else { "sweep" }.into(),
+    );
+    if let Some(preset) = config.options.get(kind.preset_key()) {
+        metadata.insert(kind.preset_key().into(), preset.clone());
+    }
+    metadata.insert(
+        "requested_dataset_bytes".into(),
+        requested_bytes.to_string(),
+    );
+    metadata.insert(
+        "resolved_dataset_bytes".into(),
+        harness.maximum_working_set_bytes.to_string(),
+    );
     metadata.insert("matrix_tile_reuse".into(), reuse_count.to_string());
     metadata.insert("operand_bytes_per_tile".into(), bytes_per_tile.to_string());
     metadata.insert("tested_tier_count".into(), points.len().to_string());
@@ -706,7 +848,10 @@ fn run_fp16_matrix_scaling(
         "transition_analysis_minimum_working_set_bytes".into(),
         transition_analysis_minimum.to_string(),
     );
-    metadata.insert("workload_model".into(), "dense weight-streaming matrix tiles with configurable reuse; representative of memory pressure in low-batch neural-network inference, not an end-to-end LLM".into());
+    metadata.insert(
+        "workload_model".into(),
+        "dense matrix operand streaming with fixed tile reuse across dataset sizes".into(),
+    );
     metadata.insert(
         "transition_threshold".into(),
         "two consecutive low-noise tiers below 90 percent of the small-set baseline with no later two-tier recovery".into(),
@@ -755,7 +900,7 @@ fn run_fp16_matrix_scaling(
         };
         run(
             record,
-            FP16_MATRIX_ID,
+            kind.register_id(),
             &crate::scaling::reference_config(config),
             cancellation,
             &mut check_progress,
@@ -768,9 +913,12 @@ fn run_fp16_matrix_scaling(
         &reference,
         transition_index.is_some(),
     );
-    callback(done("FP16 matrix compute scaling completed."));
+    callback(done(&format!(
+        "{} matrix compute scaling completed.",
+        kind.label()
+    )));
     Ok(BenchmarkResult {
-        benchmark_id: FP16_MATRIX_SCALING_ID.into(),
+        benchmark_id: kind.profile_id().into(),
         device_id: record.id.clone(),
         elapsed_ns: duration_ns(started.elapsed()),
         metrics,
@@ -821,8 +969,8 @@ fn matrix_profile_drop_is_significant(point: &MatrixProfilePoint) -> bool {
     1.0 - point.retained_ratio > (noise * 2.0).max(0.02)
 }
 
-fn matrix_profile_bytes_per_tile(shape: MatrixShape) -> u64 {
-    (shape.m as u64 * shape.k as u64 + shape.k as u64 * shape.n as u64) * 2
+fn matrix_profile_bytes_per_tile(shape: MatrixShape, kind: MatrixKind) -> u64 {
+    (shape.m as u64 * shape.k as u64 + shape.k as u64 * shape.n as u64) * kind.operand_bytes()
 }
 
 fn format_profile_size(bytes: u64) -> String {
@@ -932,12 +1080,17 @@ impl VulkanMatrixContext {
             .storage_buffer16_bit_access(
                 kind == MatrixKind::Fp16 && record.vulkan.storage_buffer_16bit_access,
             );
+        let mut storage_8bit = vk::PhysicalDevice8BitStorageFeatures::default()
+            .storage_buffer8_bit_access(
+                kind != MatrixKind::Fp16 && record.vulkan.storage_buffer_8bit_access,
+            );
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extension_names)
             .push_next(&mut cooperative)
             .push_next(&mut numeric)
-            .push_next(&mut storage_16bit);
+            .push_next(&mut storage_16bit)
+            .push_next(&mut storage_8bit);
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
             Ok(device) => device,
             Err(problem) => {
@@ -1326,12 +1479,13 @@ struct MatrixProfileHarness<'a> {
 impl<'a> MatrixProfileHarness<'a> {
     fn new(
         context: &'a VulkanMatrixContext,
+        kind: MatrixKind,
         shape: MatrixShape,
         workgroups: u32,
         requested_working_set: u64,
     ) -> Result<Self, BenchmarkError> {
-        let bytes_a_per_tile = shape.m as u64 * shape.k as u64 * 2;
-        let bytes_b_per_tile = shape.k as u64 * shape.n as u64 * 2;
+        let bytes_a_per_tile = shape.m as u64 * shape.k as u64 * kind.operand_bytes();
+        let bytes_b_per_tile = shape.k as u64 * shape.n as u64 * kind.operand_bytes();
         let bytes_per_tile = bytes_a_per_tile + bytes_b_per_tile;
         let tile_count = (requested_working_set / bytes_per_tile).max(1);
         if tile_count > u32::MAX as u64 {
@@ -1349,7 +1503,8 @@ impl<'a> MatrixProfileHarness<'a> {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let input_a = context.create_buffer(input_a_size, usage)?;
         let input_b = context.create_buffer(input_b_size, usage)?;
-        let output = context.create_buffer(output_size, usage)?;
+        let output =
+            context.create_buffer(output_size, usage | vk::BufferUsageFlags::TRANSFER_SRC)?;
         // SAFETY: all created Vulkan objects are owned by the returned harness.
         unsafe {
             let bindings = [0_u32, 1, 2].map(|binding| {
@@ -1419,7 +1574,7 @@ impl<'a> MatrixProfileHarness<'a> {
                     .buffer_info(std::slice::from_ref(&buffer_infos[binding as usize]))
             });
             context.device.update_descriptor_sets(&writes, &[]);
-            let words = shader_words(FP16_PROFILE_SPV)?;
+            let words = shader_words(kind.profile_shader())?;
             let module = context
                 .device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
@@ -1483,14 +1638,22 @@ impl<'a> MatrixProfileHarness<'a> {
                     harness.input_a.handle,
                     0,
                     input_a_size,
-                    0x3c00_3c00,
+                    if kind == MatrixKind::Fp16 {
+                        0x3c00_3c00
+                    } else {
+                        0x0101_0101
+                    },
                 );
                 device.cmd_fill_buffer(
                     command_buffer,
                     harness.input_b.handle,
                     0,
                     input_b_size,
-                    0x3c00_3c00,
+                    if kind == MatrixKind::Fp16 {
+                        0x3c00_3c00
+                    } else {
+                        0x0101_0101
+                    },
                 );
                 device.cmd_fill_buffer(command_buffer, harness.output.handle, 0, output_size, 0);
             })?;
@@ -1540,6 +1703,18 @@ impl<'a> MatrixProfileHarness<'a> {
             self.active_subgroups as u32,
         );
         self.context.measure(|device, command_buffer| unsafe {
+            let dependency = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &dependency,
+                &[],
+                &[],
+            );
             device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1560,7 +1735,21 @@ impl<'a> MatrixProfileHarness<'a> {
                 0,
                 &params,
             );
-            for _ in 0..iterations {
+            for iteration in 0..iterations {
+                if iteration > 0 {
+                    let dependency = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &dependency,
+                        &[],
+                        &[],
+                    );
+                }
                 device.cmd_dispatch(command_buffer, self.workgroups, 1, 1);
             }
         })
@@ -1733,6 +1922,369 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "checks actual INT8 GPU output against an integer reference"]
+    fn gpu_int8_matrix_output_matches_integer_reference() {
+        let provider = crate::GpuBandwidthProvider::discover();
+        let record = provider
+            .adapters
+            .iter()
+            .find(|r| matrix_available(r, INT8_MATRIX_SCALING_ID))
+            .expect("An INT8 cooperative matrix GPU with 8-bit storage is required");
+        let (kind, shape) = MatrixKind::for_benchmark(record, INT8_MATRIX_SCALING_ID).unwrap();
+        let context = VulkanMatrixContext::new(record, kind).unwrap();
+        let harness = MatrixProfileHarness::new(&context, kind, shape, 512, 262144).unwrap();
+        // Each A element is -1 for signed input, or 255 for unsigned input. B is 1.
+        context
+            .measure(|device, command| unsafe {
+                device.cmd_fill_buffer(
+                    command,
+                    harness.input_a.handle,
+                    0,
+                    vk::WHOLE_SIZE,
+                    0xffff_ffff,
+                );
+            })
+            .unwrap();
+        for requested in [262144, 131072] {
+            let bytes = harness.actual_working_set(requested);
+            harness.measure(bytes, MATRIX_PROFILE_REUSE, 1).unwrap();
+            let a = if kind == MatrixKind::Sint8 {
+                -1_i64
+            } else {
+                255
+            };
+            let expected = (a
+                * i64::from(shape.k)
+                * harness.tile_iterations(bytes) as i64
+                * i64::from(MATRIX_PROFILE_REUSE)) as u32;
+            let words = read_matrix_output(&context, &harness);
+            assert!(!words.is_empty());
+            assert!(
+                words.iter().all(|value| *value == expected),
+                "{} output differs from the CPU integer reference",
+                kind.input_label()
+            );
+        }
+    }
+
+    fn read_matrix_output(
+        context: &VulkanMatrixContext,
+        harness: &MatrixProfileHarness<'_>,
+    ) -> Vec<u32> {
+        // SAFETY: this test owns the staging allocation, waits for the queue before mapping,
+        // and releases it after copying into an owned Vec. HOST_COHERENT avoids invalidation.
+        unsafe {
+            let device = &context.device;
+            let staging = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(harness.output_size)
+                        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .unwrap();
+            let requirements = device.get_buffer_memory_requirements(staging);
+            let memory_type = (0..context.memory_properties.memory_type_count)
+                .find(|i| {
+                    requirements.memory_type_bits & (1 << i) != 0
+                        && context.memory_properties.memory_types[*i as usize]
+                            .property_flags
+                            .contains(
+                                vk::MemoryPropertyFlags::HOST_VISIBLE
+                                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+                            )
+                })
+                .unwrap();
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(memory_type),
+                    None,
+                )
+                .unwrap();
+            device.bind_buffer_memory(staging, memory, 0).unwrap();
+            context
+                .measure(|device, command| {
+                    let before = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &before,
+                        &[],
+                        &[],
+                    );
+                    device.cmd_copy_buffer(
+                        command,
+                        harness.output.handle,
+                        staging,
+                        &[vk::BufferCopy::default().size(harness.output_size)],
+                    );
+                    let after = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &after,
+                        &[],
+                        &[],
+                    );
+                })
+                .unwrap();
+            let mapped = device
+                .map_memory(memory, 0, harness.output_size, vk::MemoryMapFlags::empty())
+                .unwrap();
+            let words =
+                std::slice::from_raw_parts(mapped.cast::<u32>(), harness.output_size as usize / 4)
+                    .to_vec();
+            device.unmap_memory(memory);
+            device.destroy_buffer(staging, None);
+            device.free_memory(memory, None);
+            words
+        }
+    }
+
+    #[test]
+    fn int8_operand_accounting_and_format_selection_match_native_types() {
+        let shape = MatrixShape {
+            m: 16,
+            n: 16,
+            k: 32,
+            input: vk::ComponentTypeKHR::SINT8,
+            accumulator: vk::ComponentTypeKHR::SINT32,
+        };
+        assert_eq!(
+            matrix_profile_bytes_per_tile(shape, MatrixKind::Sint8),
+            1024
+        );
+        assert_eq!(
+            matrix_profile_bytes_per_tile(shape, MatrixKind::Uint8),
+            1024
+        );
+        assert_eq!(matrix_profile_bytes_per_tile(shape, MatrixKind::Fp16), 2048);
+        assert_eq!(shape.operations_per_mma(), 16384);
+        assert_eq!(MatrixKind::Sint8.operand_bytes(), 1);
+        assert_eq!(MatrixKind::Uint8.accumulator_label(), "uint32");
+    }
+
+    #[test]
+    fn matrix_presets_validate_operand_sizes_and_remain_independent_of_vectors() {
+        let mut config = BenchmarkConfig::default();
+        config
+            .options
+            .insert("gpu_preset".into(), "register".into());
+        config
+            .options
+            .insert("gpu_matrix_preset".into(), "small".into());
+        let resolve = |config: &BenchmarkConfig| {
+            crate::compute::configured_gpu_dataset(config, 1048576, 262144, "gpu_matrix_preset")
+        };
+        assert_eq!(resolve(&config).unwrap(), (262144, true));
+        config
+            .options
+            .insert("gpu_matrix_preset".into(), "custom".into());
+        config
+            .options
+            .insert("dataset_bytes".into(), "524289".into());
+        assert_eq!(resolve(&config).unwrap(), (524289, true));
+        config
+            .options
+            .insert("dataset_bytes".into(), "1048577".into());
+        assert_eq!(resolve(&config).unwrap_err().code, "dataset_exceeds_budget");
+        config
+            .options
+            .insert("dataset_bytes".into(), "262143".into());
+        assert!(resolve(&config).is_err());
+        config
+            .options
+            .insert("gpu_matrix_preset".into(), "vram".into());
+        config.options.insert("dataset_mode".into(), "sweep".into());
+        assert_eq!(resolve(&config).unwrap(), (1048576, false));
+        config
+            .options
+            .insert("gpu_matrix_preset".into(), "l2".into());
+        assert!(resolve(&config).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU with FP16 cooperative matrices and 16-bit storage"]
+    fn gpu_fp16_matrix_modes_smoke() {
+        use gluj_bench_core::BenchmarkProvider;
+        let mut provider = crate::GpuBandwidthProvider::discover();
+        let adapter = provider
+            .adapters
+            .iter()
+            .find(|record| matrix_available(record, FP16_MATRIX_SCALING_ID))
+            .expect("FP16 cooperative-matrix GPU with timestamps and 16-bit storage required");
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..Default::default()
+        };
+        config
+            .options
+            .insert("device_id".into(), adapter.id.clone());
+        config
+            .options
+            .insert("dataset_bytes".into(), "524289".into());
+        for (preset, mode) in [
+            ("register", "register"),
+            ("small", "single"),
+            ("custom", "single"),
+            ("custom", "sweep"),
+        ] {
+            config
+                .options
+                .insert("gpu_matrix_preset".into(), preset.into());
+            config.options.insert("dataset_mode".into(), mode.into());
+            let result = provider
+                .run(
+                    FP16_MATRIX_SCALING_ID,
+                    &config,
+                    &CancellationToken::default(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(result.benchmark_id, FP16_MATRIX_SCALING_ID);
+            assert_eq!(result.workload_metadata["gpu_matrix_preset"], preset);
+            assert_eq!(result.workload_metadata["dataset_mode"], mode);
+            if preset == "register" {
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name == "throughput" && m.value > 0.0)
+                );
+                assert!(
+                    !result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name.starts_with("working_set_"))
+                );
+            } else {
+                let tiers = result
+                    .metrics
+                    .iter()
+                    .filter(|m| m.name.ends_with(".compute"))
+                    .collect::<Vec<_>>();
+                assert!(!tiers.is_empty());
+                assert!(tiers.iter().all(|m| m.value.is_finite() && m.value > 0.0));
+                if mode == "single" {
+                    assert_eq!(tiers.len(), 1);
+                }
+                assert_eq!(
+                    result.workload_metadata["resolved_dataset_bytes"]
+                        .parse::<u64>()
+                        .unwrap()
+                        % result.workload_metadata["operand_bytes_per_tile"]
+                            .parse::<u64>()
+                            .unwrap(),
+                    0
+                );
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name.ends_with(".gpu_execution_time"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU with INT8 cooperative matrices and 8-bit storage"]
+    fn gpu_int8_matrix_modes_smoke() {
+        use gluj_bench_core::BenchmarkProvider;
+        let mut provider = crate::GpuBandwidthProvider::discover();
+        let adapter = provider
+            .adapters
+            .iter()
+            .find(|record| matrix_available(record, INT8_MATRIX_SCALING_ID))
+            .expect("INT8 cooperative-matrix GPU with timestamps and 8-bit storage required");
+        let mut config = BenchmarkConfig {
+            target_duration_ms: 150,
+            samples: 3,
+            ..Default::default()
+        };
+        config
+            .options
+            .insert("device_id".into(), adapter.id.clone());
+        config
+            .options
+            .insert("dataset_bytes".into(), "524289".into());
+        for (preset, mode) in [
+            ("register", "register"),
+            ("small", "single"),
+            ("custom", "single"),
+            ("custom", "sweep"),
+        ] {
+            config
+                .options
+                .insert("gpu_int8_matrix_preset".into(), preset.into());
+            config.options.insert("dataset_mode".into(), mode.into());
+            let result = provider
+                .run(
+                    INT8_MATRIX_SCALING_ID,
+                    &config,
+                    &CancellationToken::default(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(result.benchmark_id, INT8_MATRIX_SCALING_ID);
+            assert_eq!(result.workload_metadata["gpu_int8_matrix_preset"], preset);
+            assert_eq!(result.workload_metadata["dataset_mode"], mode);
+            if preset == "register" {
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name == "throughput" && m.value > 0.0)
+                );
+                assert!(
+                    !result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name.starts_with("working_set_"))
+                );
+            } else {
+                let tiers = result
+                    .metrics
+                    .iter()
+                    .filter(|m| m.name.ends_with(".compute"))
+                    .collect::<Vec<_>>();
+                assert!(!tiers.is_empty());
+                assert!(tiers.iter().all(|m| m.value.is_finite() && m.value > 0.0));
+                if mode == "single" {
+                    assert_eq!(tiers.len(), 1);
+                }
+                assert_eq!(
+                    result.workload_metadata["resolved_dataset_bytes"]
+                        .parse::<u64>()
+                        .unwrap()
+                        % result.workload_metadata["operand_bytes_per_tile"]
+                            .parse::<u64>()
+                            .unwrap(),
+                    0
+                );
+                assert!(
+                    result
+                        .metrics
+                        .iter()
+                        .any(|m| m.name.ends_with(".gpu_execution_time"))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn matrix_catalog_exposes_requested_dense_and_sparse_formats() {
         let ids = descriptors(&[])
             .into_iter()
@@ -1741,9 +2293,8 @@ mod tests {
         assert_eq!(
             ids,
             [
-                FP16_MATRIX_ID,
                 FP16_MATRIX_SCALING_ID,
-                INT8_MATRIX_ID,
+                INT8_MATRIX_SCALING_ID,
                 FP8_MATRIX_ID,
                 SPARSE_FP16_MATRIX_ID,
                 SPARSE_INT8_MATRIX_ID,
@@ -1754,7 +2305,14 @@ mod tests {
 
     #[test]
     fn embedded_matrix_shaders_are_spirv() {
-        for shader in [FP16_SPV, FP16_PROFILE_SPV, SINT8_SPV, UINT8_SPV] {
+        for shader in [
+            FP16_SPV,
+            FP16_PROFILE_SPV,
+            SINT8_SPV,
+            UINT8_SPV,
+            SINT8_PROFILE_SPV,
+            UINT8_PROFILE_SPV,
+        ] {
             assert_eq!(&shader[..4], &[0x03, 0x02, 0x23, 0x07]);
         }
     }
@@ -1793,7 +2351,7 @@ mod tests {
             input: vk::ComponentTypeKHR::FLOAT16,
             accumulator: vk::ComponentTypeKHR::FLOAT32,
         };
-        assert_eq!(matrix_profile_bytes_per_tile(shape), 1024);
+        assert_eq!(matrix_profile_bytes_per_tile(shape, MatrixKind::Fp16), 1024);
         assert_eq!(
             shape.operations_per_mma() * MATRIX_PROFILE_REUSE as u64,
             65_536

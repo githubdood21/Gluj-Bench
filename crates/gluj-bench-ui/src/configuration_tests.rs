@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture() -> App {
+pub(super) fn fixture() -> App {
     let (_, events) = mpsc::channel();
     App {
         page: 1,
@@ -16,7 +16,22 @@ fn fixture() -> App {
             category: DeviceCategory::Gpu,
             available: true,
             status: "Ready".into(),
-            properties: BTreeMap::new(),
+            properties: BTreeMap::from([
+                ("device_type".into(), "DiscreteGpu".into()),
+                (
+                    "device_local_memory_bytes".into(),
+                    (8 * 1024_u64.pow(3)).to_string(),
+                ),
+                (
+                    "host_memory_heap_bytes".into(),
+                    (64 * 1024_u64.pow(3)).to_string(),
+                ),
+                (
+                    "max_storage_buffer_binding_size".into(),
+                    (1024_u64.pow(3)).to_string(),
+                ),
+                ("min_storage_buffer_offset_alignment".into(), "256".into()),
+            ]),
             caches: vec![],
         }],
         benchmarks: vec![BenchmarkDescriptor {
@@ -40,6 +55,8 @@ fn fixture() -> App {
         selected: Some("gpu.performance.fp32.offload.scaling".into()),
         expanded_device_id: None,
         result_details_expanded: false,
+        snapshot: snapshot::SnapshotState::default(),
+        result_presentations: RefCell::default(),
         results: vec![],
         saved_results: vec![],
         baseline_results: vec![],
@@ -69,6 +86,256 @@ fn fixture() -> App {
         metadata_benchmarks_received: false,
         ui_dirty: true,
     }
+}
+
+#[test]
+fn saved_scaling_configurations_restore_the_latest_three_rows() {
+    let path = std::env::temp_dir().join(format!(
+        "scaling-results-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut saved = vec![];
+    for i in 1..=5 {
+        let result = BenchmarkResult {
+            benchmark_id: GPU_VECTOR_ID.into(),
+            device_id: "gpu:fixture".into(),
+            elapsed_ns: i,
+            metrics: vec![],
+            workload_metadata: BTreeMap::from([
+                ("gpu_preset".into(), "custom".into()),
+                ("dataset_mode".into(), "single".into()),
+                ("requested_dataset_bytes".into(), (i * 1048576).to_string()),
+            ]),
+            device_metadata: BTreeMap::new(),
+        };
+        remember_result(&mut saved, &result);
+    }
+    save_results(&path, &saved).unwrap();
+    let restored = load_results(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    let groups = component_results(&restored, "gpu:fixture");
+    assert_eq!(groups.len(), 3);
+    assert_eq!(
+        groups.iter().map(|g| g[0].elapsed_ns).collect::<Vec<_>>(),
+        [5, 4, 3]
+    );
+    assert!(result_configuration_label(groups[0][0]).contains("Custom"));
+    assert!(result_configuration_label(groups[0][0]).contains("5.00 MiB"));
+}
+
+#[test]
+fn configurable_results_keep_three_latest_configurations_and_repeat_statistics() {
+    let make = |id: &str, device: &str, size: u64, speed: f64| BenchmarkResult {
+        benchmark_id: id.into(),
+        device_id: device.into(),
+        elapsed_ns: 1,
+        metrics: vec![Metric {
+            name: format!("working_set_{size}.compute"),
+            value: speed,
+            unit: "operations/s".into(),
+            statistics: Default::default(),
+        }],
+        workload_metadata: BTreeMap::from([
+            ("dataset_mode".into(), "single".into()),
+            ("requested_dataset_bytes".into(), size.to_string()),
+        ]),
+        device_metadata: BTreeMap::new(),
+    };
+    for id in [
+        CPU_VECTOR_ID,
+        CPU_MATRIX_ID,
+        CPU_ASCII_ID,
+        CPU_INT64_ID,
+        GPU_VECTOR_ID,
+        GPU_MATRIX_ID,
+        GPU_INT8_MATRIX_ID,
+        GPU_OFFLOAD_ID,
+    ] {
+        let mut results = (1..=4)
+            .map(|i| make(id, "gpu:fixture", i * 1048576, i as f64))
+            .collect::<Vec<_>>();
+        let groups = component_results(&results, "gpu:fixture");
+        assert_eq!(groups.len(), 3, "{id}");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| g[0].workload_metadata["requested_dataset_bytes"].as_str())
+                .collect::<Vec<_>>(),
+            ["4194304", "3145728", "2097152"]
+        );
+        results.push(make(id, "gpu:fixture", 2 * 1048576, 0.5));
+        let groups = component_results(&results, "gpu:fixture");
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].metrics[0].value, 0.5);
+        assert_eq!(best_primary(&groups[0]).unwrap().value, 2.0);
+        results.push(make(id, "gpu:fixture", 1048576, 5.0));
+        results.push(make(
+            "cpu.performance.extended.popcnt",
+            "gpu:fixture",
+            1,
+            1.0,
+        ));
+        results.push(make(id, "gpu:other", 1048576, 1.0));
+        let groups = component_results(&results, "gpu:fixture");
+        let configured = groups
+            .iter()
+            .filter(|g| g[0].benchmark_id == id)
+            .collect::<Vec<_>>();
+        assert_eq!(configured.len(), 3);
+        assert_eq!(configured[0][0].metrics[0].value, 5.0);
+        assert_eq!(configured[1][0].metrics[0].value, 0.5);
+        assert_eq!(configured[2][0].metrics[0].value, 4.0);
+        let mut saved = vec![];
+        for result in &results {
+            remember_result(&mut saved, result);
+        }
+        assert_eq!(component_results(&saved, "gpu:fixture").len(), 4);
+    }
+}
+
+#[test]
+fn configuration_rows_distinguish_modes_workers_activity_and_ram_shares() {
+    let mut base = BenchmarkResult {
+        benchmark_id: GPU_OFFLOAD_ID.into(),
+        device_id: "gpu:fixture".into(),
+        elapsed_ns: 1,
+        metrics: vec![],
+        workload_metadata: BTreeMap::from([
+            ("dataset_mode".into(), "single".into()),
+            ("requested_dataset_bytes".into(), "1048576".into()),
+            ("ram_offload_percent".into(), "50".into()),
+        ]),
+        device_metadata: BTreeMap::new(),
+    };
+    let mut sweep = base.clone();
+    sweep
+        .workload_metadata
+        .insert("dataset_mode".into(), "sweep".into());
+    let mut full_ram = base.clone();
+    full_ram
+        .workload_metadata
+        .insert("ram_offload_percent".into(), "100".into());
+    let mut activity = base.clone();
+    activity
+        .workload_metadata
+        .insert("gpu_activity_percent".into(), "95".into());
+    assert_eq!(
+        component_results(&[base.clone(), sweep, full_ram, activity], "gpu:fixture").len(),
+        3
+    );
+    assert!(result_configuration_label(&base).contains("One size: 1.00 MiB"));
+    base.benchmark_id = CPU_VECTOR_ID.into();
+    base.device_id = "cpu:system".into();
+    base.workload_metadata
+        .insert("vector_preset".into(), "register".into());
+    base.workload_metadata
+        .insert("cpu_core_limit".into(), "4".into());
+    assert!(result_configuration_label(&base).contains("Register compute"));
+    assert!(result_configuration_label(&base).contains("4 cores"));
+    let mut other = base.clone();
+    other
+        .workload_metadata
+        .insert("cpu_core_limit".into(), "8".into());
+    assert_eq!(component_results(&[base, other], "cpu:system").len(), 2);
+}
+
+#[test]
+fn offload_legacy_preferences_keep_payload_share_and_global_fallback() {
+    let path = std::env::temp_dir().join(format!(
+        "offload-prefs-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let data = json!({"version":1,"tests":{"gpu.performance.fp32.offload50.scaling":{"custom":{"settings":{"vector_preset":1,"dataset_mode":2,"dataset_mib":128,"gpu_intensity":0},"dataset_text":"128"}}}});
+    fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+    let prefs = load_benchmark_preferences(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    let mut app = fixture();
+    app.restore_benchmark_preferences(prefs);
+    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 2);
+    let options = run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap());
+    assert_eq!(options["ram_offload_percent"], "50");
+    assert_eq!(options["dataset_mode"], "single");
+    assert_eq!(options["dataset_bytes"], (128 * 1048576_u64).to_string());
+    assert_eq!(options["gpu_activity_percent"], "95");
+    assert!(!options.contains_key("gpu_offload_preset"));
+    app.select_vector_choice(0);
+    let selected = app.snapshot_benchmark_preferences();
+    assert_eq!(
+        selected.tests[GPU_OFFLOAD_ID].selected_option.as_deref(),
+        Some("single_dataset")
+    );
+    write_json(&path, &selected).unwrap();
+    let round_trip = load_benchmark_preferences(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    app.restore_benchmark_preferences(round_trip);
+    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 0);
+}
+
+#[test]
+fn offload_choices_default_to_sweep_and_restore_custom_split_and_slider() {
+    let mut app = fixture();
+    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 1);
+    let sweep = app.queued_run(GPU_OFFLOAD_ID).unwrap();
+    let options = run_options(&sweep);
+    assert_eq!(options["gpu_offload_preset"], "budget");
+    assert_eq!(options["dataset_mode"], "sweep");
+    assert_eq!(options["ram_offload_percent"], "75");
+    assert!(!options.contains_key("gpu_preset"));
+    app.select_vector_choice(0);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["dataset_mode"],
+        "single"
+    );
+    app.select_vector_choice(2);
+    app.edit_configuration(true, "offload", 2);
+    app.edit_vector_slider(0.0);
+    let custom = app.queued_run(GPU_OFFLOAD_ID).unwrap();
+    assert_eq!(run_options(&custom)["dataset_bytes"], "294912");
+    assert_eq!(run_options(&custom)["ram_offload_percent"], "100");
+    app.edit_configuration(true, "offload-preset", 1);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["gpu_offload_preset"],
+        "small"
+    );
+    app.edit_configuration(true, "offload-preset", 3);
+    app.select_vector_choice(1);
+    let prefs = app.snapshot_benchmark_preferences();
+    assert_eq!(
+        prefs.tests[GPU_OFFLOAD_ID].selected_option.as_deref(),
+        Some("data_sizes")
+    );
+    let mut reopened = fixture();
+    reopened.restore_benchmark_preferences(prefs);
+    assert_eq!(reopened.compute_choice(GPU_OFFLOAD_ID), 1);
+    assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
+    reopened.select_vector_choice(2);
+    assert_eq!(
+        reopened.queued_run(GPU_OFFLOAD_ID).unwrap().settings,
+        custom.settings
+    );
+    reopened.edit_vector_slider(1000.0);
+    let settings = reopened.queued_run(GPU_OFFLOAD_ID).unwrap().settings;
+    let range = reopened.compute_slider_range(GPU_OFFLOAD_ID, &settings);
+    assert_eq!(
+        vector_size_bytes(&settings.vector_size).unwrap(),
+        range.maximum
+    );
+    assert_eq!(range.maximum % range.alignment, 0);
+    reopened.reset_vector_configuration();
+    assert_eq!(reopened.compute_choice(GPU_OFFLOAD_ID), 1);
+    assert_eq!(run_options(&sweep)["dataset_mode"], "sweep");
+    let invalid = AppSettings {
+        vector_preset: 1,
+        ..Default::default()
+    };
+    assert!(validated_run_settings(&invalid, "256", GPU_OFFLOAD_ID).is_err());
 }
 
 #[test]
@@ -212,9 +479,11 @@ fn benchmark_preferences_restore_choices_and_custom_settings_across_launches() {
     app.select_vector_choice(1);
     let gpu = "gpu.performance.fp32.offload.scaling";
     app.selected = Some(gpu.into());
-    let mut settings = AppSettings::default();
-    settings.dataset_mode = 2;
-    settings.dataset_mib = 128;
+    let settings = AppSettings {
+        dataset_mode: 2,
+        dataset_mib: 128,
+        ..Default::default()
+    };
     app.run_overrides.insert(
         gpu.into(),
         TestOverride {
@@ -286,9 +555,11 @@ fn invalid_edits_keep_the_last_valid_saved_configuration() {
     app.benchmark_preferences_path = path.clone();
     app.benchmark_preferences_writable = true;
     let id = app.selected.clone().unwrap();
-    let mut settings = AppSettings::default();
-    settings.dataset_mode = 2;
-    settings.dataset_mib = 128;
+    let settings = AppSettings {
+        dataset_mode: 2,
+        dataset_mib: 128,
+        ..Default::default()
+    };
     app.run_overrides.insert(
         id.clone(),
         TestOverride {
@@ -360,65 +631,6 @@ fn invalid_preferences_are_preserved_and_write_failures_keep_session_choices() {
 }
 
 #[test]
-fn ram_bandwidth_size_slider_preserves_automatic_defaults_and_saved_custom_values() {
-    let mut app = fixture();
-    app.selected = Some(CPU_RAM_BANDWIDTH_ID.into());
-    app.devices[0]
-        .properties
-        .insert("physical_cores".into(), "4".into());
-    let automatic = run_options(&app.queued_run(CPU_RAM_BANDWIDTH_ID).unwrap());
-    assert_eq!(automatic["ram_bandwidth_mode"], "automatic");
-    assert!(!automatic.contains_key("ram_bandwidth_bytes"));
-    assert!(!automatic.contains_key("dataset_mode"));
-    app.run_overrides.insert(
-        CPU_RAM_BANDWIDTH_ID.into(),
-        TestOverride {
-            settings: app.settings.clone(),
-            dataset_text: "256".into(),
-        },
-    );
-    app.edit_configuration(true, "ram-bandwidth-size", 1);
-    app.edit_configuration(true, "cores", 2);
-    app.edit_vector_slider(0.0);
-    let queued = app.queued_run(CPU_RAM_BANDWIDTH_ID).unwrap();
-    let bytes = queued.settings.ram_bandwidth_bytes;
-    assert_eq!(bytes % 128, 0);
-    assert!(bytes >= 64 * 1024 * 1024);
-    app.edit_vector_slider(200.0);
-    let saved = app.run_overrides[CPU_RAM_BANDWIDTH_ID]
-        .settings
-        .ram_bandwidth_bytes;
-    app.edit_configuration(true, "ram-bandwidth-size", 0);
-    assert!(
-        !run_options(&app.queued_run(CPU_RAM_BANDWIDTH_ID).unwrap())
-            .contains_key("ram_bandwidth_bytes")
-    );
-    let mut reopened = fixture();
-    reopened.devices = app.devices.clone();
-    reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
-    reopened.selected = Some(CPU_RAM_BANDWIDTH_ID.into());
-    reopened.edit_configuration(true, "ram-bandwidth-size", 1);
-    assert_eq!(
-        reopened.run_overrides[CPU_RAM_BANDWIDTH_ID]
-            .settings
-            .ram_bandwidth_bytes,
-        saved
-    );
-    assert_eq!(
-        run_options(&queued)["ram_bandwidth_bytes"],
-        bytes.to_string()
-    );
-    assert!(
-        !run_options(&reopened.queued_run("cpu.bandwidth.cache.l3").unwrap())
-            .contains_key("ram_bandwidth_mode")
-    );
-    let range = DatasetSliderRange::for_ram_bandwidth(3, 32 * 1024 * 1024, 16 * 1024_u64.pow(3));
-    assert!(range.available());
-    assert_eq!(range.bytes(1000.0), range.maximum);
-    assert_eq!(range.clamp(range.minimum + 193), range.minimum + 192);
-}
-
-#[test]
 fn different_ram_bandwidth_payloads_remain_separate_in_history() {
     let mut result = BenchmarkResult {
         benchmark_id: CPU_RAM_BANDWIDTH_ID.into(),
@@ -440,6 +652,410 @@ fn different_ram_bandwidth_payloads_remain_separate_in_history() {
     let mut history = vec![old];
     remember_result(&mut history, &result);
     assert_eq!(history.len(), 2);
+}
+
+#[test]
+fn retired_ram_size_preferences_do_not_override_the_default_payload() {
+    let preferences: BenchmarkPreferences = serde_json::from_value(json!({
+        "version": 1,
+        "tests": { "cpu.bandwidth.memory": { "custom": {
+            "settings": { "ram_bandwidth_custom": true, "ram_bandwidth_bytes": 1, "cpu_intensity": 0 },
+            "dataset_text": "256"
+        } } }
+    })).unwrap();
+    let mut app = fixture();
+    app.restore_benchmark_preferences(preferences);
+    let queued = app.queued_run(CPU_RAM_BANDWIDTH_ID).unwrap();
+    let options = run_options(&queued);
+    assert_eq!(options["cpu_activity_percent"], "95");
+    for field in [
+        "ram_bandwidth_mode",
+        "ram_bandwidth_bytes",
+        "dataset_mode",
+        "dataset_bytes",
+    ] {
+        assert!(!options.contains_key(field));
+    }
+    let saved = serde_json::to_value(app.snapshot_benchmark_preferences()).unwrap();
+    let settings = &saved["tests"][CPU_RAM_BANDWIDTH_ID]["custom"]["settings"];
+    assert!(settings.get("ram_bandwidth_custom").is_none());
+    assert!(settings.get("ram_bandwidth_bytes").is_none());
+}
+
+#[test]
+fn gpu_fp32_choices_sizes_and_adapter_snapshots_are_independent() {
+    let mut app = fixture();
+    app.selected = Some(GPU_VECTOR_ID.into());
+    app.devices[0].properties = BTreeMap::from([
+        (
+            "device_local_memory_bytes".into(),
+            (8 * 1024_u64.pow(3)).to_string(),
+        ),
+        (
+            "max_storage_buffer_binding_size".into(),
+            (1024_u64.pow(3)).to_string(),
+        ),
+        ("min_storage_buffer_offset_alignment".into(), "256".into()),
+    ]);
+    let defaults = run_options(&app.queued_run(GPU_VECTOR_ID).unwrap());
+    assert_eq!(defaults["gpu_preset"], "register");
+    assert_eq!(defaults["dataset_mode"], "register");
+    assert!(!defaults.contains_key("dataset_bytes"));
+    assert!(!defaults.contains_key("vector_preset"));
+    app.select_vector_choice(1);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_VECTOR_ID).unwrap())["gpu_preset"],
+        "vram"
+    );
+    app.select_vector_choice(2);
+    app.edit_vector_slider(0.0);
+    let queued = app.queued_run(GPU_VECTOR_ID).unwrap();
+    assert_eq!(run_options(&queued)["dataset_bytes"], "270336");
+    app.edit_configuration(true, "gpu-preset", 2);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_VECTOR_ID).unwrap())["gpu_preset"],
+        "small"
+    );
+    app.edit_configuration(true, "gpu-preset", 4);
+    app.edit_vector_slider(1000.0);
+    let range = app.compute_slider_range(
+        GPU_VECTOR_ID,
+        &app.queued_run(GPU_VECTOR_ID).unwrap().settings,
+    );
+    assert_eq!(range.bytes(1000.0), range.maximum);
+    assert_eq!(range.maximum % range.alignment, 0);
+    let custom = app.queued_run(GPU_VECTOR_ID).unwrap();
+    app.select_vector_choice(0);
+    let mut reopened = fixture();
+    reopened.devices = app.devices.clone();
+    reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
+    assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
+    assert_eq!(reopened.compute_choice(CPU_VECTOR_ID), 0);
+    reopened.selected = Some(GPU_VECTOR_ID.into());
+    reopened.select_vector_choice(2);
+    assert_eq!(
+        reopened.queued_run(GPU_VECTOR_ID).unwrap().settings,
+        custom.settings
+    );
+    reopened.selected_gpu_id = Some("gpu:other".into());
+    assert!(reopened.queued_run(GPU_VECTOR_ID).is_err());
+    assert_eq!(run_options(&custom)["device_id"], "gpu:fixture");
+    assert_eq!(run_options(&queued)["dataset_bytes"], "270336");
+    reopened.reset_vector_configuration();
+    assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
+}
+
+#[test]
+fn gpu_matrix_choices_use_operand_limits_and_save_independently() {
+    let mut app = fixture();
+    app.selected = Some(GPU_MATRIX_ID.into());
+    app.devices[0].properties = BTreeMap::from([
+        (
+            "device_local_memory_bytes".into(),
+            (8 * 1024_u64.pow(3)).to_string(),
+        ),
+        (
+            "max_storage_buffer_binding_size".into(),
+            (1024_u64.pow(3)).to_string(),
+        ),
+        ("cooperative_matrix_fp16_shape".into(), "16x16x16".into()),
+        ("vulkan_subgroup_size".into(), "32".into()),
+        ("storage_buffer_16bit_access".into(), "true".into()),
+    ]);
+    let defaults = run_options(&app.queued_run(GPU_MATRIX_ID).unwrap());
+    assert_eq!(defaults["gpu_matrix_preset"], "register");
+    assert!(!defaults.contains_key("gpu_preset"));
+    app.select_vector_choice(1);
+    let sweep = run_options(&app.queued_run(GPU_MATRIX_ID).unwrap());
+    assert_eq!(sweep["gpu_matrix_preset"], "vram");
+    assert_eq!(sweep["dataset_mode"], "sweep");
+    app.select_vector_choice(2);
+    app.edit_vector_slider(0.0);
+    let custom = app.queued_run(GPU_MATRIX_ID).unwrap();
+    assert_eq!(run_options(&custom)["dataset_bytes"], "262144");
+    let range = app.compute_slider_range(GPU_MATRIX_ID, &custom.settings);
+    assert_eq!(range.alignment, 1024);
+    assert_eq!(range.bytes(1000.0), range.maximum);
+    assert_eq!(
+        range.maximum,
+        (gluj_bench_core::vram_budget_bytes(8 * 1024_u64.pow(3), 25) - 32 * 1024 * 1024) / 1024
+            * 1024
+    );
+    let mut reopened = fixture();
+    reopened.devices = app.devices.clone();
+    reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
+    assert_eq!(reopened.compute_choice(GPU_MATRIX_ID), 2);
+    assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
+    assert_eq!(
+        reopened.queued_run(GPU_MATRIX_ID).unwrap().settings,
+        custom.settings
+    );
+    reopened.devices[0]
+        .properties
+        .remove("storage_buffer_16bit_access");
+    assert!(
+        !reopened
+            .compute_slider_range(GPU_MATRIX_ID, &custom.settings)
+            .available()
+    );
+    assert!(reopened.queued_run(GPU_MATRIX_ID).is_err());
+    reopened
+        .run_overrides
+        .get_mut(GPU_MATRIX_ID)
+        .unwrap()
+        .settings
+        .vector_preset = 2;
+    assert!(reopened.queued_run(GPU_MATRIX_ID).is_err());
+
+    reopened.selected = Some(GPU_MATRIX_ID.into());
+    reopened.select_vector_choice(0);
+    assert_eq!(
+        run_options(&reopened.queued_run(GPU_MATRIX_ID).unwrap())["gpu_matrix_preset"],
+        "register"
+    );
+}
+
+#[test]
+fn gpu_int8_matrix_choices_use_operand_limits_and_save_independently() {
+    let mut app = fixture();
+    app.selected = Some(GPU_INT8_MATRIX_ID.into());
+    app.devices[0].properties = BTreeMap::from([
+        (
+            "device_local_memory_bytes".into(),
+            (8 * 1024_u64.pow(3)).to_string(),
+        ),
+        (
+            "max_storage_buffer_binding_size".into(),
+            (1024_u64.pow(3)).to_string(),
+        ),
+        ("cooperative_matrix_int8_shape".into(), "16x16x32".into()),
+        ("vulkan_subgroup_size".into(), "32".into()),
+        ("storage_buffer_8bit_access".into(), "true".into()),
+    ]);
+    let defaults = run_options(&app.queued_run(GPU_INT8_MATRIX_ID).unwrap());
+    assert_eq!(defaults["gpu_int8_matrix_preset"], "register");
+    assert!(!defaults.contains_key("gpu_preset"));
+    app.select_vector_choice(1);
+    let sweep = run_options(&app.queued_run(GPU_INT8_MATRIX_ID).unwrap());
+    assert_eq!(sweep["gpu_int8_matrix_preset"], "vram");
+    assert_eq!(sweep["dataset_mode"], "sweep");
+    app.select_vector_choice(2);
+    app.edit_vector_slider(0.0);
+    let custom = app.queued_run(GPU_INT8_MATRIX_ID).unwrap();
+    assert_eq!(run_options(&custom)["dataset_bytes"], "262144");
+    let range = app.compute_slider_range(GPU_INT8_MATRIX_ID, &custom.settings);
+    assert_eq!(range.alignment, 1024);
+    assert_eq!(range.bytes(1000.0), range.maximum);
+    assert_eq!(
+        range.maximum,
+        (gluj_bench_core::vram_budget_bytes(8 * 1024_u64.pow(3), 25) - 32 * 1024 * 1024) / 1024
+            * 1024
+    );
+    let mut reopened = fixture();
+    reopened.devices = app.devices.clone();
+    reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
+    assert_eq!(reopened.compute_choice(GPU_INT8_MATRIX_ID), 2);
+    assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
+    assert_eq!(
+        reopened.queued_run(GPU_INT8_MATRIX_ID).unwrap().settings,
+        custom.settings
+    );
+    reopened.devices[0]
+        .properties
+        .remove("storage_buffer_8bit_access");
+    assert!(
+        !reopened
+            .compute_slider_range(GPU_INT8_MATRIX_ID, &custom.settings)
+            .available()
+    );
+    assert!(reopened.queued_run(GPU_INT8_MATRIX_ID).is_err());
+    reopened
+        .run_overrides
+        .get_mut(GPU_INT8_MATRIX_ID)
+        .unwrap()
+        .settings
+        .vector_preset = 2;
+    assert!(reopened.queued_run(GPU_INT8_MATRIX_ID).is_err());
+
+    reopened.selected = Some(GPU_INT8_MATRIX_ID.into());
+    reopened.select_vector_choice(0);
+    assert_eq!(
+        run_options(&reopened.queued_run(GPU_INT8_MATRIX_ID).unwrap())["gpu_int8_matrix_preset"],
+        "register"
+    );
+}
+
+#[test]
+fn old_gpu_register_history_and_preferences_migrate_without_scaling_graphs() {
+    let path = std::env::temp_dir().join(format!(
+        "gluj-gpu-register-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let result = BenchmarkResult {
+        benchmark_id: "gpu.performance.fp32".into(),
+        device_id: "gpu:fixture".into(),
+        elapsed_ns: 1,
+        metrics: vec![Metric {
+            name: "throughput".into(),
+            value: 3e12,
+            unit: "operations/s".into(),
+            statistics: Default::default(),
+        }],
+        workload_metadata: BTreeMap::new(),
+        device_metadata: BTreeMap::new(),
+    };
+    write_json(
+        &path,
+        &ResultsFile {
+            version: 1,
+            results: vec![result],
+        },
+    )
+    .unwrap();
+    let loaded = load_results(&path).unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(loaded[0].benchmark_id, GPU_VECTOR_ID);
+    assert!(!scaling_result(&loaded[0]));
+    let row = result_row(&loaded[0], &[], &[]);
+    assert!(!row.gpu_timing_visible);
+    assert!(row.summary.contains("Register-resident GPU FP32"));
+    assert!(chart_tiers(&loaded[0]).is_empty());
+    assert_eq!(featured_metric(&loaded[0]).unwrap().value, 3e12);
+    let prefs: BenchmarkPreferences = serde_json::from_value(json!({"version":1,"tests":{"gpu.performance.fp32":{"custom":{"settings":{"gpu_intensity":0},"dataset_text":"256"}}}})).unwrap();
+    let mut app = fixture();
+    app.restore_benchmark_preferences(prefs);
+    let migrated = run_options(&app.queued_run(GPU_VECTOR_ID).unwrap());
+    assert_eq!(migrated["gpu_preset"], "register");
+    assert_eq!(migrated["gpu_activity_percent"], "95");
+}
+
+#[test]
+fn old_gpu_matrix_history_and_preferences_migrate_without_scaling_graphs() {
+    let path = std::env::temp_dir().join(format!(
+        "gluj-gpu-register-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let result = BenchmarkResult {
+        benchmark_id: "gpu.performance.matrix.fp16".into(),
+        device_id: "gpu:fixture".into(),
+        elapsed_ns: 1,
+        metrics: vec![Metric {
+            name: "throughput".into(),
+            value: 3e12,
+            unit: "operations/s".into(),
+            statistics: Default::default(),
+        }],
+        workload_metadata: BTreeMap::new(),
+        device_metadata: BTreeMap::new(),
+    };
+    write_json(
+        &path,
+        &ResultsFile {
+            version: 1,
+            results: vec![result],
+        },
+    )
+    .unwrap();
+    let loaded = load_results(&path).unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(loaded[0].benchmark_id, GPU_MATRIX_ID);
+    assert!(!scaling_result(&loaded[0]));
+    let row = result_row(&loaded[0], &[], &[]);
+    assert!(!row.gpu_timing_visible);
+    assert!(row.summary.contains("Register-resident FP16 matrix"));
+    assert!(chart_tiers(&loaded[0]).is_empty());
+    assert_eq!(featured_metric(&loaded[0]).unwrap().value, 3e12);
+    let prefs: BenchmarkPreferences = serde_json::from_value(json!({"version":1,"tests":{"gpu.performance.matrix.fp16":{"custom":{"settings":{"gpu_intensity":0},"dataset_text":"256"}}}})).unwrap();
+    let mut app = fixture();
+    app.restore_benchmark_preferences(prefs);
+    let migrated = run_options(&app.queued_run(GPU_MATRIX_ID).unwrap());
+    assert_eq!(migrated["gpu_matrix_preset"], "register");
+    assert_eq!(migrated["gpu_activity_percent"], "95");
+}
+
+#[test]
+fn int8_scaling_results_keep_native_reference_and_configuration_separate() {
+    let mut result = BenchmarkResult {
+        benchmark_id: GPU_INT8_MATRIX_ID.into(),
+        device_id: "gpu:fixture".into(),
+        elapsed_ns: 1,
+        metrics: vec![Metric {
+            name: "working_set_262144.compute".into(),
+            value: 3e12,
+            unit: "operations/s".into(),
+            statistics: Default::default(),
+        }],
+        workload_metadata: BTreeMap::from([
+            ("gpu_int8_matrix_preset".into(), "small".into()),
+            ("dataset_mode".into(), "single".into()),
+        ]),
+        device_metadata: BTreeMap::new(),
+    };
+    assert!(scaling_result(&result));
+    assert!(result_summary(&result).contains("INT8 matrix reference"));
+    assert!(!result_summary(&result).contains("FP16"));
+    let mut other = result.clone();
+    other
+        .workload_metadata
+        .insert("gpu_int8_matrix_preset".into(), "custom".into());
+    assert!(!same_run_configuration(&result, &other));
+    result
+        .workload_metadata
+        .insert("gpu_int8_matrix_preset".into(), "register".into());
+    assert!(!scaling_result(&result));
+}
+
+#[test]
+fn old_gpu_int8_matrix_history_and_preferences_migrate_without_scaling_graphs() {
+    let path = std::env::temp_dir().join(format!(
+        "gluj-gpu-register-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let result = BenchmarkResult {
+        benchmark_id: "gpu.performance.matrix.int8".into(),
+        device_id: "gpu:fixture".into(),
+        elapsed_ns: 1,
+        metrics: vec![Metric {
+            name: "throughput".into(),
+            value: 3e12,
+            unit: "operations/s".into(),
+            statistics: Default::default(),
+        }],
+        workload_metadata: BTreeMap::new(),
+        device_metadata: BTreeMap::new(),
+    };
+    write_json(
+        &path,
+        &ResultsFile {
+            version: 1,
+            results: vec![result],
+        },
+    )
+    .unwrap();
+    let loaded = load_results(&path).unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(loaded[0].benchmark_id, GPU_INT8_MATRIX_ID);
+    assert!(!scaling_result(&loaded[0]));
+    let row = result_row(&loaded[0], &[], &[]);
+    assert!(!row.gpu_timing_visible);
+    assert!(row.summary.contains("Register-resident INT8 matrix"));
+    assert!(chart_tiers(&loaded[0]).is_empty());
+    assert_eq!(featured_metric(&loaded[0]).unwrap().value, 3e12);
+    let prefs: BenchmarkPreferences = serde_json::from_value(json!({"version":1,"tests":{"gpu.performance.matrix.int8":{"custom":{"settings":{"gpu_intensity":0},"dataset_text":"256"}}}})).unwrap();
+    let mut app = fixture();
+    app.restore_benchmark_preferences(prefs);
+    let migrated = run_options(&app.queued_run(GPU_INT8_MATRIX_ID).unwrap());
+    assert_eq!(migrated["gpu_int8_matrix_preset"], "register");
+    assert_eq!(migrated["gpu_activity_percent"], "95");
 }
 
 #[test]
@@ -727,7 +1343,7 @@ fn matrix_slider_rounds_to_supported_dimensions_and_reaches_its_budget() {
     assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
     for bytes in values {
         let dimension = gluj_bench_core::cpu_matrix_dimension(bytes / 3);
-        assert!(dimension >= 32 && dimension % 8 == 0);
+        assert!(dimension >= 32 && dimension.is_multiple_of(8));
         assert_eq!(bytes, gluj_bench_core::cpu_matrix_bytes(dimension) * 3);
     }
     assert!(!DatasetSliderRange::for_matrix(3, 1024).available());
@@ -763,8 +1379,10 @@ fn sliders_preserve_per_test_values_and_queued_settings() {
         .properties
         .insert("physical_cores".into(), "8".into());
     app.selected = Some(CPU_VECTOR_ID.into());
-    let mut settings = AppSettings::default();
-    settings.vector_preset = 6;
+    let settings = AppSettings {
+        vector_preset: 6,
+        ..Default::default()
+    };
     app.run_overrides.insert(
         CPU_VECTOR_ID.into(),
         TestOverride {
@@ -861,7 +1479,7 @@ fn global_defaults_overrides_and_queue_snapshots_are_independent() {
     let id = app.selected.clone().unwrap();
     app.settings.dataset_mode = 2;
     app.dataset_text = "384".into();
-    assert_eq!(app.effective_settings(&id).unwrap().dataset_mib, 384);
+    assert_eq!(app.effective_settings(&id).unwrap().dataset_mode, 0);
     app.run_overrides.insert(
         id.clone(),
         TestOverride {
@@ -884,7 +1502,9 @@ fn global_defaults_overrides_and_queue_snapshots_are_independent() {
     app.edit_dataset(true, "".into());
     assert!(app.queued_run(&id).is_err());
     app.run_overrides.remove(&id);
-    assert_eq!(app.effective_settings(&id).unwrap().dataset_mib, 384);
+    assert!(app.effective_settings(&id).is_err());
+    app.selected_gpu_id = Some("gpu:fixture".into());
+    assert_eq!(app.effective_settings(&id).unwrap().dataset_mode, 0);
     assert_eq!(app.effective_settings(&id).unwrap().ram_offload_percent, 50);
     let ordinary = app.queued_run("gpu.performance.fp32").unwrap();
     assert!(!run_options(&ordinary).contains_key("dataset_bytes"));
@@ -947,7 +1567,7 @@ fn result_history_keeps_offload_shares_and_datasets_separate() {
         remember_result(&mut saved, &sample);
     }
     assert_eq!(saved.len(), 3);
-    assert_eq!(component_results(&saved, "gpu:fixture").len(), 2);
+    assert_eq!(component_results(&saved, "gpu:fixture").len(), 3);
     assert!(!same_run_configuration(&saved[0], &saved[1]));
     assert!(!same_run_configuration(&saved[1], &saved[2]));
     let previous = saved[0].clone();
@@ -1115,9 +1735,11 @@ fn render_vector_configuration_previews() {
             "automatic_compute_dataset_sizes".into(),
             "262144,524288,786432,1048576".into(),
         );
-        let mut settings = AppSettings::default();
-        settings.vector_preset = preset;
-        settings.vector_size = "8 GiB".into();
+        let settings = AppSettings {
+            vector_preset: preset,
+            vector_size: "8 GiB".into(),
+            ..Default::default()
+        };
         app.run_overrides.insert(
             id.into(),
             TestOverride {
@@ -1224,8 +1846,8 @@ fn render_vector_configuration_previews() {
 }
 
 #[test]
-#[ignore = "renders the RAM bandwidth size slider to target/ui-preview"]
-fn render_ram_bandwidth_previews() {
+#[ignore = "renders the GPU FP32 configuration to target/ui-preview"]
+fn render_gpu_configuration_previews() {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
     struct Headless(Rc<MinimalSoftwareWindow>);
     impl slint::platform::Platform for Headless {
@@ -1239,70 +1861,139 @@ fn render_ram_bandwidth_previews() {
     slint::platform::set_platform(Box::new(Headless(adapter.clone()))).unwrap();
     let window = MainWindow::new().unwrap();
     let mut app = fixture();
-    app.devices[0].id = "memory:system".into();
-    app.devices[0].name = "System RAM".into();
-    app.devices[0].category = DeviceCategory::Memory;
-    app.devices.push(DeviceDescriptor {
-        id: "cpu:system".into(),
-        name: "CPU preview".into(),
-        category: DeviceCategory::Cpu,
-        available: true,
-        status: "Ready".into(),
-        properties: BTreeMap::from([("physical_cores".into(), "4".into())]),
-        caches: vec![gluj_bench_core::CacheDescriptor {
-            level: 3,
-            kind: gluj_bench_core::CacheKind::Unified,
-            size_bytes: 32 * 1024 * 1024,
-            line_size_bytes: 64,
-            sharing_logical_processors: 4,
-            instances: 1,
-        }],
-    });
-    app.benchmarks[0].id = CPU_RAM_BANDWIDTH_ID.into();
-    app.benchmarks[0].name = "System RAM bandwidth".into();
-    app.benchmarks[0].suite_id = "cpu.bandwidth".into();
-    app.benchmarks[0].category = BenchmarkCategory::Memory;
-    app.benchmarks[0].workload = "Physical-core-scaled streaming memory access".into();
-    app.benchmarks[0].data_type = "bytes".into();
-    app.benchmarks[0].unit = "bytes/s".into();
-    app.benchmarks[0].supported_device_ids = vec!["memory:system".into()];
-    app.selected = Some(CPU_RAM_BANDWIDTH_ID.into());
-    app.selected_suite = "cpu.bandwidth".into();
+    app.devices[0].name = "GPU preview".into();
+    app.devices[0].properties = BTreeMap::from([
+        (
+            "device_local_memory_bytes".into(),
+            (8 * 1024_u64.pow(3)).to_string(),
+        ),
+        (
+            "max_storage_buffer_binding_size".into(),
+            (1024_u64.pow(3)).to_string(),
+        ),
+        ("min_storage_buffer_offset_alignment".into(), "256".into()),
+    ]);
+    app.devices[0].properties.extend(BTreeMap::from([
+        ("cooperative_matrix_fp16_shape".into(), "16x16x16".into()),
+        ("vulkan_subgroup_size".into(), "32".into()),
+        ("storage_buffer_16bit_access".into(), "true".into()),
+    ]));
+    app.benchmarks[0].id = GPU_VECTOR_ID.into();
+    app.benchmarks[0].name = "FP32 vector compute".into();
+    app.benchmarks[0].workload =
+        "GPU FP32 calculations with register, small-data, VRAM or custom working sets".into();
+    app.selected = Some(GPU_VECTOR_ID.into());
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-preview");
     fs::create_dir_all(&directory).unwrap();
-    for (custom, width, height, name) in [
-        (false, 1280, 820, "ram-bandwidth-automatic"),
-        (true, 1280, 820, "ram-bandwidth-custom"),
-        (true, 980, 680, "ram-bandwidth-custom-min"),
+    for id in [
+        GPU_VECTOR_ID,
+        GPU_MATRIX_ID,
+        GPU_INT8_MATRIX_ID,
+        GPU_OFFLOAD_ID,
     ] {
-        app.run_overrides.clear();
-        if custom {
-            let settings = AppSettings {
-                ram_bandwidth_custom: true,
-                ram_bandwidth_bytes: 1024 * 1024 * 1024,
-                ..Default::default()
-            };
-            app.run_overrides.insert(
-                CPU_RAM_BANDWIDTH_ID.into(),
-                TestOverride {
-                    settings,
-                    dataset_text: "256".into(),
-                },
+        app.selected = Some(id.into());
+        app.benchmarks[0].id = id.into();
+        if id == GPU_MATRIX_ID {
+            app.benchmarks[0].name = "FP16 matrix compute".into();
+            app.benchmarks[0].data_type = "fp16".into();
+            app.benchmarks[0].workload =
+                "FP16 matrix multiply-accumulate with FP32 accumulation".into();
+        }
+        if id == GPU_INT8_MATRIX_ID {
+            app.devices[0]
+                .properties
+                .insert("cooperative_matrix_int8_shape".into(), "16x16x32".into());
+            app.devices[0]
+                .properties
+                .insert("storage_buffer_8bit_access".into(), "true".into());
+            app.benchmarks[0].name = "INT8 matrix compute".into();
+            app.benchmarks[0].data_type = "int8".into();
+            app.benchmarks[0].workload =
+                "INT8 matrix multiply-accumulate with 32-bit accumulation".into();
+        }
+        if id == GPU_OFFLOAD_ID {
+            app.devices[0]
+                .properties
+                .insert("device_type".into(), "DiscreteGpu".into());
+            app.devices[0].properties.insert(
+                "host_memory_heap_bytes".into(),
+                (64 * 1024_u64.pow(3)).to_string(),
+            );
+            app.benchmarks[0].name = "FP32 system-RAM offload scaling".into();
+            app.benchmarks[0].data_type = "fp32".into();
+            app.benchmarks[0].workload =
+                "GPU FP32 compute with data split between system RAM and VRAM".into();
+        }
+        for (choice, preset, width, height, name) in [
+            (0, 1, 1280, 820, "gpu-fp32-default"),
+            (1, 5, 980, 680, "gpu-fp32-sweep-min"),
+            (2, 2, 1280, 820, "gpu-fp32-small"),
+            (2, 6, 980, 680, "gpu-fp32-custom-min"),
+        ] {
+            app.vector_choices.insert(id.into(), choice);
+            app.run_overrides.clear();
+            if choice == 2 {
+                app.run_overrides.insert(
+                    id.into(),
+                    TestOverride {
+                        settings: AppSettings {
+                            vector_preset: preset,
+                            ram_offload_percent: if id == GPU_OFFLOAD_ID && preset == 6 {
+                                100
+                            } else {
+                                75
+                            },
+                            vector_size: "8 GiB".into(),
+                            vector_sweep: false,
+                            ..Default::default()
+                        },
+                        dataset_text: "256".into(),
+                    },
+                );
+            }
+            window.set_configuration_scroll_offset(0.0);
+            App::refresh(&window, &app);
+            adapter.set_size(slint::PhysicalSize::new(width, height));
+            window.show().unwrap();
+            if name == "gpu-fp32-custom-min" {
+                window
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                        position: slint::LogicalPosition::new(850., 450.),
+                        delta_x: 0.,
+                        delta_y: if id == GPU_OFFLOAD_ID { -430. } else { -230. },
+                    });
+            }
+            let mut pixels = vec![slint::Rgb8Pixel::default(); width as usize * height as usize];
+            assert!(adapter.draw_if_needed(|renderer| {
+                renderer.render(&mut pixels, width as usize);
+            }));
+            let mut image = format!("P6\n{width} {height}\n255\n").into_bytes();
+            for pixel in pixels {
+                image.extend_from_slice(&[pixel.r, pixel.g, pixel.b]);
+            }
+            fs::write(
+                directory.join(format!(
+                    "{name}-{}.ppm",
+                    if id == GPU_OFFLOAD_ID {
+                        "offload"
+                    } else if id == GPU_INT8_MATRIX_ID {
+                        "int8-matrix"
+                    } else if id == GPU_MATRIX_ID {
+                        "matrix"
+                    } else {
+                        "vector"
+                    }
+                )),
+                image,
+            )
+            .unwrap();
+            assert!(!window.get_test_is_cpu());
+            assert_eq!(
+                window.get_test_vector_register(),
+                choice == 0 && id != GPU_OFFLOAD_ID
             );
         }
-        window.set_configuration_scroll_offset(0.0);
-        App::refresh(&window, &app);
-        adapter.set_size(slint::PhysicalSize::new(width, height));
-        window.show().unwrap();
-        let mut pixels = vec![slint::Rgb8Pixel::default(); width as usize * height as usize];
-        assert!(adapter.draw_if_needed(|renderer| {
-            renderer.render(&mut pixels, width as usize);
-        }));
-        let mut image = format!("P6\n{width} {height}\n255\n").into_bytes();
-        for pixel in pixels {
-            image.extend_from_slice(&[pixel.r, pixel.g, pixel.b]);
-        }
-        fs::write(directory.join(format!("{name}.ppm")), image).unwrap();
     }
 }
 
@@ -1310,6 +2001,7 @@ fn render_ram_bandwidth_previews() {
 #[test]
 #[ignore = "renders configuration previews to target/ui-preview"]
 fn render_configuration_previews() {
+    use slint::Model;
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
     struct Headless(Rc<MinimalSoftwareWindow>);
     impl slint::platform::Platform for Headless {
@@ -1341,6 +2033,10 @@ fn render_configuration_previews() {
         (1, 980, 680, "test-override-min"),
         (1, 1280, 820, "test-override-options"),
         (3, 1280, 820, "global-settings"),
+        (2, 1280, 820, "snapshot-picker"),
+        (2, 980, 680, "snapshot-picker-min"),
+        (2, 1280, 820, "scaling-history"),
+        (2, 980, 680, "scaling-history-min"),
         (2, 1280, 820, "gpu-timings"),
         (2, 980, 680, "gpu-timings-min"),
         (2, 1280, 820, "tuning-visuals"),
@@ -1451,6 +2147,40 @@ fn render_configuration_previews() {
                     ("bound_classification".into(), "compute_bound".into()),
                 ]);
             }
+            if name.starts_with("scaling-history") {
+                let template = app.results[0].clone();
+                app.results.clear();
+                for (share, bytes) in [
+                    (50, 262144),
+                    (75, 1048576),
+                    (100, 67108864),
+                    (75, 268435456),
+                ] {
+                    let mut result = template.clone();
+                    result
+                        .workload_metadata
+                        .insert("ram_offload_percent".into(), share.to_string());
+                    result
+                        .workload_metadata
+                        .insert("gpu_offload_preset".into(), "custom".into());
+                    result
+                        .workload_metadata
+                        .insert("dataset_mode".into(), "single".into());
+                    result
+                        .workload_metadata
+                        .insert("requested_dataset_bytes".into(), bytes.to_string());
+                    result
+                        .workload_metadata
+                        .insert("resolved_dataset_bytes".into(), bytes.to_string());
+                    result.metrics.retain(|m| {
+                        !m.name.starts_with("working_set_")
+                            || m.name.starts_with(&format!("working_set_{bytes}."))
+                    });
+                    app.results.push(result);
+                }
+                assert_eq!(component_results(&app.results, "gpu:fixture").len(), 3);
+                app.result_selection = 0;
+            }
             app.result_details_expanded = !name.starts_with("tuning-visuals");
             if name.starts_with("ram-latency") || name.starts_with("cache-latency") {
                 app.devices = vec![DeviceDescriptor {
@@ -1519,7 +2249,43 @@ fn render_configuration_previews() {
                 }
             }
         }
+        app.snapshot = snapshot::SnapshotState::default();
+        if name.starts_with("snapshot-picker") {
+            app.open_snapshot();
+            app.finish_snapshot_for_test();
+            app.snapshot.choices = (0..6).map(|index| crate::snapshot::Choice {
+                result_index: 0,
+                selected: index == 0,
+                title: "AVX2 FP32 vector compute".into(),
+                detail: format!("AMD Ryzen 9 5950X 16-Core Processor - {} - 16 cores - 99% activity - 16 iterations", ["Sweep to 15.95 GiB", "L1 target - Sweep to 384.00 KiB", "Register compute"][index % 3]),
+            }).collect();
+        }
         App::refresh(&window, &app);
+        if name.starts_with("snapshot-picker") {
+            let summaries = window.get_result_summaries();
+            let details = window.get_selected_result();
+            let choices = window.get_snapshot_choices();
+            app.ui_dirty = false;
+            app.snapshot.choices[1].selected = true;
+            app.update_snapshot();
+            App::refresh_snapshot(&window, &app);
+            assert!(
+                window.get_snapshot_choices() == choices,
+                "Checkbox model must be retained"
+            );
+            assert!(window.get_snapshot_choices().row_data(1).unwrap().selected);
+            assert!(
+                window.get_result_summaries() == summaries,
+                "Snapshot clicks must preserve result/chart models"
+            );
+            assert!(window.get_selected_result().profile_points == details.profile_points);
+            assert!(!window.get_snapshot_ready());
+            assert!(!app.ui_dirty);
+            app.finish_snapshot_for_test();
+            App::refresh_snapshot(&window, &app);
+            assert!(window.get_snapshot_ready());
+            assert!(window.get_result_summaries() == summaries);
+        }
         window.set_tuning_details_expanded(name.starts_with("tuning-visuals"));
         adapter.set_size(slint::PhysicalSize::new(width, height));
         window.show().unwrap();
@@ -1545,8 +2311,11 @@ fn render_configuration_previews() {
                 .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
                     position: slint::LogicalPosition::new(width as f32 - 100.0, 500.0),
                     delta_x: 0.0,
-                    delta_y: if name.starts_with("ram-latency") || name.starts_with("cache-latency")
+                    delta_y: if name.starts_with("scaling-history")
+                        || name.starts_with("snapshot-picker")
                     {
+                        0.0
+                    } else if name.starts_with("ram-latency") || name.starts_with("cache-latency") {
                         -280.0
                     } else if name.starts_with("chart-") {
                         -850.0
@@ -1611,4 +2380,116 @@ fn render_configuration_previews() {
             );
         }
     }
+}
+
+/// Exercise the actual navigation callbacks without polling timers or benchmark execution.
+#[test]
+#[ignore = "headless navigation and presentation-cache regression check"]
+fn navigation_updates_immediately_and_reuses_result_presentations() {
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+    struct Headless(Rc<MinimalSoftwareWindow>);
+    impl slint::platform::Platform for Headless {
+        fn create_window_adapter(
+            &self,
+        ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+            Ok(self.0.clone())
+        }
+    }
+    let adapter = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(Headless(adapter.clone()))).unwrap();
+    let window = MainWindow::new().unwrap();
+    let mut app = fixture();
+    let mut second = app.benchmarks[0].clone();
+    second.id = GPU_VECTOR_ID.into();
+    second.name = "FP32 vector compute".into();
+    app.benchmarks.push(second);
+    for id in [GPU_VECTOR_ID, GPU_OFFLOAD_ID] {
+        app.results.push(BenchmarkResult {
+            benchmark_id: id.into(),
+            device_id: "gpu:fixture".into(),
+            elapsed_ns: 123456,
+            metrics: vec![Metric {
+                name: "working_set_1048576.compute".into(),
+                value: 10e12,
+                unit: "operations/s".into(),
+                statistics: Default::default(),
+            }],
+            workload_metadata: BTreeMap::from([
+                ("dataset_mode".into(), "single".into()),
+                ("gpu_preset".into(), "custom".into()),
+                ("ram_offload_percent".into(), "75".into()),
+            ]),
+            device_metadata: BTreeMap::new(),
+        });
+    }
+    let app = Rc::new(RefCell::new(app));
+    App::wire(&window, &app);
+    App::refresh(&window, &app.borrow());
+    app.borrow_mut().ui_dirty = false;
+    let devices = window.get_devices();
+    let benchmarks = window.get_benchmarks();
+    let summaries = window.get_result_summaries();
+    let detail = window.get_selected_result();
+    let started = std::time::Instant::now();
+    for page in [0, 1, 2, 3, 2] {
+        window.invoke_select_page(page);
+        assert_eq!(
+            window.get_page(),
+            page,
+            "Page must change before a polling tick"
+        );
+        assert_eq!(app.borrow().page, page);
+        assert!(!app.borrow().ui_dirty);
+        assert!(window.get_devices() == devices);
+        assert!(window.get_benchmarks() == benchmarks);
+        assert!(window.get_result_summaries() == summaries);
+        assert!(window.get_selected_result().measurement_facts == detail.measurement_facts);
+    }
+    println!(
+        "Five page switches: {:?} (callback time, excludes painting)",
+        started.elapsed()
+    );
+    window.invoke_toggle_device_details("gpu:fixture".into());
+    assert_eq!(window.get_expanded_device_id().as_str(), "gpu:fixture");
+    window.invoke_toggle_device_details("gpu:fixture".into());
+    assert!(window.get_expanded_device_id().is_empty());
+    window.invoke_select_benchmark(GPU_VECTOR_ID.into());
+    assert_eq!(
+        window.get_selected_benchmark_name().as_str(),
+        "FP32 vector compute"
+    );
+    assert_eq!(window.get_configuration_test_id().as_str(), GPU_VECTOR_ID);
+    assert!(window.get_devices() == devices);
+    assert!(window.get_result_summaries() == summaries);
+    window.invoke_select_suite("cpu.bandwidth".into());
+    assert!(window.get_suite_description().contains("Cache/RAM"));
+    window.invoke_select_suite("gpu.performance".into());
+    window.invoke_select_gpu(0);
+    assert!(!app.borrow().ui_dirty);
+    assert!(window.get_result_summaries() == summaries);
+    window.invoke_select_result_row(1);
+    assert_eq!(window.get_result_selection(), 1);
+    assert!(!window.get_result_details_expanded());
+    window.invoke_select_result_row(0);
+    assert!(window.get_selected_result().measurement_facts == detail.measurement_facts);
+    assert!(window.get_selected_result().profile_points == detail.profile_points);
+    assert_eq!(app.borrow().result_presentations.borrow().len(), 2);
+    window.invoke_toggle_result_details();
+    assert!(window.get_result_details_expanded());
+    window.invoke_select_comparison(0);
+    assert!(window.get_selected_result().measurement_facts == detail.measurement_facts);
+    assert!(!app.borrow().ui_dirty);
+    app.borrow_mut().results[1].metrics[0].value = 20e12;
+    App::refresh(&window, &app.borrow());
+    assert!(window.get_selected_result().measurement_facts != detail.measurement_facts);
+    assert_eq!(
+        window.get_selected_result().primary_value.as_str(),
+        "20.00 TOPS"
+    );
+    adapter.set_size(slint::PhysicalSize::new(980, 680));
+    window.show().unwrap();
+    let mut pixels = vec![slint::Rgb8Pixel::default(); 980 * 680];
+    assert!(adapter.draw_if_needed(|renderer| {
+        renderer.render(&mut pixels, 980);
+    }));
 }

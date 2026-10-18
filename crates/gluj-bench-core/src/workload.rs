@@ -64,20 +64,147 @@ pub fn ram_allocation_budget(total: u64, available: u64, percent: u32) -> u64 {
         .min(available.saturating_sub(2 * 1024 * 1024 * 1024))
 }
 
-/// RAM bandwidth payload across all workers. Two equal-sized buffers are
-/// allocated, so the payload limit is half the safe allocation ceiling.
-pub fn ram_bandwidth_payload_range(
-    last_level_cache: u64,
-    available: u64,
-    workers: u32,
-) -> (u64, u64) {
-    let alignment = 64 * u64::from(workers.max(1));
-    let minimum = last_level_cache
-        .saturating_mul(2)
-        .saturating_add(64 * 1024 * 1024);
-    let minimum = minimum.saturating_add(alignment - 1) / alignment * alignment;
-    let maximum = (available / 5 * 4).min(available.saturating_sub(2 * 1024 * 1024 * 1024)) / 2;
-    (minimum, maximum / alignment * alignment)
+/// FP32 GPU profile: three vec4 arrays, aligned to a workgroup and descriptor offsets.
+pub fn gpu_fp32_dataset_range(
+    local_memory: u64,
+    storage_range: u64,
+    offset_alignment: u64,
+    percent: u32,
+    shared_available: Option<u64>,
+) -> (u64, u64, u64) {
+    let alignment = 48 * 256_u64.max(offset_alignment / 16);
+    let minimum = (256 * 1024_u64).div_ceil(alignment) * alignment;
+    let mut maximum = vram_budget_bytes(local_memory, percent)
+        .saturating_sub(16 * 1024 * 1024)
+        .min(storage_range.saturating_mul(3))
+        .min(u64::from(u32::MAX) / (alignment / 48) * alignment);
+    if let Some(available) = shared_available {
+        maximum =
+            maximum.min((available / 5 * 4).min(available.saturating_sub(2 * 1024 * 1024 * 1024)));
+    }
+    (minimum, maximum / alignment * alignment, alignment)
+}
+
+/// Host allocation policy for direct GPU access to system RAM.
+pub fn gpu_offload_ram_budget(total: u64, available: u64, heap: u64, percent: u32) -> u64 {
+    (total / 100 * u64::from(percent))
+        .min(available / 100 * 80)
+        .min(available.saturating_sub(2 * 1024 * 1024 * 1024))
+        .min(heap)
+        .saturating_sub(16 * 1024 * 1024)
+}
+
+/// Total bytes allowed by the independent budgets for a fixed RAM/VRAM split.
+pub fn gpu_mixed_allocation_limit(vram: u64, ram: u64, offload: u32) -> u64 {
+    if offload > 100 {
+        return 0;
+    }
+    let host = if offload == 0 {
+        u64::MAX
+    } else {
+        ram.saturating_mul(100) / u64::from(offload)
+    };
+    let local = if offload == 100 {
+        u64::MAX
+    } else {
+        vram.saturating_mul(100) / u64::from(100 - offload)
+    };
+    host.min(local)
+}
+
+/// Three vec4 arrays with exact 50/75/100% host shares and complete workgroups.
+pub fn gpu_fp32_offload_dataset_range(
+    vram_budget: u64,
+    ram_budget: u64,
+    storage_range: u64,
+    offset_alignment: u64,
+    offload: u32,
+) -> (u64, u64, u64) {
+    let alignment = 48 * 256_u64.max(offset_alignment / 16) * 4;
+    let minimum = (256 * 1024_u64).div_ceil(alignment) * alignment;
+    if ![50, 75, 100].contains(&offload) {
+        return (minimum, 0, alignment);
+    }
+    let maximum = gpu_mixed_allocation_limit(vram_budget, ram_budget, offload)
+        .min(storage_range.saturating_mul(3))
+        .min(u64::from(u32::MAX) / (alignment / 48) * alignment);
+    (minimum, maximum / alignment * alignment, alignment)
+}
+
+/// FP16 matrix operands; reserve FP32 output for every supported saturation width.
+/// The shared-memory limit also leaves room for the OS and other applications.
+pub fn gpu_fp16_matrix_dataset_range(
+    local_memory: u64,
+    storage_range: u64,
+    shape: [u64; 3],
+    subgroup_size: u64,
+    percent: u32,
+    shared_available: Option<u64>,
+) -> (u64, u64, u64) {
+    gpu_matrix_dataset_range(
+        local_memory,
+        storage_range,
+        shape,
+        subgroup_size,
+        percent,
+        shared_available,
+        2,
+    )
+}
+
+/// INT8 operands with 32-bit output; the same tile layout and memory policy as FP16.
+pub fn gpu_int8_matrix_dataset_range(
+    local_memory: u64,
+    storage_range: u64,
+    shape: [u64; 3],
+    subgroup_size: u64,
+    percent: u32,
+    shared_available: Option<u64>,
+) -> (u64, u64, u64) {
+    gpu_matrix_dataset_range(
+        local_memory,
+        storage_range,
+        shape,
+        subgroup_size,
+        percent,
+        shared_available,
+        1,
+    )
+}
+
+fn gpu_matrix_dataset_range(
+    local_memory: u64,
+    storage_range: u64,
+    shape: [u64; 3],
+    subgroup_size: u64,
+    percent: u32,
+    shared_available: Option<u64>,
+    operand_bytes: u64,
+) -> (u64, u64, u64) {
+    let [m, n, k] = shape;
+    if m == 0 || n == 0 || k == 0 || subgroup_size == 0 || 64 % subgroup_size != 0 {
+        return (256 * 1024, 0, 1);
+    }
+    let a = m.saturating_mul(k);
+    let b = k.saturating_mul(n);
+    let alignment = a.saturating_add(b).saturating_mul(operand_bytes);
+    let minimum = (256 * 1024_u64).div_ceil(alignment) * alignment;
+    let output_reserve = (8192 * 64 / subgroup_size) * m * n * 4;
+    let reserve = output_reserve.saturating_add(16 * 1024 * 1024);
+    let tiles = (storage_range / a.saturating_mul(operand_bytes))
+        .min(storage_range / b.saturating_mul(operand_bytes))
+        .min(u64::from(u32::MAX) / a.max(b));
+    let mut maximum = vram_budget_bytes(local_memory, percent)
+        .saturating_sub(reserve)
+        .min(tiles.saturating_mul(alignment));
+    if let Some(available) = shared_available {
+        maximum = maximum.min(local_memory / 8).min(
+            (available / 5 * 4)
+                .min(available.saturating_sub(2 * 1024 * 1024 * 1024))
+                .saturating_sub(reserve),
+        );
+    }
+    (minimum, maximum / alignment * alignment, alignment)
 }
 
 /// Fixed 32-row CPU matrix layout: A[32,K], B[K,N], C[32,N], K=N.
@@ -230,6 +357,78 @@ pub fn pace_gpu(active: Duration) -> Result<(), BenchmarkError> {
 mod tests {
     use super::*;
     #[test]
+    fn offload_ranges_preserve_exact_shares_and_both_memory_budgets() {
+        let gib = 1024_u64.pow(3);
+        for share in [50, 75, 100] {
+            let (minimum, maximum, alignment) =
+                gpu_fp32_offload_dataset_range(2 * gib, 3 * gib, gib, 256, share);
+            assert_eq!(minimum, 294912);
+            assert_eq!(alignment, 49152);
+            assert_eq!(maximum % alignment, 0);
+            assert!(maximum * u64::from(share) / 100 <= 3 * gib);
+            assert!(maximum * u64::from(100 - share) / 100 <= 2 * gib);
+            assert_eq!((maximum / 48 * u64::from(share) / 100) % 256, 0);
+            assert!(maximum <= 3 * gib);
+        }
+        assert_eq!(
+            gpu_fp32_offload_dataset_range(0, 3 * gib, gib, 4096, 100).1,
+            3 * gib
+        );
+        assert_eq!(
+            gpu_fp32_offload_dataset_range(0, 3 * gib, gib, 256, 50).1,
+            0
+        );
+        assert_eq!(gpu_fp32_offload_dataset_range(gib, 0, gib, 256, 100).1, 0);
+        assert_eq!(gpu_fp32_offload_dataset_range(gib, gib, gib, 256, 60).1, 0);
+    }
+
+    #[test]
+    fn int8_range_uses_one_byte_operands_and_reserves_32_bit_outputs() {
+        let gib = 1024_u64.pow(3);
+        let (minimum, maximum, alignment) =
+            gpu_int8_matrix_dataset_range(8 * gib, 128 * 1024 * 1024, [16, 8, 32], 32, 25, None);
+        assert_eq!(minimum, 262656);
+        assert_eq!(alignment, 768);
+        assert_eq!(maximum, 192 * 1024 * 1024);
+        let (_, fp16_maximum, fp16_alignment) =
+            gpu_fp16_matrix_dataset_range(8 * gib, gib, [16, 16, 32], 32, 25, None);
+        let (_, int8_maximum, int8_alignment) =
+            gpu_int8_matrix_dataset_range(8 * gib, gib, [16, 16, 32], 32, 25, None);
+        assert_eq!(fp16_alignment, 2 * int8_alignment);
+        assert_eq!(int8_maximum / fp16_alignment * fp16_alignment, fp16_maximum);
+    }
+
+    #[test]
+    fn fp16_operand_range_reserves_output_and_respects_shader_and_shared_limits() {
+        let gib = 1024_u64.pow(3);
+        let (minimum, maximum, alignment) =
+            gpu_fp16_matrix_dataset_range(8 * gib, gib, [16, 16, 16], 32, 25, None);
+        assert_eq!((minimum, alignment), (262144, 1024));
+        assert_eq!(
+            maximum,
+            (vram_budget_bytes(8 * gib, 25) - 32 * 1024 * 1024) / 1024 * 1024
+        );
+        let (_, binding_limited, _) =
+            gpu_fp16_matrix_dataset_range(80 * gib, 128 * 1024 * 1024, [16, 8, 32], 32, 80, None);
+        assert_eq!(binding_limited, 192 * 1024 * 1024);
+        let (_, shared, _) =
+            gpu_fp16_matrix_dataset_range(8 * gib, gib, [16, 16, 16], 32, 80, Some(3 * gib));
+        assert_eq!(shared, gib - 32 * 1024 * 1024);
+        assert_eq!(
+            gpu_fp16_matrix_dataset_range(8 * gib, gib, [16, 16, 16], 32, 80, Some(gib)).1,
+            0
+        );
+        assert_eq!(
+            gpu_fp16_matrix_dataset_range(8 * gib, gib, [0, 16, 16], 32, 25, None).1,
+            0
+        );
+        assert_eq!(
+            gpu_fp16_matrix_dataset_range(8 * gib, gib, [16, 16, 16], 0, 25, None).1,
+            0
+        );
+    }
+
+    #[test]
     fn cpu_matrix_layout_rounds_down_and_handles_large_budgets() {
         for budget in [0, 12287, 12288, 65536, 1024_u64.pow(4), u64::MAX] {
             let dimension = cpu_matrix_dimension(budget);
@@ -311,21 +510,26 @@ mod tests {
     }
 
     #[test]
-    fn ram_bandwidth_limits_keep_payload_beyond_cache_and_budget_both_buffers() {
+    fn gpu_fp32_sizing_respects_buffers_alignment_and_shared_memory() {
         let gib = 1024_u64.pow(3);
-        let llc = 32 * 1024 * 1024;
-        for workers in [1, 3, 16] {
-            let (minimum, maximum) = ram_bandwidth_payload_range(llc, 16 * gib, workers);
-            assert!(minimum >= 2 * llc + 64 * 1024 * 1024);
-            assert_eq!(minimum % (64 * workers as u64), 0);
-            assert_eq!(maximum % (64 * workers as u64), 0);
-            assert!(2 * maximum <= 16 * gib / 5 * 4);
-            assert!(16 * gib - 2 * maximum >= 2 * gib);
-            assert!(maximum > minimum);
+        for offset in [0, 256, 8192] {
+            let (minimum, maximum, alignment) =
+                gpu_fp32_dataset_range(16 * gib, gib, offset, 25, None);
+            assert!(minimum >= 256 * 1024);
+            assert_eq!(minimum % alignment, 0);
+            assert_eq!(maximum % alignment, 0);
+            assert!(maximum <= 3 * gib);
+            assert!(maximum > gib);
+            let (_, shared, _) = gpu_fp32_dataset_range(16 * gib, gib, offset, 25, Some(3 * gib));
+            assert!(shared <= gib);
         }
-        let (minimum, maximum) = ram_bandwidth_payload_range(llc, gib, 4);
-        assert!(maximum < minimum);
+        assert_eq!(gpu_fp32_dataset_range(0, 0, 0, 25, None).1, 0);
+        assert_eq!(
+            gpu_fp32_dataset_range(16 * gib, gib, 256, 25, Some(gib)).1,
+            0
+        );
     }
+
     #[test]
     fn vram_budget_accepts_only_twenty_to_eighty_percent() {
         let mut config = BenchmarkConfig::default();
