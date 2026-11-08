@@ -259,18 +259,22 @@ fn cooperative_support(
             property.scope == vk::ScopeKHR::SUBGROUP
                 && property.a_type == vk::ComponentTypeKHR::FLOAT16
                 && property.b_type == vk::ComponentTypeKHR::FLOAT16
-                && matches!(
-                    property.c_type,
-                    vk::ComponentTypeKHR::FLOAT16 | vk::ComponentTypeKHR::FLOAT32
-                )
+                && property.c_type == vk::ComponentTypeKHR::FLOAT32
+                && property.saturating_accumulation == vk::FALSE
                 && property.c_type == property.result_type
         })
-        .max_by_key(|property| property.m_size * property.n_size * property.k_size)
-        .map(matrix_shape);
+        .map(matrix_shape)
+        .collect::<Vec<_>>();
+    let fp16_shapes = fp16;
+    let fp16 = fp16_shapes
+        .iter()
+        .copied()
+        .max_by_key(|s| u64::from(s.m) * u64::from(s.n) * u64::from(s.k));
     let int8 = configurations
         .iter()
         .filter(|property| {
             property.scope == vk::ScopeKHR::SUBGROUP
+                && property.saturating_accumulation == vk::FALSE
                 && matches!(
                     property.a_type,
                     vk::ComponentTypeKHR::SINT8 | vk::ComponentTypeKHR::UINT8
@@ -283,14 +287,25 @@ fn cooperative_support(
                 )
                 && property.result_type == property.c_type
         })
-        .max_by_key(|property| property.m_size * property.n_size * property.k_size)
-        .map(matrix_shape);
+        .map(matrix_shape)
+        .collect::<Vec<_>>();
+    let int8_shapes = int8;
+    let int8 = int8_shapes
+        .iter()
+        .copied()
+        .max_by_key(|s| u64::from(s.m) * u64::from(s.n) * u64::from(s.k));
     let reason = if fp16.is_none() && int8.is_none() {
         "cooperative_matrix_formats_unsupported".into()
     } else {
         String::new()
     };
-    Ok(CooperativeSupport { fp16, int8, reason })
+    Ok(CooperativeSupport {
+        fp16,
+        int8,
+        reason,
+        fp16_shapes,
+        int8_shapes,
+    })
 }
 
 fn matrix_shape(property: &vk::CooperativeMatrixPropertiesKHR<'_>) -> MatrixShape {

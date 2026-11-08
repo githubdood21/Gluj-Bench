@@ -1,9 +1,112 @@
 use super::*;
 
+#[test]
+fn shorter_measurement_is_explicit_and_applies_to_the_resolved_queue() {
+    let mut app = fixture();
+    assert!(!app.settings.shorter_run);
+    let condition = gluj_bench_core::legacy_condition(&app.benchmarks[0]);
+    let extensive = resolved_ui_config(
+        &condition,
+        &app.queued_run(GPU_OFFLOAD_ID).unwrap(),
+        &app.devices,
+    )
+    .unwrap();
+    assert_eq!(extensive.samples, 6);
+    assert_eq!(extensive.target_duration_ms, 1500);
+    app.edit_configuration(false, "measurement", 1);
+    let shorter = resolved_ui_config(
+        &condition,
+        &app.queued_run(GPU_OFFLOAD_ID).unwrap(),
+        &app.devices,
+    )
+    .unwrap();
+    assert_eq!(shorter.samples, 3);
+    assert_eq!(shorter.target_duration_ms, 300);
+    app.edit_configuration(false, "measurement", 0);
+    assert!(!app.queued_run(GPU_OFFLOAD_ID).unwrap().settings.shorter_run);
+    let old: AppSettings = serde_json::from_str("{}").unwrap();
+    assert!(!old.shorter_run);
+}
+
+#[test]
+fn phase_one_ui_and_worker_resolve_the_same_explicit_conditions() {
+    let app = fixture();
+    let run = app.queued_run(GPU_OFFLOAD_ID).unwrap();
+    let condition = gluj_bench_core::legacy_condition(&app.benchmarks[0]);
+    let from_ui = resolved_ui_config(&condition, &run, &app.devices).unwrap();
+    let from_worker = condition.resolve(&from_ui, &app.devices).unwrap().config();
+    assert_eq!(from_ui, from_worker);
+    assert!(!from_ui.options.contains_key("cpu_activity_percent"));
+
+    let mut cpu = app.devices[0].clone();
+    cpu.id = "cpu:system".into();
+    cpu.category = DeviceCategory::Cpu;
+    cpu.properties.insert("physical_cores".into(), "16".into());
+    for id in [
+        CPU_VECTOR_ID,
+        CPU_MATRIX_ID,
+        CPU_INT64_ID,
+        CPU_ASCII_ID,
+        GPU_VECTOR_ID,
+        GPU_MATRIX_ID,
+        GPU_INT8_MATRIX_ID,
+    ] {
+        for preset in [0, 1, 6] {
+            let gpu = id.starts_with("gpu.");
+            let mut descriptor = app.benchmarks[0].clone();
+            descriptor.id = id.into();
+            descriptor.supported_device_ids = vec![if gpu {
+                app.devices[0].id.clone()
+            } else {
+                cpu.id.clone()
+            }];
+            let condition = gluj_bench_core::legacy_condition(&descriptor);
+            let mut settings = AppSettings {
+                vector_preset: preset,
+                vector_size: "1 MiB".into(),
+                ..Default::default()
+            };
+            // Explicit custom mode always carries bytes; register choices normalize themselves.
+            settings.dataset_mode = 0;
+            let run = QueuedRun {
+                benchmark_id: id.into(),
+                settings,
+                gpu_id: gpu.then(|| app.devices[0].id.clone()),
+                physical_cores: 16,
+            };
+            let devices = if gpu {
+                vec![app.devices[0].clone()]
+            } else {
+                vec![cpu.clone()]
+            };
+            let resolved = resolved_ui_config(&condition, &run, &devices)
+                .unwrap_or_else(|e| panic!("{id} preset {preset}: {e}"));
+            assert_eq!(
+                condition.resolve(&resolved, &devices).unwrap().config(),
+                resolved
+            );
+        }
+    }
+}
+
+#[test]
+fn phase_one_native_storage_failure_keeps_the_full_record_in_session() {
+    let mut app = fixture();
+    let mut record = gluj_bench_core::RunRecord::start("missing", &Default::default(), vec![]);
+    record.finish(Err(gluj_bench_core::BenchmarkError::new(
+        "cancelled",
+        "user cancelled",
+    )));
+    let message = app.retain_native_response(&json!({"run_record":record,"run_storage":{"saved":false,"error":{"message":"disk full"}}})).unwrap();
+    assert!(message.contains("disk full"));
+    assert_eq!(app.unsaved_native_runs, [record]);
+}
+
 pub(super) fn fixture() -> App {
     let (_, events) = mpsc::channel();
     App {
         page: 1,
+        result_observations: Default::default(),
         worker: WorkerClient {
             child: None,
             input: None,
@@ -51,6 +154,7 @@ pub(super) fn fixture() -> App {
             metadata: BTreeMap::new(),
         }],
         selected_suite: "gpu.performance".into(),
+        condition_descriptors: vec![],
         selected_gpu_id: Some("gpu:fixture".into()),
         selected: Some("gpu.performance.fp32.offload.scaling".into()),
         expanded_device_id: None,
@@ -59,18 +163,27 @@ pub(super) fn fixture() -> App {
         result_presentations: RefCell::default(),
         results: vec![],
         saved_results: vec![],
+        native_history_path: None,
+        unsaved_native_runs: vec![],
         baseline_results: vec![],
         comparison_selection: 0,
         results_file_status: String::new(),
         results_file_writable: false,
         settings: AppSettings::default(),
-        settings_status: "Global settings apply unless a test override is enabled.".into(),
+        settings_status: String::new(),
         settings_writable: false,
         result_component: 0,
         result_selection: 0,
         queue: VecDeque::new(),
+        custom_plan: Vec::new(),
+        active_plan: None,
+        history: phase_eight::HistoryState::default(),
+        presentation: presentation::State::default(),
+        primary_selection: 0,
+        continue_after_cancel: false,
         run_overrides: BTreeMap::new(),
         vector_choices: BTreeMap::new(),
+        family_modes: BTreeMap::new(),
         benchmark_preferences: BenchmarkPreferences::default(),
         benchmark_preferences_path: std::env::temp_dir().join("unused-benchmark-settings.json"),
         benchmark_preferences_writable: false,
@@ -89,7 +202,7 @@ pub(super) fn fixture() -> App {
 }
 
 #[test]
-fn saved_scaling_configurations_restore_the_latest_three_rows() {
+fn saved_scaling_configurations_restore_all_distinct_rows() {
     let path = std::env::temp_dir().join(format!(
         "scaling-results-{}.json",
         SystemTime::now()
@@ -117,17 +230,17 @@ fn saved_scaling_configurations_restore_the_latest_three_rows() {
     let restored = load_results(&path).unwrap();
     fs::remove_file(&path).unwrap();
     let groups = component_results(&restored, "gpu:fixture");
-    assert_eq!(groups.len(), 3);
+    assert_eq!(groups.len(), 5);
     assert_eq!(
         groups.iter().map(|g| g[0].elapsed_ns).collect::<Vec<_>>(),
-        [5, 4, 3]
+        [5, 4, 3, 2, 1]
     );
     assert!(result_configuration_label(groups[0][0]).contains("Custom"));
     assert!(result_configuration_label(groups[0][0]).contains("5.00 MiB"));
 }
 
 #[test]
-fn configurable_results_keep_three_latest_configurations_and_repeat_statistics() {
+fn configurable_results_keep_all_configurations_and_repeat_statistics() {
     let make = |id: &str, device: &str, size: u64, speed: f64| BenchmarkResult {
         benchmark_id: id.into(),
         device_id: device.into(),
@@ -158,17 +271,17 @@ fn configurable_results_keep_three_latest_configurations_and_repeat_statistics()
             .map(|i| make(id, "gpu:fixture", i * 1048576, i as f64))
             .collect::<Vec<_>>();
         let groups = component_results(&results, "gpu:fixture");
-        assert_eq!(groups.len(), 3, "{id}");
+        assert_eq!(groups.len(), 4, "{id}");
         assert_eq!(
             groups
                 .iter()
                 .map(|g| g[0].workload_metadata["requested_dataset_bytes"].as_str())
                 .collect::<Vec<_>>(),
-            ["4194304", "3145728", "2097152"]
+            ["4194304", "3145728", "2097152", "1048576"]
         );
         results.push(make(id, "gpu:fixture", 2 * 1048576, 0.5));
         let groups = component_results(&results, "gpu:fixture");
-        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.len(), 4);
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[0][0].metrics[0].value, 0.5);
         assert_eq!(best_primary(&groups[0]).unwrap().value, 2.0);
@@ -185,7 +298,7 @@ fn configurable_results_keep_three_latest_configurations_and_repeat_statistics()
             .iter()
             .filter(|g| g[0].benchmark_id == id)
             .collect::<Vec<_>>();
-        assert_eq!(configured.len(), 3);
+        assert_eq!(configured.len(), 4);
         assert_eq!(configured[0][0].metrics[0].value, 5.0);
         assert_eq!(configured[1][0].metrics[0].value, 0.5);
         assert_eq!(configured[2][0].metrics[0].value, 4.0);
@@ -193,7 +306,7 @@ fn configurable_results_keep_three_latest_configurations_and_repeat_statistics()
         for result in &results {
             remember_result(&mut saved, result);
         }
-        assert_eq!(component_results(&saved, "gpu:fixture").len(), 4);
+        assert_eq!(component_results(&saved, "gpu:fixture").len(), 5);
     }
 }
 
@@ -225,7 +338,7 @@ fn configuration_rows_distinguish_modes_workers_activity_and_ram_shares() {
         .insert("gpu_activity_percent".into(), "95".into());
     assert_eq!(
         component_results(&[base.clone(), sweep, full_ram, activity], "gpu:fixture").len(),
-        3
+        4
     );
     assert!(result_configuration_label(&base).contains("One size: 1.00 MiB"));
     base.benchmark_id = CPU_VECTOR_ID.into();
@@ -258,7 +371,7 @@ fn offload_legacy_preferences_keep_payload_share_and_global_fallback() {
     fs::remove_file(&path).unwrap();
     let mut app = fixture();
     app.restore_benchmark_preferences(prefs);
-    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 2);
+    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 1);
     let options = run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap());
     assert_eq!(options["ram_offload_percent"], "50");
     assert_eq!(options["dataset_mode"], "single");
@@ -269,7 +382,7 @@ fn offload_legacy_preferences_keep_payload_share_and_global_fallback() {
     let selected = app.snapshot_benchmark_preferences();
     assert_eq!(
         selected.tests[GPU_OFFLOAD_ID].selected_option.as_deref(),
-        Some("single_dataset")
+        Some("curated")
     );
     write_json(&path, &selected).unwrap();
     let round_trip = load_benchmark_preferences(&path).unwrap();
@@ -279,21 +392,143 @@ fn offload_legacy_preferences_keep_payload_share_and_global_fallback() {
 }
 
 #[test]
+fn offload_traffic_rate_is_independent_saved_and_captured_in_queued_runs() {
+    let mut app = fixture();
+    app.select_vector_choice(1);
+    app.edit_configuration(true, "offload-traffic", 0);
+    app.edit_vector_slider(0.0);
+    let baseline = app.queued_run(GPU_OFFLOAD_ID).unwrap();
+    assert!(!run_options(&baseline).contains_key("offload_passes_per_second"));
+    app.edit_configuration(true, "offload-traffic", 2);
+    app.edit_configuration(true, "offload-rate", 100);
+    let paced = app.queued_run(GPU_OFFLOAD_ID).unwrap();
+    assert_eq!(
+        run_options(&paced)["dataset_bytes"],
+        run_options(&baseline)["dataset_bytes"]
+    );
+    assert_eq!(run_options(&paced)["offload_passes_per_second"], "100");
+    app.edit_configuration(true, "offload-rate", 10);
+    assert_eq!(run_options(&paced)["offload_passes_per_second"], "100");
+    let prefs = app.snapshot_benchmark_preferences();
+    let mut reopened = fixture();
+    reopened.restore_benchmark_preferences(prefs);
+    assert_eq!(
+        run_options(&reopened.queued_run(GPU_OFFLOAD_ID).unwrap())["offload_passes_per_second"],
+        "10"
+    );
+    app.select_vector_choice(0);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["offload_passes_per_second"],
+        "100"
+    );
+    app.select_vector_choice(1);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["offload_passes_per_second"],
+        "10"
+    );
+    let before = BenchmarkResult {
+        benchmark_id: GPU_OFFLOAD_ID.into(),
+        device_id: "gpu:test".into(),
+        elapsed_ns: 1,
+        metrics: vec![],
+        workload_metadata: BTreeMap::new(),
+        device_metadata: BTreeMap::new(),
+    };
+    let mut after = before.clone();
+    after
+        .workload_metadata
+        .insert("offload_passes_per_second".into(), "100".into());
+    assert!(!same_run_configuration(&before, &after));
+}
+
+#[test]
+fn static_traffic_defaults_migrate_saved_choices_and_preserve_both_custom_values() {
+    let mut app = fixture();
+    let automatic = run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap());
+    assert_eq!(automatic["offload_passes_per_second"], "100");
+    assert_eq!(automatic["dataset_mode"], "sweep");
+    app.select_vector_choice(1);
+    assert_eq!(app.run_overrides[GPU_OFFLOAD_ID].settings.traffic_mode(), 2);
+    app.edit_configuration(true, "offload-traffic", 1);
+    assert!(app.run_overrides[GPU_OFFLOAD_ID].settings.vector_sweep);
+    app.edit_configuration(true, "offload-bandwidth", 500);
+    let dynamic = app.queued_run(GPU_OFFLOAD_ID).unwrap();
+    assert_eq!(
+        run_options(&dynamic)["offload_traffic_bytes_per_second"],
+        (256_u64 * 1024 * 1024).to_string()
+    );
+    app.edit_configuration(true, "offload-traffic", 2);
+    app.edit_configuration(true, "offload-rate", 10);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["offload_passes_per_second"],
+        "10"
+    );
+    app.edit_configuration(true, "offload-traffic", 1);
+    assert_eq!(
+        run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["offload_traffic_bytes_per_second"],
+        (256_u64 * 1024 * 1024).to_string()
+    );
+    let prefs = app.snapshot_benchmark_preferences();
+    let mut reopened = fixture();
+    reopened.restore_benchmark_preferences(prefs);
+    assert_eq!(
+        reopened.run_overrides[GPU_OFFLOAD_ID]
+            .settings
+            .offload_passes_per_second,
+        10
+    );
+    assert_eq!(
+        reopened.run_overrides[GPU_OFFLOAD_ID]
+            .settings
+            .offload_dynamic_mib_per_second,
+        256
+    );
+    for (legacy, expected) in [
+        (
+            r#"{"offload_traffic_limited":true,"offload_passes_per_second":37}"#,
+            2,
+        ),
+        (r#"{"offload_traffic_limited":false}"#, 0),
+    ] {
+        let saved: AppSettings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(saved.traffic_mode(), expected);
+    }
+    let mut before = BenchmarkResult {
+        benchmark_id: GPU_OFFLOAD_ID.into(),
+        device_id: "gpu:test".into(),
+        elapsed_ns: 1,
+        metrics: vec![],
+        workload_metadata: BTreeMap::new(),
+        device_metadata: BTreeMap::new(),
+    };
+    before.workload_metadata.insert(
+        "offload_traffic_bytes_per_second".into(),
+        "268435456".into(),
+    );
+    let mut after = before.clone();
+    after.workload_metadata.insert(
+        "offload_traffic_bytes_per_second".into(),
+        "536870912".into(),
+    );
+    assert!(!same_run_configuration(&before, &after));
+}
+
+#[test]
 fn offload_choices_default_to_sweep_and_restore_custom_split_and_slider() {
     let mut app = fixture();
-    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 1);
+    assert_eq!(app.compute_choice(GPU_OFFLOAD_ID), 0);
     let sweep = app.queued_run(GPU_OFFLOAD_ID).unwrap();
     let options = run_options(&sweep);
-    assert_eq!(options["gpu_offload_preset"], "budget");
+    assert_eq!(options["gpu_offload_preset"], "custom");
     assert_eq!(options["dataset_mode"], "sweep");
     assert_eq!(options["ram_offload_percent"], "75");
     assert!(!options.contains_key("gpu_preset"));
     app.select_vector_choice(0);
     assert_eq!(
         run_options(&app.queued_run(GPU_OFFLOAD_ID).unwrap())["dataset_mode"],
-        "single"
+        "sweep"
     );
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_configuration(true, "offload", 2);
     app.edit_vector_slider(0.0);
     let custom = app.queued_run(GPU_OFFLOAD_ID).unwrap();
@@ -305,17 +540,17 @@ fn offload_choices_default_to_sweep_and_restore_custom_split_and_slider() {
         "small"
     );
     app.edit_configuration(true, "offload-preset", 3);
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     let prefs = app.snapshot_benchmark_preferences();
     assert_eq!(
         prefs.tests[GPU_OFFLOAD_ID].selected_option.as_deref(),
-        Some("data_sizes")
+        Some("curated")
     );
     let mut reopened = fixture();
     reopened.restore_benchmark_preferences(prefs);
-    assert_eq!(reopened.compute_choice(GPU_OFFLOAD_ID), 1);
+    assert_eq!(reopened.compute_choice(GPU_OFFLOAD_ID), 0);
     assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
-    reopened.select_vector_choice(2);
+    reopened.select_vector_choice(1);
     assert_eq!(
         reopened.queued_run(GPU_OFFLOAD_ID).unwrap().settings,
         custom.settings
@@ -329,7 +564,7 @@ fn offload_choices_default_to_sweep_and_restore_custom_split_and_slider() {
     );
     assert_eq!(range.maximum % range.alignment, 0);
     reopened.reset_vector_configuration();
-    assert_eq!(reopened.compute_choice(GPU_OFFLOAD_ID), 1);
+    assert_eq!(reopened.compute_choice(GPU_OFFLOAD_ID), 0);
     assert_eq!(run_options(&sweep)["dataset_mode"], "sweep");
     let invalid = AppSettings {
         vector_preset: 1,
@@ -409,26 +644,33 @@ fn automatic_choices_use_full_cpu_allocation_and_preserve_custom_settings() {
     assert_eq!(app.vector_choice(), 0);
     assert_eq!(
         run_options(&app.queued_run(CPU_VECTOR_ID).unwrap())["vector_preset"],
-        "register"
+        "custom"
     );
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     let sweep = app.queued_run(CPU_VECTOR_ID).unwrap();
-    assert_eq!(run_options(&sweep)["vector_preset"], "ram");
+    assert_eq!(run_options(&sweep)["vector_preset"], "custom");
     assert_eq!(run_options(&sweep)["dataset_mode"], "sweep");
     assert_eq!(run_options(&sweep)["cpu_core_limit"], "8");
     app.select_vector_choice(0);
     let register = app.queued_run(CPU_VECTOR_ID).unwrap();
-    assert_eq!(run_options(&register)["vector_preset"], "register");
-    assert!(!run_options(&register).contains_key("dataset_bytes"));
+    assert_eq!(run_options(&register)["vector_preset"], "custom");
+    assert!(
+        run_options(&register)["dataset_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            <= CURATED_DATASET_BYTES
+    );
     assert_eq!(run_options(&register)["cpu_core_limit"], "8");
     app.dataset_text = "256".into();
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_configuration(true, "vector-preset", 6);
     app.edit_configuration(true, "vector-mode", 0);
     app.edit_configuration(true, "cores", 3);
     app.edit_vector_slider(300.0);
     let custom = app.queued_run(CPU_VECTOR_ID).unwrap();
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     assert_eq!(
         app.queued_run(CPU_VECTOR_ID)
             .unwrap()
@@ -436,7 +678,7 @@ fn automatic_choices_use_full_cpu_allocation_and_preserve_custom_settings() {
             .cpu_core_limit,
         0
     );
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     let restored = app.queued_run(CPU_VECTOR_ID).unwrap();
     assert_eq!(restored.settings.cpu_core_limit, 3);
     assert_eq!(restored.settings.vector_size, custom.settings.vector_size);
@@ -444,7 +686,7 @@ fn automatic_choices_use_full_cpu_allocation_and_preserve_custom_settings() {
     assert_eq!(run_options(&sweep)["dataset_mode"], "sweep");
     app.active_request = Some("running".into());
     app.select_vector_choice(0);
-    assert_eq!(app.vector_choice(), 2);
+    assert_eq!(app.vector_choice(), 1);
 }
 
 #[test]
@@ -470,13 +712,13 @@ fn benchmark_preferences_restore_choices_and_custom_settings_across_launches() {
         .properties
         .insert("physical_cores".into(), "8".into());
     assert_eq!(app.vector_choice(), 0);
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_configuration(true, "cores", 3);
     app.edit_configuration(true, "vector-mode", 0);
     app.edit_vector_slider(350.0);
     let custom = app.run_overrides[CPU_VECTOR_ID].clone();
     let queued = app.queued_run(CPU_VECTOR_ID).unwrap();
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     let gpu = "gpu.performance.fp32.offload.scaling";
     app.selected = Some(gpu.into());
     let settings = AppSettings {
@@ -495,7 +737,7 @@ fn benchmark_preferences_restore_choices_and_custom_settings_across_launches() {
     let disk = load_benchmark_preferences(&path).unwrap();
     assert_eq!(
         disk.tests[CPU_VECTOR_ID].selected_option.as_deref(),
-        Some("data_sizes")
+        Some("curated")
     );
     assert_eq!(disk.tests[CPU_VECTOR_ID].custom.as_ref().unwrap(), &custom);
     assert_eq!(
@@ -514,11 +756,11 @@ fn benchmark_preferences_restore_choices_and_custom_settings_across_launches() {
         .properties
         .insert("physical_cores".into(), "8".into());
     reopened.restore_benchmark_preferences(disk);
-    assert_eq!(reopened.vector_choice(), 1);
+    assert_eq!(reopened.vector_choice(), 0);
     assert_eq!(reopened.run_overrides[CPU_VECTOR_ID], custom);
     assert_eq!(reopened.effective_settings(gpu).unwrap().dataset_mib, 128);
     reopened.selected = Some(CPU_VECTOR_ID.into());
-    reopened.select_vector_choice(2);
+    reopened.select_vector_choice(1);
     assert_eq!(
         reopened.queued_run(CPU_VECTOR_ID).unwrap().settings,
         queued.settings
@@ -528,7 +770,7 @@ fn benchmark_preferences_restore_choices_and_custom_settings_across_launches() {
         load_benchmark_preferences(&path).unwrap().tests[CPU_VECTOR_ID]
             .selected_option
             .as_deref(),
-        Some("compute_speed")
+        Some("curated")
     );
     reopened.reset_vector_configuration();
     let reset = load_benchmark_preferences(&path).unwrap();
@@ -610,9 +852,9 @@ fn invalid_preferences_are_preserved_and_write_failures_keep_session_choices() {
         let mut app = fixture();
         app.benchmark_preferences_path = path.clone();
         app.selected = Some(CPU_VECTOR_ID.into());
-        app.select_vector_choice(1);
+        app.select_vector_choice(0);
         assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
-        assert_eq!(app.vector_choice(), 1);
+        assert_eq!(app.vector_choice(), 0);
     }
     let mut app = fixture();
     app.selected = Some(CPU_VECTOR_ID.into());
@@ -620,8 +862,8 @@ fn invalid_preferences_are_preserved_and_write_failures_keep_session_choices() {
         .join("missing-parent")
         .join("benchmark-settings.json");
     app.benchmark_preferences_writable = true;
-    app.select_vector_choice(1);
-    assert_eq!(app.vector_choice(), 1);
+    app.select_vector_choice(0);
+    assert_eq!(app.vector_choice(), 0);
     assert!(
         app.benchmark_preferences_status
             .contains("could not be saved")
@@ -655,7 +897,7 @@ fn different_ram_bandwidth_payloads_remain_separate_in_history() {
 }
 
 #[test]
-fn retired_ram_size_preferences_do_not_override_the_default_payload() {
+fn obsolete_ram_keys_do_not_change_defaults_and_current_size_preferences_are_honored() {
     let preferences: BenchmarkPreferences = serde_json::from_value(json!({
         "version": 1,
         "tests": { "cpu.bandwidth.memory": { "custom": {
@@ -668,14 +910,18 @@ fn retired_ram_size_preferences_do_not_override_the_default_payload() {
     let queued = app.queued_run(CPU_RAM_BANDWIDTH_ID).unwrap();
     let options = run_options(&queued);
     assert_eq!(options["cpu_activity_percent"], "95");
-    for field in [
-        "ram_bandwidth_mode",
-        "ram_bandwidth_bytes",
-        "dataset_mode",
-        "dataset_bytes",
-    ] {
+    for field in ["ram_bandwidth_mode", "ram_bandwidth_bytes", "dataset_bytes"] {
         assert!(!options.contains_key(field));
     }
+    assert_eq!(options["dataset_mode"], "automatic");
+    let mut custom = queued.clone();
+    custom.settings.dataset_mode = 2;
+    custom.settings.dataset_mib = 64;
+    let options = run_options(&custom);
+    assert_eq!(options["dataset_mode"], "single");
+    assert_eq!(options["dataset_bytes"], "67108864");
+    custom.settings.dataset_mode = 1;
+    assert_eq!(run_options(&custom)["dataset_mode"], "sweep");
     let saved = serde_json::to_value(app.snapshot_benchmark_preferences()).unwrap();
     let settings = &saved["tests"][CPU_RAM_BANDWIDTH_ID]["custom"]["settings"];
     assert!(settings.get("ram_bandwidth_custom").is_none());
@@ -698,16 +944,23 @@ fn gpu_fp32_choices_sizes_and_adapter_snapshots_are_independent() {
         ("min_storage_buffer_offset_alignment".into(), "256".into()),
     ]);
     let defaults = run_options(&app.queued_run(GPU_VECTOR_ID).unwrap());
-    assert_eq!(defaults["gpu_preset"], "register");
-    assert_eq!(defaults["dataset_mode"], "register");
-    assert!(!defaults.contains_key("dataset_bytes"));
+    assert_eq!(defaults["gpu_preset"], "custom");
+    assert_eq!(defaults["dataset_mode"], "sweep");
+    assert!(
+        defaults["dataset_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            <= CURATED_DATASET_BYTES
+    );
     assert!(!defaults.contains_key("vector_preset"));
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     assert_eq!(
         run_options(&app.queued_run(GPU_VECTOR_ID).unwrap())["gpu_preset"],
-        "vram"
+        "custom"
     );
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_vector_slider(0.0);
     let queued = app.queued_run(GPU_VECTOR_ID).unwrap();
     assert_eq!(run_options(&queued)["dataset_bytes"], "270336");
@@ -732,7 +985,7 @@ fn gpu_fp32_choices_sizes_and_adapter_snapshots_are_independent() {
     assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
     assert_eq!(reopened.compute_choice(CPU_VECTOR_ID), 0);
     reopened.selected = Some(GPU_VECTOR_ID.into());
-    reopened.select_vector_choice(2);
+    reopened.select_vector_choice(1);
     assert_eq!(
         reopened.queued_run(GPU_VECTOR_ID).unwrap().settings,
         custom.settings
@@ -763,13 +1016,13 @@ fn gpu_matrix_choices_use_operand_limits_and_save_independently() {
         ("storage_buffer_16bit_access".into(), "true".into()),
     ]);
     let defaults = run_options(&app.queued_run(GPU_MATRIX_ID).unwrap());
-    assert_eq!(defaults["gpu_matrix_preset"], "register");
+    assert_eq!(defaults["gpu_matrix_preset"], "custom");
     assert!(!defaults.contains_key("gpu_preset"));
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     let sweep = run_options(&app.queued_run(GPU_MATRIX_ID).unwrap());
-    assert_eq!(sweep["gpu_matrix_preset"], "vram");
+    assert_eq!(sweep["gpu_matrix_preset"], "custom");
     assert_eq!(sweep["dataset_mode"], "sweep");
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_vector_slider(0.0);
     let custom = app.queued_run(GPU_MATRIX_ID).unwrap();
     assert_eq!(run_options(&custom)["dataset_bytes"], "262144");
@@ -784,7 +1037,7 @@ fn gpu_matrix_choices_use_operand_limits_and_save_independently() {
     let mut reopened = fixture();
     reopened.devices = app.devices.clone();
     reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
-    assert_eq!(reopened.compute_choice(GPU_MATRIX_ID), 2);
+    assert_eq!(reopened.compute_choice(GPU_MATRIX_ID), 1);
     assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
     assert_eq!(
         reopened.queued_run(GPU_MATRIX_ID).unwrap().settings,
@@ -833,13 +1086,13 @@ fn gpu_int8_matrix_choices_use_operand_limits_and_save_independently() {
         ("storage_buffer_8bit_access".into(), "true".into()),
     ]);
     let defaults = run_options(&app.queued_run(GPU_INT8_MATRIX_ID).unwrap());
-    assert_eq!(defaults["gpu_int8_matrix_preset"], "register");
+    assert_eq!(defaults["gpu_int8_matrix_preset"], "custom");
     assert!(!defaults.contains_key("gpu_preset"));
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     let sweep = run_options(&app.queued_run(GPU_INT8_MATRIX_ID).unwrap());
-    assert_eq!(sweep["gpu_int8_matrix_preset"], "vram");
+    assert_eq!(sweep["gpu_int8_matrix_preset"], "custom");
     assert_eq!(sweep["dataset_mode"], "sweep");
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_vector_slider(0.0);
     let custom = app.queued_run(GPU_INT8_MATRIX_ID).unwrap();
     assert_eq!(run_options(&custom)["dataset_bytes"], "262144");
@@ -854,7 +1107,7 @@ fn gpu_int8_matrix_choices_use_operand_limits_and_save_independently() {
     let mut reopened = fixture();
     reopened.devices = app.devices.clone();
     reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
-    assert_eq!(reopened.compute_choice(GPU_INT8_MATRIX_ID), 2);
+    assert_eq!(reopened.compute_choice(GPU_INT8_MATRIX_ID), 1);
     assert_eq!(reopened.compute_choice(GPU_VECTOR_ID), 0);
     assert_eq!(
         reopened.queued_run(GPU_INT8_MATRIX_ID).unwrap().settings,
@@ -1059,37 +1312,44 @@ fn old_gpu_int8_matrix_history_and_preferences_migrate_without_scaling_graphs() 
 }
 
 #[test]
-fn integer_choices_preserve_register_default_and_independent_custom_settings() {
+fn integer_choices_use_curated_default_and_independent_custom_settings() {
     let mut app = fixture();
     app.selected = Some(CPU_INT64_ID.into());
     app.devices[0]
         .properties
         .insert("physical_cores".into(), "4".into());
     let default = run_options(&app.queued_run(CPU_INT64_ID).unwrap());
-    assert_eq!(default["int64_preset"], "register");
-    assert_eq!(default["dataset_mode"], "register");
-    assert!(!default.contains_key("dataset_bytes"));
+    assert_eq!(default["int64_preset"], "custom");
+    assert_eq!(default["dataset_mode"], "sweep");
+    assert!(
+        default["dataset_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            <= CURATED_DATASET_BYTES
+    );
     assert!(!default.contains_key("vector_preset"));
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_configuration(true, "cores", 2);
     app.edit_vector_slider(0.0);
     let custom = app.queued_run(CPU_INT64_ID).unwrap();
     assert_eq!(run_options(&custom)["dataset_bytes"], "2048");
     assert_eq!(run_options(&custom)["dataset_mode"], "single");
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     let sweep = run_options(&app.queued_run(CPU_INT64_ID).unwrap());
-    assert_eq!(sweep["int64_preset"], "ram");
+    assert_eq!(sweep["int64_preset"], "custom");
     assert_eq!(sweep["dataset_mode"], "sweep");
     assert_eq!(sweep["cpu_core_limit"], "4");
     let mut reopened = fixture();
     reopened.devices = app.devices.clone();
     reopened.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
-    assert_eq!(reopened.compute_choice(CPU_INT64_ID), 1);
+    assert_eq!(reopened.compute_choice(CPU_INT64_ID), 0);
     for id in [CPU_VECTOR_ID, CPU_MATRIX_ID, CPU_ASCII_ID] {
         assert_eq!(reopened.compute_choice(id), 0);
     }
     reopened.selected = Some(CPU_INT64_ID.into());
-    reopened.select_vector_choice(2);
+    reopened.select_vector_choice(1);
     assert_eq!(
         reopened.queued_run(CPU_INT64_ID).unwrap().settings,
         custom.settings
@@ -1097,7 +1357,7 @@ fn integer_choices_preserve_register_default_and_independent_custom_settings() {
     reopened.reset_vector_configuration();
     assert_eq!(
         run_options(&reopened.queued_run(CPU_INT64_ID).unwrap())["int64_preset"],
-        "register"
+        "custom"
     );
     let range = DatasetSliderRange::for_integer(3, 65537);
     assert_eq!(range.minimum, 3072);
@@ -1172,16 +1432,16 @@ fn ascii_choices_preserve_custom_settings_and_remain_independent() {
         .properties
         .insert("physical_cores".into(), "4".into());
     let options = run_options(&app.queued_run(CPU_ASCII_ID).unwrap());
-    assert_eq!(options["ascii_preset"], "compute");
-    assert_eq!(options["dataset_mode"], "single");
+    assert_eq!(options["ascii_preset"], "custom");
+    assert_eq!(options["dataset_mode"], "sweep");
     assert_eq!(options["cpu_core_limit"], "4");
     assert!(!options.contains_key("vector_preset"));
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_configuration(true, "cores", 2);
     app.edit_vector_slider(0.0);
     let custom = app.queued_run(CPU_ASCII_ID).unwrap();
     assert_eq!(run_options(&custom)["dataset_bytes"], "128");
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     assert_eq!(
         run_options(&app.queued_run(CPU_ASCII_ID).unwrap())["dataset_mode"],
         "sweep"
@@ -1192,11 +1452,11 @@ fn ascii_choices_preserve_custom_settings_and_remain_independent() {
         .properties
         .insert("physical_cores".into(), "4".into());
     reopened.restore_benchmark_preferences(saved);
-    assert_eq!(reopened.compute_choice(CPU_ASCII_ID), 1);
+    assert_eq!(reopened.compute_choice(CPU_ASCII_ID), 0);
     assert_eq!(reopened.compute_choice(CPU_MATRIX_ID), 0);
     assert_eq!(reopened.compute_choice(CPU_VECTOR_ID), 0);
     reopened.selected = Some(CPU_ASCII_ID.into());
-    reopened.select_vector_choice(2);
+    reopened.select_vector_choice(1);
     assert_eq!(
         reopened.queued_run(CPU_ASCII_ID).unwrap().settings,
         custom.settings
@@ -1290,16 +1550,16 @@ fn matrix_choices_and_saved_settings_are_independent_of_vector_choices() {
         .insert("physical_cores".into(), "4".into());
     app.selected = Some(CPU_MATRIX_ID.into());
     let automatic = app.queued_run(CPU_MATRIX_ID).unwrap();
-    assert_eq!(run_options(&automatic)["matrix_preset"], "compute");
-    assert_eq!(run_options(&automatic)["dataset_mode"], "single");
+    assert_eq!(run_options(&automatic)["matrix_preset"], "custom");
+    assert_eq!(run_options(&automatic)["dataset_mode"], "sweep");
     assert!(!run_options(&automatic).contains_key("vector_preset"));
-    app.select_vector_choice(2);
+    app.select_vector_choice(1);
     app.edit_configuration(true, "cores", 2);
     app.edit_vector_slider(0.0);
     let custom = app.queued_run(CPU_MATRIX_ID).unwrap();
     assert_eq!(run_options(&custom)["dataset_bytes"], "24576");
     assert_eq!(run_options(&custom)["matrix_preset"], "custom");
-    app.select_vector_choice(1);
+    app.select_vector_choice(0);
     assert_eq!(
         run_options(&app.queued_run(CPU_MATRIX_ID).unwrap())["dataset_mode"],
         "sweep"
@@ -1318,9 +1578,9 @@ fn matrix_choices_and_saved_settings_are_independent_of_vector_choices() {
         .properties
         .insert("physical_cores".into(), "4".into());
     restored.restore_benchmark_preferences(load_benchmark_preferences(&path).unwrap());
-    assert_eq!(restored.compute_choice(CPU_MATRIX_ID), 1);
+    assert_eq!(restored.compute_choice(CPU_MATRIX_ID), 0);
     restored.selected = Some(CPU_MATRIX_ID.into());
-    restored.select_vector_choice(2);
+    restored.select_vector_choice(1);
     assert_eq!(
         restored.queued_run(CPU_MATRIX_ID).unwrap().settings,
         custom.settings
@@ -1505,7 +1765,7 @@ fn global_defaults_overrides_and_queue_snapshots_are_independent() {
     assert!(app.effective_settings(&id).is_err());
     app.selected_gpu_id = Some("gpu:fixture".into());
     assert_eq!(app.effective_settings(&id).unwrap().dataset_mode, 0);
-    assert_eq!(app.effective_settings(&id).unwrap().ram_offload_percent, 50);
+    assert_eq!(app.effective_settings(&id).unwrap().ram_offload_percent, 75);
     let ordinary = app.queued_run("gpu.performance.fp32").unwrap();
     assert!(!run_options(&ordinary).contains_key("dataset_bytes"));
 }
@@ -1747,7 +2007,8 @@ fn render_vector_configuration_previews() {
                 dataset_text: "256".into(),
             },
         );
-        app.vector_choices.insert(id.into(), choice);
+        app.vector_choices
+            .insert(id.into(), if choice == 2 { 1 } else { 0 });
         if choice != 2 {
             app.run_overrides.clear();
         }
@@ -1778,9 +2039,9 @@ fn render_vector_configuration_previews() {
         fs::write(directory.join(format!("{name}.ppm")), image).unwrap();
     }
 
-    // Switching between automatic modes and full customization must preserve
-    // custom controls without requiring the old override checkbox.
+    // Switching between Curated and Customized must preserve custom controls.
     app.run_overrides.clear();
+    app.vector_choices.clear();
     app.selected = Some(CPU_VECTOR_ID.into());
     app.benchmarks[0].id = CPU_VECTOR_ID.into();
     app.benchmarks[0].name = "AVX2 FP32 vector compute".into();
@@ -1805,8 +2066,8 @@ fn render_vector_configuration_previews() {
     }
     fs::write(directory.join("vector-interaction-start.ppm"), image).unwrap();
     assert!(!window.get_test_override_enabled());
-    assert_eq!(window.get_test_vector_choice_index(), 1);
-    window.invoke_select_vector_choice(2);
+    assert_eq!(window.get_test_vector_choice_index(), 0);
+    window.invoke_select_vector_choice(1);
     App::refresh(&window, &app.borrow());
     assert!(app.borrow().run_overrides.contains_key(CPU_VECTOR_ID));
     assert!(window.get_test_override_enabled());
@@ -1820,16 +2081,16 @@ fn render_vector_configuration_previews() {
     window.invoke_select_vector_choice(0);
     App::refresh(&window, &app.borrow());
     assert_eq!(window.get_test_vector_choice_index(), 0);
-    assert_eq!(window.get_test_vector_preset_index(), 1);
+    assert_eq!(window.get_test_vector_preset_index(), 6);
     assert_eq!(window.get_test_core_value(), 4.0);
-    window.invoke_select_vector_choice(2);
+    window.invoke_select_vector_choice(1);
     App::refresh(&window, &app.borrow());
     assert_eq!(window.get_test_vector_preset_index(), 6);
     window.set_configuration_scroll_offset(-100.0);
     window.invoke_select_benchmark("cpu.performance.integer.i64".into());
     App::refresh(&window, &app.borrow());
     assert!(!window.get_test_override_enabled());
-    assert_eq!(window.get_test_vector_preset_index(), 1);
+    assert_eq!(window.get_test_vector_preset_index(), 6);
     assert_eq!(window.get_test_core_value(), 4.0);
     window.invoke_select_benchmark(CPU_VECTOR_ID.into());
     App::refresh(&window, &app.borrow());
@@ -1842,7 +2103,7 @@ fn render_vector_configuration_previews() {
     App::refresh(&window, &app.borrow());
     assert!(!window.get_test_override_enabled());
     assert_eq!(window.get_test_vector_choice_index(), 0);
-    assert_eq!(window.get_test_vector_preset_index(), 1);
+    assert_eq!(window.get_test_vector_preset_index(), 6);
 }
 
 #[test]
@@ -1930,7 +2191,8 @@ fn render_gpu_configuration_previews() {
             (2, 2, 1280, 820, "gpu-fp32-small"),
             (2, 6, 980, 680, "gpu-fp32-custom-min"),
         ] {
-            app.vector_choices.insert(id.into(), choice);
+            app.vector_choices
+                .insert(id.into(), if choice == 2 { 1 } else { 0 });
             app.run_overrides.clear();
             if choice == 2 {
                 app.run_overrides.insert(
@@ -1989,10 +2251,7 @@ fn render_gpu_configuration_previews() {
             )
             .unwrap();
             assert!(!window.get_test_is_cpu());
-            assert_eq!(
-                window.get_test_vector_register(),
-                choice == 0 && id != GPU_OFFLOAD_ID
-            );
+            assert!(!window.get_test_vector_register());
         }
     }
 }
@@ -2014,7 +2273,9 @@ fn render_configuration_previews() {
     let adapter = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(Headless(adapter.clone()))).unwrap();
     let window = MainWindow::new().unwrap();
-    window.on_chart_point_at(super::chart_hover::nearest);
+    window
+        .global::<ChartInteraction>()
+        .on_point_at(super::chart_hover::nearest);
     let mut app = fixture();
     let id = app.selected.clone().unwrap();
     let mut settings = app.settings.clone();
@@ -2033,10 +2294,18 @@ fn render_configuration_previews() {
         (1, 980, 680, "test-override-min"),
         (1, 1280, 820, "test-override-options"),
         (3, 1280, 820, "global-settings"),
+        (2, 1280, 820, "tuning-visuals-gap"),
+        (2, 980, 680, "tuning-visuals-gap-min"),
+        (2, 1280, 820, "tuning-visuals-gap-compact"),
+        (2, 980, 680, "tuning-visuals-gap-compact-min"),
         (2, 1280, 820, "snapshot-picker"),
         (2, 980, 680, "snapshot-picker-min"),
         (2, 1280, 820, "scaling-history"),
         (2, 980, 680, "scaling-history-min"),
+        (2, 1280, 820, "queued-work"),
+        (2, 980, 680, "queued-work-min"),
+        (2, 1280, 820, "offered-load"),
+        (2, 980, 680, "offered-load-min"),
         (2, 1280, 820, "gpu-timings"),
         (2, 980, 680, "gpu-timings-min"),
         (2, 1280, 820, "tuning-visuals"),
@@ -2054,7 +2323,27 @@ fn render_configuration_previews() {
         (2, 980, 680, "ram-latency-min"),
         (2, 1280, 820, "cache-latency"),
         (2, 980, 680, "cache-latency-min"),
+        (1, 1280, 820, "offload-traffic-settings"),
+        (1, 980, 680, "offload-traffic-settings-min"),
+        (1, 1280, 820, "offload-traffic-dynamic-settings"),
+        (1, 980, 680, "offload-traffic-dynamic-settings-min"),
     ] {
+        if name.starts_with("offload-traffic") {
+            app = fixture();
+            app.select_vector_choice(1);
+            let settings = &mut app.run_overrides.get_mut(GPU_OFFLOAD_ID).unwrap().settings;
+            settings.vector_preset = 6;
+            settings.vector_size = "2 MiB".into();
+            settings.vector_sweep = false;
+            settings.offload_traffic_limited = Some(true);
+            settings.offload_traffic_mode = Some(2);
+            settings.offload_passes_per_second = 100;
+            if name.contains("dynamic") {
+                settings.offload_traffic_mode = Some(1);
+                settings.vector_sweep = true;
+                settings.vector_size = "3 GiB".into();
+            }
+        }
         app.page = page;
         if page == 2 {
             use gluj_bench_core::SampleStatistics;
@@ -2114,6 +2403,51 @@ fn render_configuration_previews() {
                 ]),
                 device_metadata: BTreeMap::new(),
             }];
+            if name.starts_with("offered-load") || name.starts_with("queued-work") {
+                let result = &mut app.results[0];
+                result
+                    .workload_metadata
+                    .insert("traffic_generation_policy".into(), "offered_load_v1".into());
+                result.metrics.clear();
+                for (bytes, requested, delivered, delay, pending) in [
+                    (67108864_u64, 6e12, 2e12, 45e6, 67.0),
+                    (134217728, 12e12, 2e12, 75e6, 83.0),
+                    (268435456, 24e12, 2e12, 95e6, 92.0),
+                ] {
+                    let (delay, pending) = if name.starts_with("queued-work") {
+                        match bytes {
+                            67108864 => (2.5e6, 0.0),
+                            134217728 => (7.5e6, 0.0),
+                            _ => (14.8e6, 20.0),
+                        }
+                    } else {
+                        (delay, pending)
+                    };
+                    for (suffix, value, unit) in [
+                        ("compute", delivered, "operations/s"),
+                        ("requested_compute", requested, "operations/s"),
+                        ("host_bandwidth", delivered / 100.0, "bytes/s"),
+                        ("requested_host_bandwidth", requested / 100.0, "bytes/s"),
+                        ("end_to_end_time", delay, "ns"),
+                        ("observation_window", 200e6, "ns"),
+                        ("gpu_execution_time", 2e6, "ns"),
+                        (
+                            "oldest_pending_age",
+                            if pending > 0.0 { 190e6 } else { 0.0 },
+                            "ns",
+                        ),
+                        ("demand_fulfillment", delivered / requested * 100.0, "%"),
+                        ("completed_requests", 100.0 - pending, "requests"),
+                        ("unserved_requests", pending, "requests"),
+                    ] {
+                        result.metrics.push(metric(
+                            &format!("working_set_{bytes}.{suffix}"),
+                            value,
+                            unit,
+                        ));
+                    }
+                }
+            }
             if name.starts_with("tuning-visuals") {
                 let result = &mut app.results[0];
                 result.metrics = vec![
@@ -2132,6 +2466,36 @@ fn render_configuration_previews() {
                 ] {
                     result.workload_metadata.insert(key.into(), value.into());
                 }
+            }
+            if name.starts_with("tuning-visuals-gap") {
+                let result = &mut app.results[0];
+                result.benchmark_id = GPU_MATRIX_ID.into();
+                result.metrics = vec![
+                    metric("measured_compute_ceiling", 105.83e12, "operations/s"),
+                    metric("working_set_268435456.compute", 56.78e12, "operations/s"),
+                    metric("working_set_268435456.bandwidth", 890.66e9, "bytes/s"),
+                ];
+                result.metrics[0].statistics.standard_deviation = 105.83e12 * 0.12;
+                result.metrics[1].statistics.standard_deviation = 56.78e12 * 0.053;
+                if name.contains("compact") {
+                    let mut small = metric("working_set_262144.compute", 93.18e12, "operations/s");
+                    small.statistics.standard_deviation = 93.18e12 * 0.01;
+                    result.metrics.push(small);
+                }
+                result.workload_metadata = BTreeMap::from([
+                    ("gpu_matrix_preset".into(), "custom".into()),
+                    ("dataset_mode".into(), "single".into()),
+                    ("compute_reference_drift_percent".into(), "6.5".into()),
+                    (
+                        "allocated_test_buffer_bytes".into(),
+                        (257_u64 * 1024 * 1024).to_string(),
+                    ),
+                    ("allocation_budget_bytes".into(), (6_u64 << 30).to_string()),
+                    (
+                        "tuning_guidance".into(),
+                        "No frequency-limit trial suggested.".into(),
+                    ),
+                ]);
             }
             if name.starts_with("latest-details") {
                 let result = &mut app.results[0];
@@ -2181,7 +2545,7 @@ fn render_configuration_previews() {
                 assert_eq!(component_results(&app.results, "gpu:fixture").len(), 3);
                 app.result_selection = 0;
             }
-            app.result_details_expanded = !name.starts_with("tuning-visuals");
+            app.result_details_expanded = true;
             if name.starts_with("ram-latency") || name.starts_with("cache-latency") {
                 app.devices = vec![DeviceDescriptor {
                     id: "cpu:system".into(),
@@ -2261,6 +2625,9 @@ fn render_configuration_previews() {
             }).collect();
         }
         App::refresh(&window, &app);
+        if name.starts_with("queued-work") {
+            window.set_profile_selection(if name.ends_with("-min") { 1 } else { 0 });
+        }
         if name.starts_with("snapshot-picker") {
             let summaries = window.get_result_summaries();
             let details = window.get_selected_result();
@@ -2286,9 +2653,21 @@ fn render_configuration_previews() {
             assert!(window.get_snapshot_ready());
             assert!(window.get_result_summaries() == summaries);
         }
-        window.set_tuning_details_expanded(name.starts_with("tuning-visuals"));
         adapter.set_size(slint::PhysicalSize::new(width, height));
         window.show().unwrap();
+        if name.starts_with("offload-traffic") {
+            let mut initial = vec![slint::Rgb8Pixel::default(); width as usize * height as usize];
+            adapter.draw_if_needed(|renderer| {
+                renderer.render(&mut initial, width as usize);
+            });
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(width as f32 - 100.0, 400.0),
+                    delta_x: 0.0,
+                    delta_y: -450.0,
+                });
+        }
         if name == "test-override-options" {
             window
                 .window()
@@ -2319,10 +2698,14 @@ fn render_configuration_previews() {
                         -280.0
                     } else if name.starts_with("chart-") {
                         -850.0
+                    } else if name.starts_with("queued-work") {
+                        if width > 1000 { -1450.0 } else { -1250.0 }
                     } else if name == "timing-hover" {
                         -1350.0
                     } else if name.starts_with("latest-details") {
                         -480.0
+                    } else if name.starts_with("offered-load") {
+                        -520.0
                     } else if name.starts_with("tuning-visuals") {
                         if name.contains("charts") {
                             -1040.0
@@ -2337,19 +2720,69 @@ fn render_configuration_previews() {
                 });
         }
         if name.starts_with("chart-") || name == "timing-hover" {
-            let position = if name.starts_with("chart-guide") {
-                if width > 1000 {
-                    slint::LogicalPosition::new(800.0, 330.0)
-                } else {
-                    slint::LogicalPosition::new(650.0, 315.0)
+            // Locate the rendered chart instead of assuming its old page offset.
+            let mut initial = vec![slint::Rgb8Pixel::default(); width as usize * height as usize];
+            adapter.draw_if_needed(|renderer| {
+                renderer.render(&mut initial, width as usize);
+            });
+            let background = |pixel: &slint::Rgb8Pixel| (pixel.r, pixel.g, pixel.b) == (16, 28, 41);
+            let rows = (0..height as usize)
+                .filter(|y| {
+                    initial[y * width as usize..(y + 1) * width as usize]
+                        .iter()
+                        .skip(260)
+                        .filter(|p| background(p))
+                        .count()
+                        > width as usize / 4
+                })
+                .collect::<Vec<_>>();
+            let mut tops = Vec::new();
+            let mut previous = None;
+            for y in rows {
+                if previous.is_none_or(|last| y > last + 12) {
+                    tops.push(y);
                 }
-            } else if name == "timing-hover" {
-                slint::LogicalPosition::new(1042.0, 350.0)
-            } else if width > 1000 {
-                slint::LogicalPosition::new(564.0, 302.0)
+                previous = Some(y);
+            }
+            let top = if name == "timing-hover" {
+                *tops.last().expect("visible timing chart")
             } else {
-                slint::LogicalPosition::new(477.0, 286.0)
+                tops[0]
             };
+            let row = &initial[(top + 12) * width as usize..(top + 13) * width as usize];
+            let left = row
+                .iter()
+                .enumerate()
+                .skip(260)
+                .find(|(_, p)| background(p))
+                .unwrap()
+                .0;
+            let right = row
+                .iter()
+                .enumerate()
+                .rfind(|(_, p)| background(p))
+                .unwrap()
+                .0
+                + 1;
+            let chart_width = (right - left) as f32;
+            let details = window.get_selected_result();
+            let points = if name == "timing-hover" {
+                details.gpu_timing_points
+            } else {
+                details.profile_points
+            };
+            let point = points
+                .row_data(if name == "timing-hover" { 2 } else { 1 })
+                .expect("chart has repeated dataset points");
+            let (x, y) = if name.starts_with("chart-guide") {
+                (450.0, 100.0)
+            } else {
+                (point.x, point.y)
+            };
+            let position = slint::LogicalPosition::new(
+                left as f32 + x * chart_width / 900.0,
+                top as f32 + y * chart_width / 900.0,
+            );
             window
                 .window()
                 .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
@@ -2376,7 +2809,7 @@ fn render_configuration_previews() {
                     .iter()
                     .zip(cleared.iter())
                     .any(|(a, b)| (a.r, a.g, a.b) != (b.r, b.g, b.b)),
-                "Hover guides must disappear when the pointer leaves"
+                "Hover guides must disappear when the pointer leaves: {name}"
             );
         }
     }
@@ -2492,4 +2925,276 @@ fn navigation_updates_immediately_and_reuses_result_presentations() {
     assert!(adapter.draw_if_needed(|renderer| {
         renderer.render(&mut pixels, 980);
     }));
+}
+
+#[test]
+fn curated_defaults_balance_all_families_and_leave_custom_settings_intact() {
+    let mut app = fixture();
+    app.devices[0].properties.extend(BTreeMap::from([
+        ("physical_cores".into(), "8".into()),
+        ("cooperative_matrix_fp16_shape".into(), "16x16x16".into()),
+        ("cooperative_matrix_int8_shape".into(), "16x16x32".into()),
+        ("vulkan_subgroup_size".into(), "32".into()),
+        ("storage_buffer_16bit_access".into(), "true".into()),
+        ("storage_buffer_8bit_access".into(), "true".into()),
+    ]));
+    app.settings.cpu_core_limit = 2;
+    app.settings.vector_size = "3 GiB".into();
+    app.settings.offload_traffic_mode = Some(1);
+    app.settings.offload_passes_per_second = 700;
+    for id in [
+        CPU_VECTOR_ID,
+        CPU_MATRIX_ID,
+        CPU_ASCII_ID,
+        CPU_INT64_ID,
+        GPU_VECTOR_ID,
+        GPU_MATRIX_ID,
+        GPU_INT8_MATRIX_ID,
+        GPU_OFFLOAD_ID,
+    ] {
+        app.selected = Some(id.into());
+        assert_eq!(app.compute_choice(id), 0);
+        assert_eq!(compute_choice_ids(id), ["curated", "custom"]);
+        let curated = app.queued_run(id).unwrap();
+        assert!(curated.settings.vector_sweep);
+        assert_eq!(curated.settings.cpu_core_limit, 0);
+        let range = app.compute_slider_range(id, &curated.settings);
+        assert_eq!(
+            vector_size_bytes(&curated.settings.vector_size).unwrap(),
+            range.clamp(CURATED_DATASET_BYTES)
+        );
+        if gpu_offload(id) {
+            assert_eq!(curated.settings.traffic_mode(), 2);
+            assert_eq!(curated.settings.offload_passes_per_second, 100);
+            assert_eq!(curated.settings.ram_offload_percent, 75);
+        }
+        app.select_vector_choice(1);
+        let custom = app.run_overrides[id].clone();
+        app.select_vector_choice(0);
+        assert_eq!(app.run_overrides[id], custom);
+        app.select_vector_choice(1);
+        assert_eq!(app.run_overrides[id], custom);
+        let saved = app.snapshot_benchmark_preferences();
+        assert_eq!(saved.tests[id].selected_option.as_deref(), Some("custom"));
+        app.select_vector_choice(2);
+        assert_eq!(
+            app.compute_choice(id),
+            1,
+            "removed third option must be rejected"
+        );
+    }
+}
+
+#[test]
+fn legacy_automatic_choices_migrate_to_curated_without_erasing_custom_configuration() {
+    let path = std::env::temp_dir().join(format!(
+        "gluj-curated-migration-{}.json",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for (id, old_option) in [
+        (CPU_VECTOR_ID, "compute_speed"),
+        (CPU_VECTOR_ID, "data_sizes"),
+        (GPU_OFFLOAD_ID, "single_dataset"),
+        (GPU_OFFLOAD_ID, "data_sizes"),
+    ] {
+        let custom = TestOverride {
+            settings: AppSettings {
+                vector_preset: 6,
+                vector_size: "32 MiB".into(),
+                ..Default::default()
+            },
+            dataset_text: "32".into(),
+        };
+        let preferences = BenchmarkPreferences {
+            version: 1,
+            family_modes: BTreeMap::new(),
+            tests: BTreeMap::from([(
+                id.into(),
+                SavedBenchmarkPreference {
+                    selected_option: Some(old_option.into()),
+                    custom: Some(custom.clone()),
+                },
+            )]),
+        };
+        write_json(&path, &preferences).unwrap();
+        let loaded = load_benchmark_preferences(&path).unwrap();
+        assert_eq!(loaded.tests[id].selected_option.as_deref(), Some("curated"));
+        let mut app = fixture();
+        app.restore_benchmark_preferences(loaded);
+        assert_eq!(app.compute_choice(id), 0);
+        assert_eq!(app.run_overrides[id], custom);
+        app.selected = Some(id.into());
+        app.select_vector_choice(1);
+        assert_eq!(app.run_overrides[id], custom);
+        assert_eq!(
+            app.snapshot_benchmark_preferences().tests[id]
+                .selected_option
+                .as_deref(),
+            Some("custom")
+        );
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn invalid_access_edits_and_ram_size_text_preserve_last_valid_preferences() {
+    let settings = AppSettings {
+        dataset_mode: 2,
+        ..Default::default()
+    };
+    assert!(validated_run_settings(&settings, "invalid", CPU_RAM_BANDWIDTH_ID).is_err());
+    assert_eq!(
+        validated_run_settings(&settings, "16", CPU_RAM_BANDWIDTH_ID)
+            .unwrap()
+            .dataset_mib,
+        16
+    );
+    let mut app = fixture();
+    app.selected = Some(CPU_ASCII_ID.into());
+    app.run_overrides.insert(
+        CPU_ASCII_ID.into(),
+        TestOverride {
+            settings: AppSettings::default(),
+            dataset_text: "256".into(),
+        },
+    );
+    app.persist_benchmark_preferences();
+    let before = app.snapshot_benchmark_preferences();
+    app.run_overrides
+        .get_mut(CPU_ASCII_ID)
+        .unwrap()
+        .settings
+        .access_seed = "invalid".into();
+    assert!(app.queued_run(CPU_ASCII_ID).is_err());
+    assert_eq!(app.snapshot_benchmark_preferences(), before);
+}
+
+#[test]
+fn phase_seven_settings_restore_with_defaults_without_changing_existing_choices() {
+    let old: AppSettings =
+        serde_json::from_str("{\"gpu_intensity\":0,\"vector_size\":\"64 MiB\"}").unwrap();
+    assert_eq!(old.gpu_intensity, 0);
+    assert_eq!(old.gpu_matrix_tile, "automatic");
+    assert_eq!(old.memory_copy_path, 0);
+    assert_eq!(old.staging_buffers, 1);
+    assert_eq!(
+        serde_json::from_str::<AppSettings>(&serde_json::to_string(&old).unwrap()).unwrap(),
+        old
+    );
+}
+
+#[test]
+fn worker_disconnect_finishes_current_plan_without_publishing_a_score() {
+    let mut app = fixture();
+    let id = app.selected.clone().unwrap();
+    let run = app.queued_run(&id).unwrap();
+    let mut other = run.clone();
+    other.settings.ram_offload_percent = 50;
+    let plan = app.prepare_plan(vec![run, other], "disconnect").unwrap();
+    app.queue = plan.runs;
+    app.active_plan = Some(plan.suite);
+    app.active_plan.as_mut().unwrap().conditions[0].status =
+        gluj_bench_core::CompletionStatus::Running;
+    app.active_request = Some("interrupted".into());
+    let (sender, events) = mpsc::channel();
+    app.worker.events = events;
+    sender.send(WorkerEvent::Disconnected).unwrap();
+    app.receive_worker_events();
+    assert!(app.active_request.is_none());
+    assert!(app.queue.is_empty());
+    assert!(app.results.is_empty());
+    assert!(!app.worker.online());
+    let plan = app.active_plan.unwrap();
+    assert_eq!(
+        plan.conditions[0].status,
+        gluj_bench_core::CompletionStatus::Failed
+    );
+    assert_eq!(
+        plan.conditions[1].status,
+        gluj_bench_core::CompletionStatus::Skipped
+    );
+    assert!(app.status.contains("Reconnect"));
+}
+
+#[test]
+fn captured_legacy_results_and_settings_keep_originals_while_adapting_display() {
+    let bytes = include_str!("../tests/fixtures/legacy-v1-results.json");
+    let file: ResultsFile = serde_json::from_str(bytes).unwrap();
+    assert_eq!(file.version, 1);
+    assert_eq!(file.results.len(), 6);
+    let original = file.results;
+    let mut display = original.clone();
+    normalize_results(&mut display);
+    assert!(
+        original
+            .iter()
+            .any(|r| r.benchmark_id == "cpu.performance.single_thread.integer.i64")
+    );
+    assert!(
+        display
+            .iter()
+            .all(|r| r.metrics.iter().all(|m| m.value.is_finite()))
+    );
+    let settings: AppSettings =
+        serde_json::from_str(include_str!("../tests/fixtures/legacy-settings.json")).unwrap();
+    assert!(settings_valid(&settings));
+    assert!(!settings.access_ensemble);
+}
+
+#[test]
+fn offline_engine_does_not_replace_a_plan_or_queue_new_work() {
+    let mut app = fixture();
+    let id = app.selected.clone().unwrap();
+    let plan = app.configured_plan(&id);
+    app.begin_plan(plan);
+    assert!(app.active_plan.is_none());
+    assert!(app.queue.is_empty());
+    assert!(app.active_request.is_none());
+    assert!(app.status.contains("Reconnect"));
+}
+
+#[test]
+fn memory_overview_distinguishes_firmware_installed_from_os_visible_capacity() {
+    let mut device = fixture().devices[0].clone();
+    device.category = DeviceCategory::Memory;
+    device
+        .properties
+        .insert("total_bytes".into(), (39_u64 << 30).to_string());
+    device
+        .properties
+        .insert("installed_bytes".into(), (40_u64 << 30).to_string());
+    let (_, facts, _) = overview_device(&device);
+    assert_eq!(facts[0].label, "INSTALLED MEMORY");
+    assert_eq!(facts[0].value, format_binary_size((40_u64 << 30) as f64));
+    device.properties.remove("installed_bytes");
+    let (_, facts, _) = overview_device(&device);
+    assert_eq!(facts[0].label, "OS-VISIBLE MEMORY");
+    assert_eq!(facts[0].value, format_binary_size((39_u64 << 30) as f64));
+    assert_eq!(facts.len(), 2);
+    let mut before = BenchmarkResult {
+        benchmark_id: "cpu.bandwidth.cache.l1".into(),
+        device_id: "cpu:system".into(),
+        elapsed_ns: 1,
+        metrics: vec![],
+        workload_metadata: BTreeMap::new(),
+        device_metadata: BTreeMap::new(),
+    };
+    let mut after = before.clone();
+    stamp_result(&mut before, std::slice::from_ref(&device), Some("fixture"));
+    device
+        .properties
+        .insert("memory_channel_count".into(), "2".into());
+    device
+        .properties
+        .insert("memory_channel_data_width_bits".into(), "64".into());
+    let (_, facts, _) = overview_device(&device);
+    assert_eq!(facts[2].value, "128-bit (2 × 64-bit)");
+    stamp_result(&mut after, &[device], Some("fixture"));
+    assert_eq!(
+        before.device_metadata["saved_setup"],
+        after.device_metadata["saved_setup"]
+    );
 }

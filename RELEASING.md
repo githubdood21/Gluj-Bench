@@ -8,18 +8,13 @@
    .\scripts\cargo.ps1 fmt --all -- --check
    .\scripts\cargo.ps1 clippy --workspace --all-targets '--' -D warnings
    .\scripts\cargo.ps1 test --workspace --locked
-   .\scripts\package-release.ps1 -Version 0.4.0
+   .\scripts\package-release.ps1 -Version 1.0.0
    ```
 
 4. Test the ZIP on a clean Windows x64 machine with current CPU and GPU drivers.
 5. Commit and push the release changes. Wait for the `CI` workflow to pass.
-6. Create and push an annotated semantic-version tag:
+6. For a manual release, use the tested ZIP and SHA-256 checksum in `dist/`. Create the GitHub release against the verified source commit and attach both files.
 
-   ```powershell
-   git tag -a v0.4.0 -m "Gluj-Bench 0.4.0"
-   git push origin v0.4.0
-   ```
-
-The tag starts the `Release` workflow. It rebuilds and tests the workspace, creates a Windows x64 ZIP and SHA-256 checksum, and publishes a GitHub release with generated notes.
+Pushing a `v*.*.*` tag starts the automatic `Release` workflow, which builds, packages, and publishes the assets. Coordinate the tag and manual upload so both paths target the same release.
 
 Confirm that the release archive contains `LICENSE` and that dependency licensing remains compatible with distribution.

@@ -1,6 +1,6 @@
 use crate::{
     kernels::statistics,
-    latency::{Chain, LOCAL_BYTES, Pattern, SEED},
+    latency::{Chain, LOCAL_BYTES, Pattern},
     topology::{AffinityGuard, CpuTopology},
 };
 use gluj_bench_core::{
@@ -101,7 +101,7 @@ fn metadata(layout: &CacheLayout, level: u8) -> BTreeMap<String, String> {
         ("node_stride_bytes".into(), layout.stride.to_string()),
         ("thread_count".into(), "1".into()),
         ("metric_direction".into(), "lower_is_better".into()),
-        ("latency_profile_revision".into(), "1".into()),
+        ("latency_profile_revision".into(), "2-seed-ensemble".into()),
     ])
 }
 
@@ -164,8 +164,10 @@ pub fn run(
     device: &DeviceDescriptor,
     topology: &CpuTopology,
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    let _measurement_scope =
+        gluj_bench_core::MeasurementScope::enter(config, format!("cpu.latency.cache.l{level}"));
     check_cancel(cancellation)?;
-    let layout = layout(topology, level)?;
+    let mut layout = layout(topology, level)?;
     let mut system = sysinfo::System::new();
     system.refresh_memory();
     if layout.bytes as u64 > system.available_memory() / 16 {
@@ -174,6 +176,18 @@ pub fn run(
             "Insufficient available memory for this cache working set.",
         ));
     }
+    layout.bytes = crate::latency::latency_bytes(
+        config,
+        layout.bytes,
+        layout.stride,
+        (layout.bytes as u64).min(system.available_memory() / 16),
+    )?;
+    let access = gluj_bench_core::AccessPolicy::from_config(config)?;
+    let locality = config
+        .options
+        .get("locality_block_bytes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(LOCAL_BYTES);
     let location = topology.representative;
     let _affinity = AffinityGuard::pin(location)?;
     progress(ProgressUpdate {
@@ -186,22 +200,46 @@ pub fn run(
     } else {
         Pattern::Localized
     };
-    let chain = Chain::new(layout.bytes, layout.stride, pattern, cancellation)?;
+    let mut chain = Chain::new_seeded(
+        layout.bytes,
+        layout.stride,
+        pattern,
+        access.derived_seed(0, layout.bytes, 0),
+        locality,
+        cancellation,
+    )?;
     progress(ProgressUpdate {
         fraction: 0.05,
         phase: "warmup".into(),
         message: format!("Warming L{level} cache with two complete traversals"),
     });
-    chain.traverse_cycles(2, cancellation)?;
+    {
+        let _warmup = gluj_bench_core::phase_timer("warmup-and-chain-validation");
+        chain.traverse_cycles(2, cancellation)?;
+    }
     let nodes = layout.bytes / layout.stride;
     let cycles = batch_cycles(nodes);
     let batch_loads = nodes * cycles;
-    let target_ns = config.target_duration_ms.saturating_mul(1_000_000) / u64::from(config.samples);
+    let target_ns = gluj_bench_core::sample_target_ns(config);
     let mut values = Vec::new();
     let mut elapsed_total = 0u64;
     let mut loads_total = 0u64;
     let mut pacer = crate::pacing::CpuPacer::current(cancellation);
-    for sample in 0..config.samples {
+    for sample in 0..config.samples * access.realizations {
+        let realization = sample / config.samples;
+        if sample > 0 && sample.is_multiple_of(config.samples) {
+            chain = Chain::new_seeded(
+                layout.bytes,
+                layout.stride,
+                pattern,
+                access.derived_seed(0, layout.bytes, realization),
+                locality,
+                cancellation,
+            )?;
+            let _warmup = gluj_bench_core::phase_timer("warmup-and-chain-validation");
+            chain.traverse_cycles(2, cancellation)?;
+        }
+        let observation_started = Instant::now();
         progress(ProgressUpdate {
             fraction: 0.1 + 0.9 * f64::from(sample) / f64::from(config.samples),
             phase: "sample".into(),
@@ -223,11 +261,37 @@ pub fn run(
             pacer.account(active)?;
         }
         values.push(elapsed as f64 / loads as f64);
+        if let Some(recorder) = gluj_bench_core::observation_recorder() {
+            recorder
+                .with_realization(
+                    access.derived_seed(0, layout.bytes, realization),
+                    BTreeMap::from([
+                        ("root_seed".into(), access.seed.to_string()),
+                        ("realization".into(), realization.to_string()),
+                        (
+                            "generator_revision".into(),
+                            "sattolo-single-cycle-v2".into(),
+                        ),
+                    ]),
+                )
+                .record(
+                    &format!("l{level}"),
+                    "dependent_latency",
+                    *values.last().unwrap(),
+                    "ns",
+                    loads,
+                    "dependent_loads",
+                    elapsed,
+                    observation_started.elapsed().as_nanos() as u64,
+                    "validated",
+                );
+        }
         elapsed_total = elapsed_total.saturating_add(elapsed);
         loads_total = loads_total.saturating_add(loads);
     }
     let statistics = statistics(&values);
     let mut workload_metadata = metadata(&layout, level);
+    workload_metadata.insert("result_validation".into(), "constructed single-cycle pointer chain; complete cycle checked during untimed warmup and measured traversals".into());
     for (key, value) in [
         ("thread_mode", "single_pinned_core".into()),
         ("processor_group", location.group.to_string()),
@@ -235,7 +299,7 @@ pub fn run(
         ("node_count", nodes.to_string()),
         ("dependent_load_count", loads_total.to_string()),
         ("batch_loads", batch_loads.to_string()),
-        ("random_seed", SEED.to_string()),
+        ("random_seed", access.seed.to_string()),
         ("access_order", pattern.access_order().into()),
         ("page_policy", "ordinary_allocator_pages".into()),
         ("cache_state", "two_full_cycle_warmups_no_flush".into()),
@@ -244,8 +308,18 @@ pub fn run(
         ("measurement_scope", "Observed cache-sized dependent-read latency; level residency is inferred from topology and working set, not confirmed by hardware counters. Includes translation, prefetch/cache effects, timing/loop overhead and system interference.".into()),
     ] { workload_metadata.insert(key.into(), value); }
     if level > 1 {
-        workload_metadata.insert("locality_block_bytes".into(), LOCAL_BYTES.to_string());
+        workload_metadata.insert("locality_block_bytes".into(), locality.to_string());
     }
+    workload_metadata.insert("access_seed".into(), access.seed.to_string());
+    workload_metadata.insert(
+        "access_realizations".into(),
+        access.realizations.to_string(),
+    );
+    workload_metadata.insert(
+        "access_generator_revision".into(),
+        "sattolo-single-cycle-v2".into(),
+    );
+    workload_metadata.insert("latency_profile_revision".into(), "2-seed-ensemble".into());
     progress(ProgressUpdate {
         fraction: 1.0,
         phase: "complete".into(),

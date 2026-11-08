@@ -19,7 +19,7 @@ pub struct EffectiveCacheTier {
     pub last_cached_size: u64,
     pub first_uncached_size: u64,
     pub estimated_capacity: u64,
-    pub confidence: f64,
+    pub drop_strength: f64,
 }
 
 pub fn sweep_sizes(limit: u64) -> Vec<u64> {
@@ -75,7 +75,7 @@ pub fn detect_effective_cache_tiers(points: &[SweepPoint]) -> Vec<EffectiveCache
             last_cached_size,
             first_uncached_size,
             estimated_capacity,
-            confidence: (1.0 - sustained).clamp(0.0, 1.0),
+            drop_strength: (1.0 - sustained).clamp(0.0, 1.0),
         });
         previous_boundary = Some(boundary);
     }
@@ -96,7 +96,7 @@ pub fn detect_effective_cache_tiers(points: &[SweepPoint]) -> Vec<EffectiveCache
                         points[boundary - 1].size_bytes,
                         points[boundary].size_bytes,
                     ),
-                    confidence: (1.0 - first.max(second) / before).clamp(0.0, 1.0),
+                    drop_strength: (1.0 - first.max(second) / before).clamp(0.0, 1.0),
                 })
         });
     if let Some(outer) = outer_cliff
@@ -282,7 +282,7 @@ mod tests {
             last_cached_size: 16 * MIB,
             first_uncached_size: 32 * MIB,
             estimated_capacity: 22 * MIB,
-            confidence: 0.4,
+            drop_strength: 0.4,
         };
         assert_eq!(cache_working_set(tier, None), Some(8 * MIB));
         assert_eq!(vram_working_set(Some(tier), 512 * MIB), Some(256 * MIB));

@@ -52,19 +52,38 @@ pub struct Buffers {
     c: Vec<f32>,
 }
 impl Buffers {
-    pub fn new(dimension: usize, worker: usize) -> Result<Self, BenchmarkError> {
-        fn array(size: usize, phase: usize) -> Result<Vec<f32>, BenchmarkError> {
+    pub fn new(
+        dimension: usize,
+        worker: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, BenchmarkError> {
+        fn array(
+            size: usize,
+            phase: usize,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<f32>, BenchmarkError> {
             let mut data = Vec::new();
             data.try_reserve_exact(size)
                 .map_err(|error| BenchmarkError::new("allocation_failed", error.to_string()))?;
-            data.extend((0..size).map(|i| ((i + phase) % 17) as f32 / 32.0 - 0.25));
+            for begin in (0..size).step_by(65536) {
+                if cancellation.is_cancelled() {
+                    return Err(BenchmarkError::new(
+                        "cancelled",
+                        "Matrix preparation cancelled.",
+                    ));
+                }
+                data.extend(
+                    (begin..size.min(begin + 65536))
+                        .map(|i| ((i + phase) % 17) as f32 / 32.0 - 0.25),
+                );
+            }
             Ok(data)
         }
         Ok(Self {
             dimension,
-            a: array(ROWS * dimension, worker)?,
-            b: array(dimension * dimension, worker + 3)?,
-            c: array(ROWS * dimension, 0)?,
+            a: array(ROWS * dimension, worker, cancellation)?,
+            b: array(dimension * dimension, worker + 3, cancellation)?,
+            c: array(ROWS * dimension, 0, cancellation)?,
         })
     }
     pub fn sweep(&mut self, cancellation: &CancellationToken) -> bool {
@@ -92,6 +111,25 @@ impl Buffers {
             });
         black_box(&self.c);
         black_box(hash)
+    }
+    pub fn validate(&self) -> Result<(), BenchmarkError> {
+        for index in gluj_bench_core::validation_indices(self.c.len()) {
+            let row = index / self.dimension;
+            let column = index % self.dimension;
+            let expected = (0..self.dimension).fold(0.0_f64, |sum, k| {
+                sum + f64::from(self.a[row * self.dimension + k])
+                    * f64::from(self.b[k * self.dimension + column])
+            });
+            if !self.c[index].is_finite()
+                || (f64::from(self.c[index]) - expected).abs() > expected.abs().max(1.0) * 1e-5
+            {
+                return Err(BenchmarkError::new(
+                    "result_validation_failed",
+                    "CPU matrix output differs from an independent FP64 dot-product reference.",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -151,7 +189,7 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             for n in [32, 72, 136] {
-                let mut buffers = Buffers::new(n, 3).unwrap();
+                let mut buffers = Buffers::new(n, 3, &CancellationToken::default()).unwrap();
                 for _ in 0..2 {
                     assert!(buffers.sweep(&CancellationToken::default()));
                     for row in 0..ROWS {

@@ -2,10 +2,7 @@ use gluj_bench_core::{BenchmarkConfig, BenchmarkResult, Metric, SampleStatistics
 use std::collections::BTreeMap;
 
 pub(super) fn reference_config(config: &BenchmarkConfig) -> BenchmarkConfig {
-    let mut reference = config.clone();
-    reference.samples = config.samples.clamp(3, 5);
-    reference.target_duration_ms = config.target_duration_ms.clamp(150, 500);
-    reference
+    gluj_bench_core::reference_config(config, "reference-before")
 }
 
 pub(super) fn validate_reference(
@@ -149,9 +146,26 @@ pub(super) fn add_reference_analysis(
         let headroom = (1.0 - ratio) * 100.0;
         let trial_headroom = trial_gap * 100.0;
         let bandwidth_gap = (1.0 / ratio - 1.0) * 100.0;
-        // Leave one quarter of the modelled headroom unused; round down in 5% steps.
-        // This is an exploratory frequency-limit change, not a verified response.
-        let reduction = ((trial_headroom * 0.75 / 5.0).floor() * 5.0).clamp(5.0, 40.0);
+        // Candidate clock limits explore efficiency; the gap does not predict clock response.
+        let candidates = gluj_bench_core::gpu_efficiency_trials(largest.value / trial_anchor.value);
+        let reduction = candidates[0];
+        let limits = candidates
+            .iter()
+            .map(|reduction| format!("{}%", 100 - reduction))
+            .collect::<Vec<_>>()
+            .join(" then ");
+        metadata.insert(
+            "gpu_core_limit_trial_reductions_percent".into(),
+            candidates
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        metadata.insert(
+            "efficiency_search_revision".into(),
+            "manual-staged-1".into(),
+        );
         let exploratory = [ceiling, small, largest]
             .iter()
             .any(|metric| relative_noise(metric) > 0.02)
@@ -168,7 +182,7 @@ pub(super) fn add_reference_analysis(
         );
         let mut uncertainty = if exploratory {
             format!(
-                " Sample variation at the largest size is {:.1}%; repeat measurements before judging the 0–5% performance-loss target.",
+                " Sample variation at the largest size is {:.1}%; observed variation is retained alongside the 0–5% performance-loss target.",
                 relative_noise(largest) * 100.0
             )
         } else {
@@ -205,7 +219,7 @@ pub(super) fn add_reference_analysis(
             format!("{reduction:.0}"),
         );
         format!(
-            "Suggested starting point: reduce your current GPU core-frequency limit by a further {reduction:.0}%. The largest data set is {headroom:.1}% below the vector/matrix reference. The trial uses a {trial_headroom:.1}% gap against the smaller compute baseline as possible headroom. This changes only the frequency ceiling. Rerun the same data set and compare against its original throughput, then adjust in small steps to stay within 0–5% performance loss. Raise the limit if loss exceeds 5%. Check your apps too. This is untested guidance, not an automatically applied setting.{uncertainty}"
+            "Efficiency goal: retain the same workload throughput while seeking lower power use and heat; savings have not been measured. Suggested starting point: reduce your current GPU core-frequency limit by a further {reduction}%. If that passes, explore the remaining candidates. Candidate limits are {limits} of the starting core-frequency limit, in that order; percentages are not compounded. The largest data set is {headroom:.1}% below the vector/matrix reference. The {trial_headroom:.1}% gap against the smaller compute baseline selects how broadly to search; it is not a prediction of the clock response. This changes only the frequency ceiling. These candidates have no measured response in this run; the recorded reference interval is 0–5% performance loss. If a candidate fails, restore the last passing limit and refine between passing and failing limits. Respect the minimum supported by the driver. Check your apps too. This is untested guidance, not an automatically applied setting.{uncertainty}"
         )
     } else {
         format!(
@@ -214,7 +228,13 @@ pub(super) fn add_reference_analysis(
             gap_noise * 100.0
         )
     };
-    metadata.insert("tuning_guidance".into(), guidance);
+    metadata.insert(
+        "tuning_guidance".into(),
+        format!(
+            "{guidance} {}",
+            gluj_bench_core::COMPUTE_MEMORY_BALANCE_GUIDANCE
+        ),
+    );
     metadata.insert("clock_analysis_limit".into(), "Estimate for this workload only. Core and memory clocks were not changed; frequency response, temperatures, power limits, and overclock stability were not measured.".into());
 }
 
@@ -236,7 +256,7 @@ mod tests {
         }
     }
     #[test]
-    fn model_reports_delta_and_conservative_trial_instead_of_full_headroom() {
+    fn analysis_reports_delta_and_staged_candidates_without_claiming_full_headroom() {
         let mut reference = BenchmarkResult {
             benchmark_id: "reference".into(),
             device_id: "gpu".into(),
@@ -261,7 +281,8 @@ mod tests {
         assert_eq!(metrics.last().unwrap().value, -50.0);
         assert_eq!(metadata["idealized_core_headroom_percent"], "50.00");
         assert_eq!(metadata["idealized_bandwidth_increase_percent"], "100.00");
-        assert_eq!(metadata["suggested_core_underclock_trial_percent"], "30");
+        assert_eq!(metadata["suggested_core_underclock_trial_percent"], "35");
+        assert_eq!(metadata["gpu_core_limit_trial_reductions_percent"], "35,50");
         let mut check = reference.clone();
         check.metrics[0].value = 120.0;
         let checked = validate_reference(reference.clone(), check);
@@ -292,6 +313,36 @@ mod tests {
             add_reference_analysis(&mut tiers, &mut meta, &reference, transition);
             assert!(!meta.contains_key("suggested_core_underclock_trial_percent"));
         }
+    }
+
+    #[test]
+    fn severe_throughput_gap_explores_half_then_quarter_clock_limits_for_efficiency() {
+        let reference = BenchmarkResult {
+            benchmark_id: "gpu.performance.fp32".into(),
+            device_id: "gpu:test".into(),
+            elapsed_ns: 1,
+            metrics: vec![metric("throughput", 100.0)],
+            device_metadata: BTreeMap::new(),
+            workload_metadata: BTreeMap::from([
+                ("bound_classification".into(), "compute_bound".into()),
+                ("compute_reference_drift_percent".into(), "0.1".into()),
+            ]),
+        };
+        let mut tiers = vec![
+            metric("working_set_1.compute", 100.0),
+            metric("working_set_2.compute", 5.0),
+        ];
+        let mut metadata = BTreeMap::new();
+        add_reference_analysis(&mut tiers, &mut metadata, &reference, true);
+        assert_eq!(metadata["gpu_core_limit_trial_reductions_percent"], "50,75");
+        assert_eq!(
+            metadata["suggested_core_frequency_limit_reduction_percent"],
+            "50"
+        );
+        assert!(metadata["tuning_guidance"].contains("power use and heat"));
+        assert!(!metadata["tuning_guidance"].to_lowercase().contains("rerun"));
+        assert!(metadata["tuning_guidance"].contains("not compounded"));
+        assert!(metadata["tuning_guidance"].contains("not a prediction"));
     }
 
     #[test]
@@ -389,7 +440,7 @@ mod tests {
         );
         assert_eq!(metadata["tuning_confidence"], "exploratory");
         assert!(metadata["tuning_guidance"].contains("0–5% performance loss"));
-        assert!(metadata["tuning_guidance"].contains("compare against its original throughput"));
+        assert!(metadata["tuning_guidance"].contains("no measured response in this run"));
         // A similarly noisy gap that is not distinguishable from variation is withheld.
         reference.metrics[0].statistics.standard_deviation = reference.metrics[0].value * 0.09;
         let mut metadata = BTreeMap::new();

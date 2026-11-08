@@ -21,10 +21,23 @@ if ($VersionMatch.Groups[1].Value -ne $Version) {
 
 Push-Location $RepositoryRoot
 try {
+    $BuildInfo = & (Join-Path $PSScriptRoot 'build-provenance.ps1')
+    $BinaryDirectory = Join-Path $RepositoryRoot 'target\x86_64-pc-windows-gnullvm\release'
+    $BuildInfoPath = Join-Path $BinaryDirectory 'build-info.json'
     if (-not $SkipBuild) {
+        $env:GLUJ_BENCH_BUILD_REVISION = $BuildInfo.revision
         & (Join-Path $PSScriptRoot 'cargo.ps1') build --workspace --release --locked
         if ($LASTEXITCODE -ne 0) {
             throw "Release build failed with exit code $LASTEXITCODE."
+        }
+        $BuildInfo | ConvertTo-Json | Set-Content -LiteralPath $BuildInfoPath -Encoding utf8
+    } else {
+        if (-not (Test-Path -LiteralPath $BuildInfoPath)) {
+            throw 'SkipBuild requires build-info.json from the qualified release build.'
+        }
+        $RecordedBuild = Get-Content -LiteralPath $BuildInfoPath -Raw | ConvertFrom-Json
+        if ($RecordedBuild.version -ne $Version -or $RecordedBuild.source_sha256 -ne $BuildInfo.source_sha256) {
+            throw 'Release binaries do not match the current source/version provenance. Existing artifacts were preserved.'
         }
     }
 
@@ -51,20 +64,22 @@ try {
             throw "Package target is outside the dist directory: $ResolvedTarget"
         }
         if (Test-Path -LiteralPath $path) {
-            Remove-Item -Recurse -Force -LiteralPath $path
+            throw "Release artifact already exists and was preserved: $path. Choose a new version or archive it explicitly."
         }
     }
     New-Item -ItemType Directory -Path $StageDirectory | Out-Null
 
     Copy-Item -LiteralPath $UiBinary, $WorkerBinary -Destination $StageDirectory
-    Copy-Item -LiteralPath 'README.md', 'CHANGELOG.md', 'SECURITY.md' -Destination $StageDirectory
+    Copy-Item -LiteralPath $BuildInfoPath -Destination $StageDirectory
+    Copy-Item -LiteralPath 'README.md', 'CHANGELOG.md', 'RELEASING.md', 'SECURITY.md' -Destination $StageDirectory
     Copy-Item -LiteralPath 'SysInfo.png', 'Benchmarks.png', 'ScalingCompute.png' -Destination $StageDirectory
     $LogoDirectory = Join-Path $StageDirectory 'assets\branding'
     New-Item -ItemType Directory -Force -Path $LogoDirectory | Out-Null
     Copy-Item -LiteralPath 'assets\branding\loop-chip-g-preview.png' -Destination $LogoDirectory
     Copy-Item -LiteralPath 'LICENSE', 'NOTICE', 'BRANDING.md' -Destination $StageDirectory
     New-Item -ItemType Directory -Path (Join-Path $StageDirectory 'docs') | Out-Null
-    Copy-Item -LiteralPath 'docs\protocol.md' -Destination (Join-Path $StageDirectory 'docs')
+    Copy-Item -LiteralPath 'docs\protocol.md', 'docs\implementation-plan.md', 'docs\benchmark-coverage-ledger.md', 'docs\backlog.md', 'docs\release-1.0.md' -Destination (Join-Path $StageDirectory 'docs')
+    Get-ChildItem -LiteralPath 'docs' -Filter 'phase-*.md' | Copy-Item -Destination (Join-Path $StageDirectory 'docs')
     $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText(
         (Join-Path $StageDirectory 'VERSION.txt'),

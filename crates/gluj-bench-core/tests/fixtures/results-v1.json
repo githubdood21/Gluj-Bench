@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "results": [
+    {"benchmark_id":"cpu.performance.float.f32","device_id":"cpu:system","elapsed_ns":1000000,"metrics":[],"workload_metadata":{"kernel_revision":"scalar-old"},"device_metadata":{"saved_at":"1700000000"}},
+    {"benchmark_id":"cpu.performance.avx2.f32_fma","device_id":"cpu:system","elapsed_ns":2000000,"metrics":[],"workload_metadata":{"kernel_revision":"avx2-old"}},
+    {"benchmark_id":"cpu.performance.single_thread.integer.i64","device_id":"cpu:system","elapsed_ns":3000000,"metrics":[],"workload_metadata":{"thread_count":"1"}},
+    {"benchmark_id":"cpu.latency.memory.localized","device_id":"cpu:system","elapsed_ns":4000000,"metrics":[],"workload_metadata":{"random_seed":"42","latency_profile_revision":"1"}},
+    {"benchmark_id":"gpu.performance.fp32.offload75.scaling","device_id":"gpu:fixture","elapsed_ns":5000000,"metrics":[],"workload_metadata":{"offload_profile_revision":"old"},"device_metadata":{"driver":"fixture-driver"}}
+  ]
+}

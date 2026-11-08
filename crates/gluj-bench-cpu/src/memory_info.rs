@@ -25,7 +25,7 @@ pub(super) fn discover() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 
-// SMBIOS Type 16/17: system-memory arrays and their populated modules.
+// SMBIOS Types 16/17/37: system-memory arrays, populated modules and channel topology.
 // Configured speed is MT/s, not the module's advertised maximum or a measured clock.
 // https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.7.0.pdf
 #[cfg(any(windows, test))]
@@ -52,25 +52,26 @@ fn parse(mut data: &[u8]) -> BTreeMap<String, String> {
         if record[0] == 127 {
             break;
         }
-        records.push(record);
         let tail = &data[usize::from(length)..];
         let Some(end) = tail.windows(2).position(|pair| pair == [0, 0]) else {
             return BTreeMap::new();
         };
+        records.push((record, &tail[..end]));
         data = &tail[end + 2..];
     }
     let arrays: Vec<_> = records
         .iter()
+        .map(|(record, _)| *record)
         .filter(|r| r[0] == 16 && r.get(5) == Some(&3))
         .filter_map(|r| word(r, 2))
         .collect();
     let mut total = Some(0_u64);
     let mut speeds = Vec::new();
     let mut complete_speeds = true;
-    let mut populated = 0;
-    for record in records
+    let mut modules = Vec::new();
+    for (record, strings) in records
         .iter()
-        .filter(|r| r[0] == 17 && word(r, 4).is_some_and(|h| arrays.contains(&h)))
+        .filter(|(r, _)| r[0] == 17 && word(r, 4).is_some_and(|h| arrays.contains(&h)))
     {
         let Some(size) = word(record, 12) else {
             return BTreeMap::new();
@@ -78,7 +79,12 @@ fn parse(mut data: &[u8]) -> BTreeMap<String, String> {
         if size == 0 {
             continue;
         }
-        populated += 1;
+        let width = word(record, 10).filter(|width| !matches!(*width, 0 | u16::MAX));
+        modules.push((
+            word(record, 2).unwrap(),
+            width,
+            ddr4_slot_channel(record, strings),
+        ));
         let bytes = match size {
             0xffff => None,
             0x7fff => dword(record, 28)
@@ -101,7 +107,58 @@ fn parse(mut data: &[u8]) -> BTreeMap<String, String> {
         }
     }
     let mut properties = BTreeMap::new();
-    if populated > 0 {
+    if !modules.is_empty() {
+        if let Some(width) = modules[0].1
+            && modules.iter().all(|module| module.1 == Some(width))
+        {
+            let mut topology = BTreeMap::new();
+            let mut complete = true;
+            for (channel, _) in records.iter().filter(|(record, _)| record[0] == 37) {
+                let Some(&count) = channel.get(6) else {
+                    complete = false;
+                    break;
+                };
+                let Some(devices) = channel.get(7..7 + usize::from(count) * 3) else {
+                    complete = false;
+                    break;
+                };
+                for device in devices.chunks_exact(3) {
+                    if topology
+                        .insert(word(device, 1).unwrap(), word(channel, 2).unwrap())
+                        .is_some()
+                    {
+                        complete = false;
+                    }
+                }
+            }
+            let channels = if complete
+                && modules
+                    .iter()
+                    .all(|module| topology.contains_key(&module.0))
+            {
+                modules
+                    .iter()
+                    .map(|module| topology[&module.0])
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            } else if topology.is_empty()
+                && complete
+                && arrays.len() == 1
+                && modules.iter().all(|module| module.2.is_some())
+            {
+                modules
+                    .iter()
+                    .filter_map(|module| module.2)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            } else {
+                0
+            };
+            if channels > 0 {
+                properties.insert("memory_channel_count".into(), channels.to_string());
+                properties.insert("memory_channel_data_width_bits".into(), width.to_string());
+            }
+        }
         if let Some(total) = total.filter(|v| *v > 0) {
             properties.insert("installed_bytes".into(), total.to_string());
         }
@@ -119,6 +176,26 @@ fn parse(mut data: &[u8]) -> BTreeMap<String, String> {
         }
     }
     properties
+}
+
+// Some DDR4 firmware omits Type 37 but encodes the channel in labels such as DIMM_A2.
+// Numeric-only slot labels carry no channel information.
+#[cfg(any(windows, test))]
+fn ddr4_slot_channel(record: &[u8], strings: &[u8]) -> Option<u8> {
+    const DDR4: u8 = 0x1a;
+    if record.get(18) != Some(&DDR4) {
+        return None;
+    }
+    let index = record.get(16)?.checked_sub(1)?;
+    let locator = strings.split(|byte| *byte == 0).nth(usize::from(index))?;
+    let slot = locator
+        .strip_prefix(b"DIMM_")
+        .or_else(|| locator.strip_prefix(b"DIMM "))?;
+    let (&channel, number) = slot.split_first()?;
+    ((b'A'..=b'H').contains(&channel)
+        && !number.is_empty()
+        && number.iter().all(u8::is_ascii_digit))
+    .then_some(channel)
 }
 
 #[cfg(test)]
@@ -162,6 +239,43 @@ mod tests {
             (128_u64 * 1024 * 1024 * 1024).to_string()
         );
         assert_eq!(properties["configured_speed_mts"], "100000");
+    }
+    #[test]
+    fn data_bus_counts_populated_channels_instead_of_modules() {
+        let sample = table(8192, 3200, None);
+        let memory = |slots: &[(&str, u16)]| {
+            let mut data = sample[..17].to_vec();
+            for (index, (locator, width)) in slots.iter().enumerate() {
+                let mut module = sample[17..51].to_vec();
+                module[2] = index as u8 + 10;
+                module[10..12].copy_from_slice(&width.to_le_bytes());
+                module[16] = 1;
+                module[18] = 0x1a;
+                data.extend_from_slice(&module);
+                data.extend_from_slice(locator.as_bytes());
+                data.extend_from_slice(&[0, 0]);
+            }
+            data
+        };
+        let two = parse(&memory(&[
+            ("DIMM_A1", 64),
+            ("DIMM_A2", 64),
+            ("DIMM_B1", 64),
+        ]));
+        assert_eq!(two["memory_channel_count"], "2");
+        assert_eq!(two["memory_channel_data_width_bits"], "64");
+        let one = parse(&memory(&[("DIMM_A1", 64), ("DIMM_A2", 64)]));
+        assert_eq!(one["memory_channel_count"], "1");
+        for (slot, width) in [("DIMM 2", 64), ("DIMM_B1", 32), ("DIMM_B1", 0)] {
+            assert!(
+                !parse(&memory(&[("DIMM_A1", 64), (slot, width)]))
+                    .contains_key("memory_channel_count")
+            );
+        }
+        let mut explicit = memory(&[("DIMM 0", 64), ("DIMM 1", 64)]);
+        explicit.extend_from_slice(&[37, 10, 20, 0, 3, 1, 1, 1, 10, 0, 0, 0]);
+        explicit.extend_from_slice(&[37, 10, 21, 0, 3, 1, 1, 1, 11, 0, 0, 0]);
+        assert_eq!(parse(&explicit)["memory_channel_count"], "2");
     }
     #[test]
     fn unknown_empty_non_system_and_malformed_firmware_do_not_invent_values() {

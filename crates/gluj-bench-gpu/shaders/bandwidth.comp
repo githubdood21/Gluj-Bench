@@ -17,16 +17,26 @@ layout(push_constant) uniform Parameters {
     uint seed;
     uint row_width;
     uint access_count;
+    uint access_mode;
+    uint block_multiplier;
+    uint block_offset;
+    uint lane_multiplier;
 } params;
 
 uint invocation_index() {
     return gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * params.row_width;
 }
 
+uint add_mod(uint a,uint b,uint count) { return a>=count-b ? a-(count-b) : a+b; }
+
 uint mapped_index(uint index) {
-    return params.access_count != params.element_count
-        ? index & (params.element_count - 1u)
-        : index;
+    index=index%params.element_count;
+    uint blocks=params.element_count/64u;
+    uint block=index/64u; uint lane=index%64u;
+    if(params.access_mode==1u || params.access_mode==3u) block=add_mod((block*params.block_multiplier)%blocks,params.block_offset,blocks);
+    if(params.access_mode==2u) block=add_mod(block,params.block_offset,blocks);
+    if(params.access_mode==3u) lane=(lane*params.lane_multiplier)&63u;
+    return block*64u+lane;
 }
 
 uint fold_value(uvec4 value) {
@@ -34,6 +44,7 @@ uint fold_value(uvec4 value) {
 }
 
 void write_vector(uint index) {
+    index=mapped_index(index);
     uint value = params.seed ^ index;
     destination_data[index] = uvec4(value, value + 1u, value + 2u, value + 3u);
 }
@@ -59,6 +70,7 @@ void main() {
 void main() {
     uint index = invocation_index();
     if (index >= params.element_count) return;
+    index=mapped_index(index);
     destination_data[index] = source_data[index];
 }
 #elif KERNEL == 3
@@ -66,24 +78,24 @@ void main() {
     uint invocation = invocation_index();
     uint stride = params.access_count / 64u;
     if (invocation >= stride) return;
-    uvec4 a = source_data[invocation];
-    uvec4 b = source_data[invocation + stride];
-    uvec4 c = source_data[invocation + stride * 2u];
-    uvec4 d = source_data[invocation + stride * 3u];
-    uvec4 e = source_data[invocation + stride * 4u];
-    uvec4 f = source_data[invocation + stride * 5u];
-    uvec4 g = source_data[invocation + stride * 6u];
-    uvec4 h = source_data[invocation + stride * 7u];
+    uvec4 a = source_data[mapped_index(invocation)];
+    uvec4 b = source_data[mapped_index(invocation + stride)];
+    uvec4 c = source_data[mapped_index(invocation + stride * 2u)];
+    uvec4 d = source_data[mapped_index(invocation + stride * 3u)];
+    uvec4 e = source_data[mapped_index(invocation + stride * 4u)];
+    uvec4 f = source_data[mapped_index(invocation + stride * 5u)];
+    uvec4 g = source_data[mapped_index(invocation + stride * 6u)];
+    uvec4 h = source_data[mapped_index(invocation + stride * 7u)];
     for (uint group = 1u; group < 8u; ++group) {
         uint base = group * 8u;
-        a ^= source_data[invocation + stride * (base + 0u)];
-        b ^= source_data[invocation + stride * (base + 1u)];
-        c ^= source_data[invocation + stride * (base + 2u)];
-        d ^= source_data[invocation + stride * (base + 3u)];
-        e ^= source_data[invocation + stride * (base + 4u)];
-        f ^= source_data[invocation + stride * (base + 5u)];
-        g ^= source_data[invocation + stride * (base + 6u)];
-        h ^= source_data[invocation + stride * (base + 7u)];
+        a ^= source_data[mapped_index(invocation + stride * (base + 0u))];
+        b ^= source_data[mapped_index(invocation + stride * (base + 1u))];
+        c ^= source_data[mapped_index(invocation + stride * (base + 2u))];
+        d ^= source_data[mapped_index(invocation + stride * (base + 3u))];
+        e ^= source_data[mapped_index(invocation + stride * (base + 4u))];
+        f ^= source_data[mapped_index(invocation + stride * (base + 5u))];
+        g ^= source_data[mapped_index(invocation + stride * (base + 6u))];
+        h ^= source_data[mapped_index(invocation + stride * (base + 7u))];
     }
     checksums[invocation] = fold_value(a ^ b ^ c ^ d ^ e ^ f ^ g ^ h) ^ params.seed;
 }
@@ -101,7 +113,8 @@ void main() {
     if (invocation >= stride) return;
     for (uint lane = 0u; lane < 16u; ++lane) {
         uint index = invocation + stride * lane;
-        destination_data[index] = source_data[index];
+        index=mapped_index(index);
+    destination_data[index] = source_data[index];
     }
 }
 #endif

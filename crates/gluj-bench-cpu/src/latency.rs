@@ -12,6 +12,7 @@ pub const ID: &str = "cpu.latency.memory";
 pub const LOCAL_ID: &str = "cpu.latency.memory.localized";
 pub(super) const LOCAL_BYTES: usize = 64 * 1024;
 const MIB: u64 = 1024 * 1024;
+#[cfg(test)]
 pub(super) const SEED: u64 = 0x6a09_e667_f3bc_c909;
 const CHUNK: usize = 8192;
 
@@ -115,7 +116,7 @@ pub fn descriptor(
     let mut metadata = BTreeMap::from([
         ("metric_direction".into(), "lower_is_better".into()),
         ("thread_count".into(), "1".into()),
-        ("latency_profile_revision".into(), "1".into()),
+        ("latency_profile_revision".into(), "2-seed-ensemble".into()),
     ]);
     metadata.insert("access_order".into(), pattern.access_order().into());
     if pattern == Pattern::Localized {
@@ -185,13 +186,35 @@ pub(super) struct Chain {
 }
 
 impl Chain {
+    #[cfg(test)]
     pub(super) fn new(
         bytes: usize,
         stride: usize,
         pattern: Pattern,
         cancellation: &CancellationToken,
     ) -> Result<Self, BenchmarkError> {
+        Self::new_seeded(bytes, stride, pattern, SEED, LOCAL_BYTES, cancellation)
+    }
+    pub(super) fn new_seeded(
+        bytes: usize,
+        stride: usize,
+        pattern: Pattern,
+        seed: u64,
+        locality_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         check_cancel(cancellation)?;
+        if bytes < stride
+            || !bytes.is_multiple_of(stride)
+            || locality_bytes < stride
+            || !locality_bytes.is_multiple_of(stride)
+        {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Pointer-chain size/locality must contain whole cache-line nodes.",
+            ));
+        }
         let mut buffer = AlignedBuffer::new(bytes)?;
         let nodes = bytes / stride;
         let base = buffer.as_mut_ptr();
@@ -205,10 +228,10 @@ impl Chain {
                 base.add(i * stride).cast::<usize>().write(i * stride);
             }
         }
-        let mut state = SEED;
+        let mut state = seed;
         let block_nodes = match pattern {
             Pattern::RandomObjects => nodes,
-            Pattern::Localized => LOCAL_BYTES / stride,
+            Pattern::Localized => locality_bytes / stride,
         };
         for begin in (0..nodes).step_by(block_nodes) {
             check_cancel(cancellation)?;
@@ -315,10 +338,30 @@ pub fn run(
     device: &DeviceDescriptor,
     topology: &CpuTopology,
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    let _measurement_scope = gluj_bench_core::MeasurementScope::enter(config, pattern.id());
     check_cancel(cancellation)?;
     let mut system = sysinfo::System::new();
     system.refresh_memory();
-    let (bytes, stride, llc) = layout(topology, system.available_memory())?;
+    let (default_bytes, stride, llc) = layout(
+        topology,
+        if config.options.contains_key("dataset_bytes") {
+            u64::MAX
+        } else {
+            system.available_memory()
+        },
+    )?;
+    let bytes = latency_bytes(
+        config,
+        default_bytes,
+        stride,
+        (system.available_memory() / 16).min(1024 * MIB),
+    )?;
+    let access = gluj_bench_core::AccessPolicy::from_config(config)?;
+    let locality = config
+        .options
+        .get("locality_block_bytes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(LOCAL_BYTES);
     let location = topology.representative;
     let _affinity = AffinityGuard::pin(location)?;
     progress(ProgressUpdate {
@@ -326,19 +369,43 @@ pub fn run(
         phase: "prepare".into(),
         message: format!("Preparing {} pointer chain", pattern.name()),
     });
-    let chain = Chain::new(bytes, stride, pattern, cancellation)?;
+    let mut chain = Chain::new_seeded(
+        bytes,
+        stride,
+        pattern,
+        access.derived_seed(0, bytes, 0),
+        locality,
+        cancellation,
+    )?;
     progress(ProgressUpdate {
         fraction: 0.05,
         phase: "warmup".into(),
         message: "Warming and validating a full RAM traversal".into(),
     });
-    chain.traverse(cancellation)?;
-    let target = config.target_duration_ms.saturating_mul(1_000_000) / u64::from(config.samples);
+    {
+        let _warmup = gluj_bench_core::phase_timer("warmup-and-chain-validation");
+        chain.traverse(cancellation)?;
+    }
+    let target = gluj_bench_core::sample_target_ns(config);
     let mut values = Vec::new();
     let mut elapsed_total = 0u64;
     let mut loads_total = 0u64;
     let mut pacer = crate::pacing::CpuPacer::current(cancellation);
-    for sample in 0..config.samples {
+    for sample in 0..config.samples * access.realizations {
+        let realization = sample / config.samples;
+        if sample > 0 && sample.is_multiple_of(config.samples) {
+            chain = Chain::new_seeded(
+                bytes,
+                stride,
+                pattern,
+                access.derived_seed(0, bytes, realization),
+                locality,
+                cancellation,
+            )?;
+            let _warmup = gluj_bench_core::phase_timer("warmup-and-chain-validation");
+            chain.traverse(cancellation)?;
+        }
+        let observation_started = Instant::now();
         progress(ProgressUpdate {
             fraction: 0.1 + 0.9 * f64::from(sample) / f64::from(config.samples),
             phase: "sample".into(),
@@ -366,11 +433,37 @@ pub fn run(
             }
         }
         values.push(elapsed as f64 / loads as f64);
+        if let Some(recorder) = gluj_bench_core::observation_recorder() {
+            recorder
+                .with_realization(
+                    access.derived_seed(0, bytes, realization),
+                    BTreeMap::from([
+                        ("root_seed".into(), access.seed.to_string()),
+                        ("realization".into(), realization.to_string()),
+                        (
+                            "generator_revision".into(),
+                            "sattolo-single-cycle-v2".into(),
+                        ),
+                    ]),
+                )
+                .record(
+                    &format!("bytes-{bytes}"),
+                    "dependent_latency",
+                    *values.last().unwrap(),
+                    "ns",
+                    loads,
+                    "dependent_loads",
+                    elapsed,
+                    observation_started.elapsed().as_nanos() as u64,
+                    "validated",
+                );
+        }
         elapsed_total = elapsed_total.saturating_add(elapsed);
         loads_total = loads_total.saturating_add(loads);
     }
     let statistics = statistics(&values);
     let mut workload_metadata = BTreeMap::from([
+        ("result_validation".into(), "constructed single-cycle pointer chain; complete cycle checked during untimed warmup and measured traversals".into()),
         ("working_set_bytes".into(), bytes.to_string()),
         ("detected_aggregate_llc_bytes".into(), llc.to_string()),
         ("node_stride_bytes".into(), chain.stride.to_string()),
@@ -381,8 +474,8 @@ pub fn run(
         ("processor_group".into(), location.group.to_string()),
         ("processor_index".into(), location.index.to_string()),
         ("access_order".into(), pattern.access_order().into()),
-        ("random_seed".into(), SEED.to_string()),
-        ("latency_profile_revision".into(), "1".into()),
+        ("random_seed".into(), access.seed.to_string()),
+        ("latency_profile_revision".into(), "2-seed-ensemble".into()),
         ("metric_direction".into(), "lower_is_better".into()),
         ("preparation_timed".into(), "false".into()),
         ("cache_state".into(), "full_cycle_warmup_no_flush".into()),
@@ -399,8 +492,27 @@ pub fn run(
         .into(),
     );
     if pattern == Pattern::Localized {
-        workload_metadata.insert("locality_block_bytes".into(), LOCAL_BYTES.to_string());
+        workload_metadata.insert("locality_block_bytes".into(), locality.to_string());
     }
+    workload_metadata.insert(
+        "working_set_label".into(),
+        if bytes as u64 <= llc {
+            "custom cache-sized system-memory allocation"
+        } else {
+            "system-memory allocation; residency not measured"
+        }
+        .into(),
+    );
+    workload_metadata.insert("access_seed".into(), access.seed.to_string());
+    workload_metadata.insert(
+        "access_realizations".into(),
+        access.realizations.to_string(),
+    );
+    workload_metadata.insert(
+        "access_generator_revision".into(),
+        "sattolo-single-cycle-v2".into(),
+    );
+    workload_metadata.insert("statistical_summary".into(),"equal observations per seed; pooled descriptive median; separate native realization summaries".into());
     progress(ProgressUpdate {
         fraction: 1.0,
         phase: "complete".into(),
@@ -542,5 +654,60 @@ mod tests {
             assert!(Chain::new(nodes * 64, 64, Pattern::Localized, &cancelled).is_err());
             assert_eq!(chain.traverse(&cancelled).unwrap_err().code, "cancelled");
         }
+    }
+}
+
+pub(super) fn latency_bytes(
+    config: &BenchmarkConfig,
+    default: usize,
+    stride: usize,
+    cap: u64,
+) -> Result<usize, BenchmarkError> {
+    let bytes = config
+        .options
+        .get("dataset_bytes")
+        .map(|s| s.parse::<u64>())
+        .transpose()
+        .map_err(|_| BenchmarkError::new("invalid_config", "Invalid latency working set."))?
+        .unwrap_or(default as u64);
+    if bytes < stride as u64
+        || bytes > cap
+        || bytes > usize::MAX as u64
+        || !bytes.is_multiple_of(stride as u64)
+    {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Latency size must contain whole nodes and fit the available-memory headroom.",
+        ));
+    }
+    Ok(bytes as usize)
+}
+
+#[cfg(test)]
+mod seed_regressions {
+    use super::*;
+    #[test]
+    fn ensemble_chains_preserve_one_cycle_with_custom_locality_and_size() {
+        let token = CancellationToken::default();
+        for seed in [1, 2, 3] {
+            for pattern in [Pattern::RandomObjects, Pattern::Localized] {
+                let chain = Chain::new_seeded(64 * 101, 64, pattern, seed, 64 * 7, &token).unwrap();
+                let base = chain.buffer.as_ptr();
+                let mut cursor = base;
+                let mut seen = std::collections::BTreeSet::new();
+                for _ in 0..101 {
+                    assert!(seen.insert(cursor as usize - base as usize));
+                    cursor = unsafe { cursor.cast::<*const u8>().read() };
+                }
+                assert_eq!(cursor, base);
+                assert_eq!(seen.len(), 101);
+                chain.traverse_cycles(2, &token).unwrap();
+            }
+        }
+        let config = BenchmarkConfig {
+            options: BTreeMap::from([("dataset_bytes".into(), "100".into())]),
+            ..Default::default()
+        };
+        assert!(latency_bytes(&config, 4096, 64, 8192).is_err());
     }
 }

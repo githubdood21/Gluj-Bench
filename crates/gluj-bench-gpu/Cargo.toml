@@ -12,3 +12,5 @@ publish = false
 ash.workspace = true
 gluj-bench-core = { path = "../gluj-bench-core" }
 sysinfo.workspace = true
+half = "2"
+serde_json.workspace = true

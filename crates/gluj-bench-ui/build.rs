@@ -25,5 +25,6 @@ fn main() {
             .manifest_required()
             .expect("Windows application icon resource must compile");
     }
-    slint_build::compile("ui/app-window.slint").expect("Slint UI must compile");
+    let style = slint_build::CompilerConfiguration::new().with_style("fluent-dark".into());
+    slint_build::compile_with_config("ui/app-window.slint", style).expect("Slint UI must compile");
 }

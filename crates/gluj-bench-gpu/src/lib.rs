@@ -1,8 +1,11 @@
 mod analysis;
 mod compute;
 mod cooperative_matrix;
+mod memory_conditions;
 mod scaling;
 mod timing;
+mod traffic;
+mod validation;
 mod vulkan;
 mod vulkan_bandwidth;
 mod vulkan_compute_profile;
@@ -328,15 +331,20 @@ impl GpuBandwidthProvider {
     fn discover_tiers(
         &mut self,
         adapter_index: usize,
+        config: &BenchmarkConfig,
         cancellation: &CancellationToken,
         progress: &mut ProgressCallback<'_>,
     ) -> Result<Vec<EffectiveCacheTier>, BenchmarkError> {
+        let _calibration_scope =
+            gluj_bench_core::MeasurementScope::phase("calibration-cache-discovery");
+        let budget = gluj_bench_core::current_reference_budget();
         let adapter_id = self.adapters[adapter_index].id.clone();
-        if let Some(tiers) = self.inferred_tiers.get(&adapter_id) {
-            return Ok(tiers.clone());
-        }
+        self.sweep_points.remove(&adapter_id);
+        self.inferred_tiers.remove(&adapter_id);
         let context = vulkan_bandwidth::VulkanBandwidthContext::new(&self.adapters[adapter_index])?;
-        let limit = local_buffer_limit(&self.adapters[adapter_index]);
+        let limit = local_buffer_limit(&self.adapters[adapter_index]).min(
+            memory_conditions::local_memory_limit(&self.adapters[adapter_index], config)?,
+        );
         let sizes = sweep_sizes(limit);
         if sizes.len() < 4 {
             return Err(BenchmarkError::new(
@@ -363,9 +371,9 @@ impl GpuBandwidthProvider {
                     dispatch_bytes: size.max(64 * MIB),
                     operation: KernelOperation::Read,
                     flavor: KernelFlavor::Cache,
-                    precondition: false,
-                    sample_count: 3,
-                    target_per_sample: Duration::from_millis(100),
+                    precondition: true,
+                    sample_count: budget.minimum_samples,
+                    target_per_sample: Duration::from_nanos(budget.minimum_sample_ns),
                 },
                 cancellation,
             )?;
@@ -389,24 +397,36 @@ impl GpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let started = Instant::now();
-        let tiers = match self.discover_tiers(adapter_index, cancellation, progress) {
+        let tiers = match self.discover_tiers(adapter_index, config, cancellation, progress) {
             Ok(tiers) => tiers,
             Err(problem) if problem.code == "cancelled" => return Err(problem),
             Err(problem) => {
-                progress(done("GPU cache tier is not measurable on this adapter."));
-                return Ok(self.cache_discovery_result(
-                    adapter_index,
-                    started,
-                    "unavailable",
-                    Some(&problem.code),
+                return Err(BenchmarkError::new(
+                    "cache_discovery_unavailable",
+                    format!(
+                        "Cache discovery could not complete ({}): {}. Completed discovery observations are preserved.",
+                        problem.code, problem.message
+                    ),
                 ));
             }
         };
         if tiers.is_empty() {
-            progress(done(
-                "No isolatable GPU cache tier was detected on this adapter.",
-            ));
-            return Ok(self.cache_discovery_result(adapter_index, started, "not_detected", None));
+            let mut result = memory_conditions::run(
+                &self.adapters[adapter_index],
+                CACHE_ID,
+                config,
+                cancellation,
+                progress,
+            )?;
+            result
+                .workload_metadata
+                .insert("cache_discovery_status".into(), "not_detected".into());
+            result.workload_metadata.insert("cache_calibration_policy".into(),"fresh full sweep found no isolatable tier; cache-oriented shader bandwidth measured at the resolved bounded buffer size; no physical cache capacity claim".into());
+            result.workload_metadata.insert(
+                "cache_discovery_revision".into(),
+                "cache-plateau-heuristic-2-per-run".into(),
+            );
+            return Ok(result);
         }
         let context = vulkan_bandwidth::VulkanBandwidthContext::new(&self.adapters[adapter_index])?;
         let mut metrics = Vec::new();
@@ -447,6 +467,7 @@ impl GpuBandwidthProvider {
         }
         let operation_count = tiers.len() * 3;
         let mut completed = 0usize;
+        let mut allocated_peak = 0_u64;
         for (tier_index, tier) in tiers.iter().copied().enumerate() {
             let lower = tier_index.checked_sub(1).map(|index| tiers[index]);
             let Some(working_set) = cache_working_set(tier, lower) else {
@@ -457,6 +478,7 @@ impl GpuBandwidthProvider {
                 continue;
             };
             let label = tier_label(tier_index);
+            allocated_peak = allocated_peak.max(2 * working_set + working_set.max(64 * MIB) / 16);
             metadata.insert(
                 format!("estimated_effective_{label}_classification"),
                 "inferred".into(),
@@ -474,8 +496,8 @@ impl GpuBandwidthProvider {
                 tier.estimated_capacity.to_string(),
             );
             metadata.insert(
-                format!("estimated_effective_{label}_confidence"),
-                format!("{:.3}", tier.confidence),
+                format!("estimated_effective_{label}_heuristic_drop_strength"),
+                format!("{:.3}", tier.drop_strength),
             );
             metadata.insert(
                 format!("estimated_effective_{label}_working_set_bytes"),
@@ -526,6 +548,59 @@ impl GpuBandwidthProvider {
             ));
         }
         progress(done("GPU effective cache benchmark completed."));
+        metadata.insert(
+            "cache_calibration_policy".into(),
+            "fresh full sweep for this run; no lifetime discovery reuse".into(),
+        );
+        metadata.insert(
+            "cache_calibration_device_uuid".into(),
+            self.adapters[adapter_index].vulkan.device_uuid.clone(),
+        );
+        metadata.insert(
+            "cache_calibration_driver_version".into(),
+            self.adapters[adapter_index]
+                .vulkan
+                .driver_version
+                .to_string(),
+        );
+        metadata.insert(
+            "cache_calibration_time_unix_ms".into(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .to_string(),
+        );
+        let reference_budget = gluj_bench_core::current_reference_budget();
+        metadata.insert(
+            "cache_calibration_reference_samples".into(),
+            reference_budget.minimum_samples.to_string(),
+        );
+        metadata.insert(
+            "cache_calibration_min_sample_ns".into(),
+            reference_budget.minimum_sample_ns.to_string(),
+        );
+        metadata.insert(
+            "cache_discovery_revision".into(),
+            "cache-plateau-heuristic-2-per-run".into(),
+        );
+        metadata.insert("cache_transition_interpretation".into(),"adjacent tested sizes bracket an inferred transition; drop strength is a throughput-drop heuristic, not a probability or statistical confidence".into());
+        metadata.insert(
+            "allocated_test_buffer_bytes".into(),
+            allocated_peak.to_string(),
+        );
+        metadata.insert(
+            "allocation_budget_bytes".into(),
+            gluj_bench_core::vram_budget_bytes(
+                self.adapters[adapter_index]
+                    .vulkan
+                    .device_local_memory_bytes,
+                gluj_bench_core::vram_budget_percent(config)?,
+            )
+            .to_string(),
+        );
+        metadata.insert("result_validation".into(), "boundary/interior known source, write, checksum and copy destination patterns checked outside measured execution".into());
+        normalize_copy_presentation(&mut metrics, &mut metadata);
         Ok(BenchmarkResult {
             benchmark_id: CACHE_ID.into(),
             device_id: self.adapters[adapter_index].id.clone(),
@@ -545,14 +620,16 @@ impl GpuBandwidthProvider {
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let started = Instant::now();
         let (tiers, cache_discovery_status) =
-            match self.discover_tiers(adapter_index, cancellation, progress) {
+            match self.discover_tiers(adapter_index, config, cancellation, progress) {
                 Ok(tiers) if !tiers.is_empty() => (tiers, "detected"),
                 Ok(_) => (Vec::new(), "not_detected"),
                 Err(problem) if problem.code == "cancelled" => return Err(problem),
                 Err(_) => (Vec::new(), "unavailable"),
             };
         let outer = tiers.last().copied();
-        let limit = local_buffer_limit(&self.adapters[adapter_index]);
+        let limit = local_buffer_limit(&self.adapters[adapter_index]).min(
+            memory_conditions::local_memory_limit(&self.adapters[adapter_index], config)?,
+        );
         let Some(working_set) = vram_working_set(outer, limit) else {
             return Err(BenchmarkError::new(
                 "insufficient_cache_separation",
@@ -627,6 +704,59 @@ impl GpuBandwidthProvider {
         );
         metadata.insert("copy_path".into(), "raw_vulkan_copy_command".into());
         progress(done("GPU-local memory benchmark completed."));
+        metadata.insert(
+            "cache_calibration_policy".into(),
+            "fresh full sweep for this run; no lifetime discovery reuse".into(),
+        );
+        metadata.insert(
+            "cache_calibration_device_uuid".into(),
+            self.adapters[adapter_index].vulkan.device_uuid.clone(),
+        );
+        metadata.insert(
+            "cache_calibration_driver_version".into(),
+            self.adapters[adapter_index]
+                .vulkan
+                .driver_version
+                .to_string(),
+        );
+        metadata.insert(
+            "cache_calibration_time_unix_ms".into(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .to_string(),
+        );
+        let reference_budget = gluj_bench_core::current_reference_budget();
+        metadata.insert(
+            "cache_calibration_reference_samples".into(),
+            reference_budget.minimum_samples.to_string(),
+        );
+        metadata.insert(
+            "cache_calibration_min_sample_ns".into(),
+            reference_budget.minimum_sample_ns.to_string(),
+        );
+        metadata.insert(
+            "cache_discovery_revision".into(),
+            "cache-plateau-heuristic-2-per-run".into(),
+        );
+        metadata.insert("cache_transition_interpretation".into(),"adjacent tested sizes bracket an inferred transition; drop strength is a throughput-drop heuristic, not a probability or statistical confidence".into());
+        metadata.insert(
+            "allocated_test_buffer_bytes".into(),
+            (2 * working_set + (working_set / 256).max(4)).to_string(),
+        );
+        metadata.insert(
+            "allocation_budget_bytes".into(),
+            gluj_bench_core::vram_budget_bytes(
+                self.adapters[adapter_index]
+                    .vulkan
+                    .device_local_memory_bytes,
+                gluj_bench_core::vram_budget_percent(config)?,
+            )
+            .to_string(),
+        );
+        metadata.insert("result_validation".into(), "boundary/interior known source, write, checksum and copy destination patterns checked outside measured execution".into());
+        normalize_copy_presentation(&mut metrics, &mut metadata);
         Ok(BenchmarkResult {
             benchmark_id: VRAM_ID.into(),
             device_id: self.adapters[adapter_index].id.clone(),
@@ -635,33 +765,6 @@ impl GpuBandwidthProvider {
             workload_metadata: metadata,
             device_metadata: bandwidth_device_metadata(&self.adapters[adapter_index]),
         })
-    }
-
-    fn cache_discovery_result(
-        &self,
-        adapter_index: usize,
-        started: Instant,
-        status: &str,
-        reason: Option<&str>,
-    ) -> BenchmarkResult {
-        let mut metadata = bandwidth_metadata(&self.adapters[adapter_index], "gpu_timestamp");
-        metadata.insert("cache_discovery_status".into(), status.into());
-        metadata.insert("physical_cache_identity_confirmed".into(), "false".into());
-        metadata.insert(
-            "cache_discovery_note".into(),
-            "No isolatable effective cache tier was required or observed; this is expected on some unified-memory and integrated GPUs.".into(),
-        );
-        if let Some(reason) = reason {
-            metadata.insert("cache_discovery_reason".into(), reason.into());
-        }
-        BenchmarkResult {
-            benchmark_id: CACHE_ID.into(),
-            device_id: self.adapters[adapter_index].id.clone(),
-            elapsed_ns: duration_ns(started.elapsed()),
-            metrics: vec![metric("effective_cache_tiers_detected".into(), vec![0.0])],
-            workload_metadata: metadata,
-            device_metadata: bandwidth_device_metadata(&self.adapters[adapter_index]),
-        }
     }
 
     fn run_host_link(
@@ -759,6 +862,126 @@ impl BenchmarkProvider for GpuBandwidthProvider {
         self.benchmark_descriptors()
     }
 
+    fn conditions(&self) -> Vec<gluj_bench_core::ConditionDescriptor> {
+        let matrix = cooperative_matrix::descriptors(&self.adapters);
+        self.benchmark_descriptors()
+            .iter()
+            .map(|descriptor| {
+                let mut condition = gluj_bench_core::legacy_condition(descriptor);
+                if descriptor.id.contains("matrix") && descriptor.id.ends_with(".scaling") {
+                    let mut names=self.adapters.iter().flat_map(|a|cooperative_matrix::tile_shapes(a,&descriptor.id)).map(cooperative_matrix::shape_name).collect::<Vec<_>>();names.sort();names.dedup();
+                    if let Some(option)=condition.options.iter_mut().find(|o|o.key=="matrix_tile_shape") && let gluj_bench_core::OptionDomain::Choice{values}=&mut option.domain {values.extend(names.clone());}
+                    for name in names {
+                        let supported=self.adapters.iter().filter(|a|cooperative_matrix::tile_shapes(a,&descriptor.id).iter().any(|s|cooperative_matrix::shape_name(*s)==name)).map(|a|a.id.clone()).collect();
+                        condition.capabilities.push(gluj_bench_core::ModeCapability{when:BTreeMap::from([("matrix_tile_shape".into(),name)]),supported_device_ids:supported,unavailable_reason:"Tile geometry/input/accumulator combination is not advertised by this GPU.".into()});
+                    }
+                }
+
+                if gluj_bench_core::gpu_buffered_vector(&descriptor.id) {
+                    let key = if descriptor.id == "gpu.performance.fp32.offload.scaling" {
+                        "gpu_offload_preset"
+                    } else {
+                        "gpu_preset"
+                    };
+                    if let Some(option) = condition.options.iter().find(|o| o.key == key)
+                        && let gluj_bench_core::OptionDomain::Choice { values } = &option.domain
+                    {
+                        let buffered = self
+                            .adapters
+                            .iter()
+                            .filter(|a| {
+                                a.supports_vulkan_timestamps()
+                                    && a.vulkan.api_version >= ash::vk::API_VERSION_1_1
+                            })
+                            .map(|a| a.id.clone())
+                            .collect::<Vec<_>>();
+                        for value in values.iter().filter(|v| v.as_str() != "register") {
+                            condition
+                                .capabilities
+                                .push(gluj_bench_core::ModeCapability {
+                                    when: BTreeMap::from([(key.into(), value.clone())]),
+                                    supported_device_ids: buffered.clone(),
+                                    unavailable_reason:
+                                        "Buffered vector shaders require Vulkan 1.1 or newer."
+                                            .into(),
+                                });
+                        }
+                    }
+                }
+
+                if descriptor.id == "gpu.performance.fp16"
+                    && let Some(option) = condition.options.iter().find(|o| o.key == "gpu_preset")
+                    && let gluj_bench_core::OptionDomain::Choice { values } = &option.domain
+                {
+                    let buffered = self
+                        .adapters
+                        .iter()
+                        .filter(|a| {
+                            a.supports_vulkan_timestamps()
+                                && compute::ComputeKind::Fp16.supported_by_vulkan(a)
+                                && a.vulkan.storage_buffer_16bit_access
+                        })
+                        .map(|a| a.id.clone())
+                        .collect::<Vec<_>>();
+                    for value in values {
+                        condition
+                            .capabilities
+                            .push(gluj_bench_core::ModeCapability {
+                            when: BTreeMap::from([("gpu_preset".into(), value.clone())]),
+                            supported_device_ids: if value == "register" {
+                                descriptor.supported_device_ids.clone()
+                            } else {
+                                buffered.clone()
+                            },
+                            unavailable_reason:
+                                "Buffered FP16 requires shaderFloat16 and storageBuffer16BitAccess."
+                                    .into(),
+                        });
+                    }
+                }
+                let (register_id, preset_key) = match descriptor.id.as_str() {
+                    "gpu.performance.matrix.fp16.scaling" => {
+                        ("gpu.performance.matrix.fp16", "gpu_matrix_preset")
+                    }
+                    "gpu.performance.matrix.int8.scaling" => {
+                        ("gpu.performance.matrix.int8", "gpu_int8_matrix_preset")
+                    }
+                    _ => return condition,
+                };
+                if let Some(register) = matrix.iter().find(|d| d.id == register_id) {
+                    if let Some(option) = condition.options.iter().find(|o| o.key == preset_key)
+                        && let gluj_bench_core::OptionDomain::Choice { values } = &option.domain
+                    {
+                        for value in values {
+                            let capability = if value == "register" {
+                                register
+                            } else {
+                                descriptor
+                            };
+                            condition
+                                .capabilities
+                                .push(gluj_bench_core::ModeCapability {
+                                    when: BTreeMap::from([(preset_key.into(), value.clone())]),
+                                    supported_device_ids: capability.supported_device_ids.clone(),
+                                    unavailable_reason: capability.unavailable_reason.clone(),
+                                });
+                        }
+                    }
+                    condition
+                        .supported_device_ids
+                        .extend(register.supported_device_ids.clone());
+                    condition.supported_device_ids.sort();
+                    condition.supported_device_ids.dedup();
+                    condition.available = !condition.supported_device_ids.is_empty();
+                    if condition.available {
+                        condition.unavailable_reason.clear();
+                    }
+                }
+                condition
+            })
+            .collect()
+    }
+
     fn run(
         &mut self,
         benchmark_id: &str,
@@ -766,6 +989,10 @@ impl BenchmarkProvider for GpuBandwidthProvider {
         cancellation: &CancellationToken,
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
+        let measured_config = gluj_bench_core::resolve_measurement_config(config)?;
+        let config = &measured_config;
+        let _measurement_scope = gluj_bench_core::MeasurementScope::enter(config, benchmark_id);
+
         let selected_id = self.selected_adapter(config)?.id.clone();
         let adapter_index = self
             .adapters
@@ -779,6 +1006,40 @@ impl BenchmarkProvider for GpuBandwidthProvider {
                 "timestamp_query_unsupported",
                 "This GPU does not expose Vulkan timestamps required for GPU-local timing.",
             ));
+        }
+        if (gluj_bench_core::gpu_memory(benchmark_id)
+            && (config
+                .options
+                .get("dataset_mode")
+                .is_some_and(|m| m != "automatic")
+                || config
+                    .options
+                    .get("access_pattern")
+                    .is_some_and(|p| p != "sequential")
+                || config
+                    .options
+                    .get("memory_operation")
+                    .is_some_and(|p| p != "all")
+                || config
+                    .options
+                    .get("access_realizations")
+                    .is_some_and(|v| v != "1")
+                || config.options.get("memory_copy_path").is_some_and(|v| {
+                    v != if benchmark_id == VRAM_ID {
+                        "native"
+                    } else {
+                        "shader"
+                    }
+                })))
+            || gluj_bench_core::gpu_transfer(benchmark_id)
+        {
+            return memory_conditions::run(
+                &self.adapters[adapter_index],
+                benchmark_id,
+                config,
+                cancellation,
+                progress,
+            );
         }
         match benchmark_id {
             CACHE_ID => self.run_cache(adapter_index, config, cancellation, progress),
@@ -820,6 +1081,16 @@ fn descriptor(
         "cache_identity_policy".into(),
         "estimated_effective_inferred".into(),
     );
+    // Conservative buffer estimate for preview; actual device limits can reduce it.
+    metadata.insert(
+        "estimated_peak_test_buffer_bytes".into(),
+        (if id == HOST_LINK_ID {
+            64 * MIB * 4
+        } else {
+            CACHE_SWEEP_MAX * 2 + MIB
+        })
+        .to_string(),
+    );
     BenchmarkDescriptor {
         id: id.into(),
         name: name.into(),
@@ -850,9 +1121,7 @@ fn host_transfer_size(adapter_limit: u64, available_memory: u64, integrated: boo
 }
 
 fn per_sample_duration(config: &BenchmarkConfig) -> Duration {
-    gluj_bench_core::gpu_burst_duration(Duration::from_millis(
-        (config.target_duration_ms / config.samples.max(1) as u64).max(1),
-    ))
+    gluj_bench_core::sample_duration(config)
 }
 
 fn metric(name: String, values: Vec<f64>) -> Metric {
@@ -902,8 +1171,16 @@ fn bandwidth_metadata(record: &AdapterRecord, timing_domain: &str) -> BTreeMap<S
     metadata.insert("shader_format".into(), "embedded_spirv".into());
     metadata.insert("shader_source_language".into(), "GLSL".into());
     metadata.insert(
+        "shader_build_manifest".into(),
+        include_str!("../shaders/memory-matrix-build.json").into(),
+    );
+    metadata.insert(
         "bandwidth_kernel_revision".into(),
-        "vulkan-storage-vector-1".into(),
+        "vulkan-storage-vector-3-access-and-ordered-writes".into(),
+    );
+    metadata.insert(
+        "input_initialization".into(),
+        "known-source-A5-output-CC-with-untimed-validation".into(),
     );
     metadata
 }
@@ -964,6 +1241,33 @@ fn done(message: &str) -> ProgressUpdate {
 
 fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn normalize_copy_presentation(metrics: &mut Vec<Metric>, metadata: &mut BTreeMap<String, String>) {
+    let mut traffic = Vec::new();
+    for metric in metrics
+        .iter_mut()
+        .filter(|m| m.name == "copy" || m.name.ends_with(".copy"))
+    {
+        let mut accounted = metric.clone();
+        accounted.name.push_str("_accounted_read_write");
+        traffic.push(accounted);
+        metric.value *= 0.5;
+        metric.statistics.minimum *= 0.5;
+        metric.statistics.median *= 0.5;
+        metric.statistics.maximum *= 0.5;
+        metric.statistics.standard_deviation *= 0.5;
+    }
+    metrics.extend(traffic);
+    metadata.insert("copy_byte_definition".into(), "useful_payload".into());
+    metadata.insert(
+        "copy_accounting_revision".into(),
+        "useful-payload-plus-logical-traffic-v1".into(),
+    );
+    metadata.insert(
+        "copy_raw_observation_definition".into(),
+        "accounted read plus write traffic; primary summary is useful payload = traffic/2".into(),
+    );
 }
 
 #[cfg(test)]
@@ -1045,5 +1349,23 @@ mod tests {
             KernelOperation::Read.accesses_per_invocation(KernelFlavor::Stream),
             64
         );
+    }
+}
+
+#[cfg(test)]
+mod copy_presentation_regressions {
+    use super::*;
+    #[test]
+    fn payload_summary_and_logical_traffic_remain_distinct() {
+        let original = metric("l2.copy".into(), vec![100.0, 200.0, 300.0]);
+        let mut metrics = vec![original.clone()];
+        let mut metadata = BTreeMap::new();
+        normalize_copy_presentation(&mut metrics, &mut metadata);
+        assert_eq!(metrics[0].value, 100.0);
+        assert_eq!(metrics[0].statistics.minimum, 50.0);
+        assert_eq!(metrics[1].value, 200.0);
+        assert_eq!(metrics[1].name, "l2.copy_accounted_read_write");
+        assert_eq!(original.value, 200.0);
+        assert_eq!(metadata["copy_byte_definition"], "useful_payload");
     }
 }

@@ -16,12 +16,33 @@ const PATTERN: &[u8] = b"The quick brown fox searches these ASCII records for th
 pub(crate) struct Buffers {
     input: Vec<u8>,
     hits: u64,
+    expected_hits: Option<u64>,
 }
 impl Buffers {
+    #[cfg(test)]
     pub(crate) fn new(
         bytes: usize,
         cancellation: &CancellationToken,
     ) -> Result<Self, BenchmarkError> {
+        Self::new_content(
+            bytes,
+            "patterned",
+            gluj_bench_core::DEFAULT_ACCESS_SEED,
+            cancellation,
+        )
+    }
+    pub(crate) fn new_content(
+        bytes: usize,
+        content: &str,
+        seed: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, BenchmarkError> {
+        if !["patterned", "mixed", "no_hits", "all_hits"].contains(&content) {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unknown ASCII content distribution.",
+            ));
+        }
         let mut input = Vec::new();
         input.try_reserve_exact(bytes).map_err(|_| {
             BenchmarkError::new("allocation_failed", "Could not allocate the ASCII input.")
@@ -34,26 +55,78 @@ impl Buffers {
                 ));
             }
             input.extend(
-                (start..bytes.min(start + 1024 * 1024)).map(|index| PATTERN[index % PATTERN.len()]),
+                (start..bytes.min(start + 1024 * 1024)).map(|index| match content {
+                    "no_hits" => b'x',
+                    "all_hits" => b'e',
+                    "mixed" => {
+                        let value = gluj_bench_core::derive_seed(seed, 0, index as u64, 0);
+                        if value.is_multiple_of(4) {
+                            b'e'
+                        } else {
+                            b'A' + (value % 26) as u8
+                        }
+                    }
+                    _ => PATTERN[index % PATTERN.len()],
+                }),
             );
         }
-        Ok(Self { input, hits: 0 })
+        Ok(Self {
+            input,
+            hits: 0,
+            expected_hits: None,
+        })
     }
+    #[cfg(test)]
     pub(crate) fn sweep(&mut self, cancellation: &CancellationToken) -> bool {
-        let mut hits = 0u64;
-        // Keep cancellation responsive even with multi-GB inputs. Chunk boundaries
-        // are record aligned and do not change the scan operation or byte count.
-        for chunk in self.input.chunks(1024 * 1024) {
-            if cancellation.is_cancelled() {
-                return false;
-            }
-            hits += compute::scan(black_box(chunk)).1;
+        if cancellation.is_cancelled() {
+            return false;
         }
+        let mut schedule = gluj_bench_core::AccessPolicy::from_config(&Default::default())
+            .unwrap()
+            .schedule(self.input.len(), 64, 0, 0, cancellation)
+            .unwrap();
+        self.sweep_scheduled(cancellation, &mut schedule)
+    }
+    pub(crate) fn sweep_scheduled(
+        &mut self,
+        cancellation: &CancellationToken,
+        schedule: &mut gluj_bench_core::AccessSchedule,
+    ) -> bool {
+        let mut hits = 0;
+        let complete = schedule.visit(cancellation, |range| {
+            hits += compute::scan(black_box(&self.input[range])).1;
+        });
         self.hits = black_box(hits);
-        true
+        complete
+    }
+    pub(crate) fn expected_hits(&self) -> u64 {
+        self.expected_hits.unwrap_or(0)
+    }
+    pub(crate) fn prepare_reference(
+        &mut self,
+        schedule: &mut gluj_bench_core::AccessSchedule,
+        cancellation: &CancellationToken,
+    ) {
+        let mut expected = 0;
+        schedule.visit(cancellation, |range| {
+            expected += self.input[range].iter().filter(|b| **b == b'e').count() as u64;
+        });
+        self.expected_hits = Some(expected);
     }
     pub(crate) fn checksum(&self) -> u64 {
         black_box(self.hits)
+    }
+    pub(crate) fn validate(&self) -> Result<(), BenchmarkError> {
+        let expected = self
+            .expected_hits
+            .unwrap_or_else(|| self.input.iter().filter(|byte| **byte == b'e').count() as u64);
+        if self.hits != expected {
+            return Err(BenchmarkError::new(
+                "result_validation_failed",
+                "ASCII scan differs from the bytewise reference.",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -84,7 +157,7 @@ pub fn descriptor(
         .unwrap();
     item.workload = "ASCII character counting with automatic or fully custom input sizes".into();
     item.metadata
-        .insert("kernel_revision".into(), "ascii-scan-1".into());
+        .insert("kernel_revision".into(), "ascii-scan-2-access".into());
     item.metadata.insert(
         "operation_definition".into(),
         "one 64-byte ASCII record scanned for the letter e".into(),
@@ -230,7 +303,9 @@ pub fn run(
         system.available_memory(),
         percent,
     );
-    let (requested, single) = dataset(config, limit, topology, &workers)?;
+    let payload_limit =
+        gluj_bench_core::AccessPolicy::from_config(config)?.payload_budget(limit, workers.len(), 1);
+    let (requested, single) = dataset(config, payload_limit, topology, &workers)?;
     let tiers = sizes(requested, workers.len(), single);
     if tiers.is_empty() {
         return Err(BenchmarkError::new(
@@ -240,21 +315,29 @@ pub fn run(
     }
     let mut metrics = Vec::new();
     let mut elapsed_ns = 0;
+    progress(ProgressUpdate {
+        fraction: 0.04,
+        phase: "measurement_plan".into(),
+        message: gluj_bench_core::measurement_estimate(config, tiers.len()),
+    });
+    let visits = gluj_bench_core::condition_visits(&tiers, config);
+    let mut accumulated: BTreeMap<(u64, &str, &str), Vec<f64>> = BTreeMap::new();
     let mut checksum = 0;
-    for (index, bytes) in tiers.iter().enumerate() {
+    for (index, (bytes, block_config, block)) in visits.iter().enumerate() {
+        let _block_scope = gluj_bench_core::MeasurementScope::block(block_config, ID, *block);
         progress(ProgressUpdate {
-            fraction: index as f64 / tiers.len() as f64,
+            fraction: index as f64 / visits.len() as f64,
             phase: "ascii_scan".into(),
             message: format!(
                 "Scanning {bytes} bytes of ASCII input ({}/{})",
                 index + 1,
-                tiers.len()
+                visits.len()
             ),
         });
         let (records, bandwidth, elapsed, hash) = compute_scaling::measure(
             &workers,
             *bytes,
-            config,
+            block_config,
             cancellation,
             compute_scaling::Kernel::Ascii,
         )?;
@@ -264,14 +347,20 @@ pub fn run(
             ("compute", records, "strings/s"),
             ("bandwidth", bandwidth, "bytes/s"),
         ] {
-            let stats = crate::kernels::statistics(&values);
-            metrics.push(Metric {
-                name: format!("working_set_{bytes}.{suffix}"),
-                value: stats.median,
-                unit: unit.into(),
-                statistics: stats,
-            });
+            accumulated
+                .entry((*bytes, suffix, unit))
+                .or_default()
+                .extend(values);
         }
+    }
+    for ((bytes, suffix, unit), values) in accumulated {
+        let stats = crate::kernels::statistics(&values);
+        metrics.push(Metric {
+            name: format!("working_set_{bytes}.{suffix}"),
+            value: stats.median,
+            unit: unit.into(),
+            statistics: stats,
+        });
     }
     let record_tiers = metrics
         .iter()
@@ -290,17 +379,18 @@ pub fn run(
         .map(String::as_str)
         .unwrap_or("compute");
     let mut metadata = BTreeMap::from([
+        ("result_validation".into(), "every visited dataset: complete bytewise ASCII hit count checked independently outside timing".into()),
         ("ascii_preset".into(), preset.into()),
         ("dataset_mode".into(), if single { "single" } else { "sweep" }.into()),
-        ("kernel_revision".into(), "ascii-scan-1".into()),
+        ("kernel_revision".into(), "ascii-scan-2-access".into()),
         ("harness_revision".into(), "4".into()),
         ("data_type".into(), "64-byte ASCII record".into()),
         ("operation_definition".into(), "one 64-byte ASCII record scanned for the letter e".into()),
         ("record_bytes".into(), RECORD_BYTES.to_string()),
-        ("input_pattern".into(), "fixed_ascii_sentence_v1".into()),
+        ("input_pattern".into(), config.options.get("ascii_content").cloned().unwrap_or_else(||"patterned".into())),
         ("instruction_path".into(), instruction_path().into()),
         ("working_set_definition".into(), "aggregate ASCII input buffers across selected workers; no output arrays".into()),
-        ("byte_definition".into(), "input bytes read once per complete scan; effective payload, not physical RAM traffic".into()),
+        ("byte_definition".into(), "all scheduled input visits, including hot-region repetitions; effective payload, not physical RAM traffic".into()),
         ("thread_count".into(), workers.len().to_string()),
         ("thread_mode".into(), if !crate::topology::explicit_core_limit(config) && config.options.get("thread_mode").is_some_and(|mode| mode == "logical_processors") { "logical_processors" } else { "physical_cores" }.into()),
         ("affinity".into(), "one_worker_per_selected_processor".into()),
@@ -314,9 +404,10 @@ pub fn run(
         ("aggregate_working_set_bytes".into(), resolved.to_string()),
         ("per_thread_working_set_bytes".into(), (resolved / workers.len() as u64).to_string()),
         ("tested_tier_count".into(), tiers.len().to_string()),
-        ("profile_sample_count_per_tier".into(), config.samples.to_string()),
-        ("target_duration_ms_per_tier".into(), config.target_duration_ms.to_string()),
-        ("warmup_ms_per_tier".into(), "100".into()),
+        ("profile_sample_count_per_tier".into(), (config.samples*gluj_bench_core::AccessPolicy::from_config(config)?.realizations).to_string()),
+        ("target_duration_ms_per_realization".into(), config.target_duration_ms.to_string()),
+        ("target_duration_ms_per_tier".into(), (config.target_duration_ms * gluj_bench_core::AccessPolicy::from_config(config)?.realizations as u64).to_string()),
+        ("warmup_ms_per_tier".into(), (gluj_bench_core::measurement_budget(config).warmup_ns/1_000_000).to_string()),
         ("buffer_ownership".into(), "pinned_thread_first_touch; disjoint inputs".into()),
         ("baseline_operations_per_second".into(), baseline.to_string()),
         ("bandwidth_transition_status".into(), if transition.is_some() { "observed" } else { "not_observed_within_tested_range" }.into()),
@@ -343,6 +434,17 @@ pub fn run(
         phase: "complete".into(),
         message: "ASCII scan complete".into(),
     });
+    metadata.insert(
+        "ascii_content".into(),
+        config
+            .options
+            .get("ascii_content")
+            .cloned()
+            .unwrap_or_else(|| "patterned".into()),
+    );
+    metadata.insert("ascii_expected_hits".into(),"independently counted across scheduled visits during preparation; recorded per worker/realization".into());
+    metadata.extend(gluj_bench_core::AccessPolicy::from_config(config)?.metadata());
+    metadata.insert("kernel_revision".into(), "ascii-scan-2-access".into());
     Ok(BenchmarkResult {
         benchmark_id: ID.into(),
         device_id: device.id.clone(),
@@ -482,7 +584,10 @@ mod tests {
             let result = registry
                 .run(ID, &config, &CancellationToken::default(), &mut |_| {})
                 .unwrap();
-            assert_eq!(result.workload_metadata["kernel_revision"], "ascii-scan-1");
+            assert_eq!(
+                result.workload_metadata["kernel_revision"],
+                "ascii-scan-2-access"
+            );
             assert_eq!(result.workload_metadata["ascii_preset"], preset);
             let records = result
                 .metrics

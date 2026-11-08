@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 miniz_oxide = "0.8"
+serde_json.workspace = true
 gluj-bench-core = { path = "../gluj-bench-core" }
 sysinfo.workspace = true
 windows-sys.workspace = true

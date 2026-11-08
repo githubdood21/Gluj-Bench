@@ -1,6 +1,6 @@
 #version 450
 
-layout(local_size_x = 256) in;
+layout(local_size_x_id = 0) in;
 layout(set = 0, binding = 0, std430) readonly buffer InputA { vec4 values[]; } input_a;
 layout(set = 0, binding = 1, std430) readonly buffer InputB { vec4 values[]; } input_b;
 layout(set = 0, binding = 2, std430) writeonly buffer Output { vec4 values[]; } output_data;
@@ -8,12 +8,21 @@ layout(push_constant) uniform Parameters {
     uint loop_count;
     uint element_count;
     uint seed;
-    uint padding;
+    uint access_mode;
+    uint block_multiplier;
+    uint block_offset;
+    uint lane_multiplier;
+    uint lane_offset;
 } params;
 
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= params.element_count) return;
+    uint block=index/256u; uint lane=index%256u; uint blocks=params.element_count/256u;
+    if(params.access_mode==1u || params.access_mode==3u) block=(block*params.block_multiplier+params.block_offset)%blocks;
+    if(params.access_mode==2u) block=(block+params.block_offset)%blocks;
+    if(params.access_mode==3u) lane=(lane*params.lane_multiplier+params.lane_offset)&255u;
+    index=block*256u+lane;
     vec4 x = input_a.values[index];
     vec4 y = input_b.values[index];
     float perturbation = float((index ^ params.seed) & 255u) * 0.000001;

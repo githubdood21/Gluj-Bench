@@ -20,14 +20,11 @@ use std::{
 };
 
 const SUITE_ID: &str = "cpu.performance";
-const PROBE_NS: u64 = 250_000_000;
-const PROBE_SAMPLES: u32 = 3;
-const WARMUP_NS: u64 = 200_000_000;
 const MEMORY_BOUND_RATIO: f64 = 0.80;
 const STRING_BYTES: usize = 64;
 const PRIME_SEARCH_LIMIT: usize = 1_000_000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Workload {
     Integer,
     Float32,
@@ -215,8 +212,33 @@ pub fn descriptors(
                     "lane-level multiply and add operations".into(),
                 );
             }
-            metadata.insert("kernel_revision".into(), "4".into());
-            metadata.insert("harness_revision".into(), "2".into());
+            metadata.insert(
+                "kernel_revision".into(),
+                if matches!(
+                    definition.workload,
+                    Workload::Integer
+                        | Workload::SingleThread
+                        | Workload::Popcnt
+                        | Workload::Avx2Fma
+                        | Workload::Avx2Fma64
+                ) {
+                    "5"
+                } else {
+                    "4"
+                }
+                .into(),
+            );
+            metadata.insert("harness_revision".into(), "4".into());
+            let estimated = match definition.workload {
+                Workload::Prime => PRIME_SEARCH_LIMIT as u64 + 1,
+                Workload::Compress | Workload::Decompress => 10 * 1024 * 1024,
+                Workload::String => 0, // Buffered scan advertises its resolved dataset separately.
+                _ => 0,
+            };
+            metadata.insert(
+                "estimated_peak_test_buffer_bytes_per_worker".into(),
+                estimated.to_string(),
+            );
             BenchmarkDescriptor {
                 id: definition.id.into(),
                 name: definition.name.into(),
@@ -244,87 +266,6 @@ struct Measurement {
     elapsed_ns: u64,
     cpu_ns: u64,
     checksum: u64,
-}
-
-fn measure<F>(
-    config: &BenchmarkConfig,
-    cancellation: &CancellationToken,
-    progress: &mut ProgressCallback<'_>,
-    label: &str,
-    mut chunk: F,
-) -> Result<Measurement, BenchmarkError>
-where
-    F: FnMut() -> (u64, u64),
-{
-    black_box(chunk());
-    let target_ns = config.target_duration_ms.saturating_mul(1_000_000) / u64::from(config.samples);
-    let mut values = Vec::with_capacity(config.samples as usize);
-    let mut elapsed_total = 0u64;
-    let mut cpu_total = 0u64;
-    let mut checksum = 0u64;
-    let mut pacer = crate::pacing::CpuPacer::current(cancellation);
-    for sample in 0..config.samples {
-        if cancellation.is_cancelled() {
-            return Err(BenchmarkError::new(
-                "cancelled",
-                "The benchmark was cancelled.",
-            ));
-        }
-        progress(ProgressUpdate {
-            fraction: f64::from(sample) / f64::from(config.samples),
-            phase: "measure".into(),
-            message: format!("{label}: sample {}/{}", sample + 1, config.samples),
-        });
-        let cpu_start = thread_cpu_time_ns();
-        let start = Instant::now();
-        let idle_before = pacer.idle();
-        let mut operations = 0u64;
-        loop {
-            let batch_start = Instant::now();
-            let (completed, value) = chunk();
-            operations = operations.saturating_add(completed);
-            checksum ^= value.rotate_left((operations & 63) as u32);
-            pacer.account(batch_start.elapsed())?;
-            if pacer.active_elapsed(start, idle_before).as_nanos() >= u128::from(target_ns) {
-                break;
-            }
-            if cancellation.is_cancelled() {
-                return Err(BenchmarkError::new(
-                    "cancelled",
-                    "The benchmark was cancelled.",
-                ));
-            }
-        }
-        let elapsed = pacer.active_elapsed(start, idle_before).as_nanos().max(1) as u64;
-        let cpu = thread_cpu_time_ns().saturating_sub(cpu_start);
-        values.push(operations as f64 * 1e9 / elapsed as f64);
-        elapsed_total = elapsed_total.saturating_add(elapsed);
-        cpu_total = cpu_total.saturating_add(cpu);
-    }
-    black_box(checksum);
-    Ok(Measurement {
-        values,
-        elapsed_ns: elapsed_total,
-        cpu_ns: cpu_total,
-        checksum,
-    })
-}
-
-fn quick_rate<F>(mut chunk: F) -> f64
-where
-    F: FnMut() -> (u64, u64),
-{
-    black_box(chunk());
-    let start = Instant::now();
-    let mut operations = 0u64;
-    let mut checksum = 0u64;
-    while start.elapsed().as_nanos() < u128::from(PROBE_NS) {
-        let (count, value) = chunk();
-        operations = operations.saturating_add(count);
-        checksum ^= value;
-    }
-    black_box(checksum);
-    operations as f64 * 1e9 / start.elapsed().as_nanos().max(1) as f64
 }
 
 fn patterned_bytes(length: usize) -> Vec<u8> {
@@ -492,6 +433,39 @@ enum ThreadWorkload {
 }
 
 impl ThreadWorkload {
+    fn validate_final(&self) -> Result<(), BenchmarkError> {
+        let valid = match self {
+            Self::Float32(value) | Self::Avx2Fma(value) => value.is_finite(),
+            Self::Float64(value) | Self::Avx2Fma64(value) => value.is_finite(),
+            Self::Prime(finder) => {
+                finder
+                    .marks
+                    .iter()
+                    .map(|mark| u64::from(*mark))
+                    .sum::<u64>()
+                    == 78_498
+            }
+            Self::Compress(codec) => {
+                decompress_to_vec(&codec.output).is_ok_and(|decoded| decoded == codec.input)
+            }
+            Self::Decompress(codec) => {
+                codec.output.len() == codec.output_len
+                    && decompress_to_vec(&codec.input).is_ok_and(|decoded| decoded == codec.output)
+            }
+            Self::String(input) => {
+                scan(input).1 == input.iter().filter(|byte| **byte == b'e').count() as u64
+            }
+            _ => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BenchmarkError::new(
+                "result_validation_failed",
+                "CPU output failed independent correctness validation.",
+            ))
+        }
+    }
     fn new(workload: Workload, thread_index: usize, large: bool, thread_count: usize) -> Self {
         let seed = thread_index as u64 + 1;
         match workload {
@@ -629,19 +603,42 @@ fn measure_parallel(
     let barrier = Arc::new(Barrier::new(locations.len()));
     let cancelled_all = Arc::new(AtomicBool::new(false));
     let intensity = gluj_bench_core::cpu_activity_percent();
+    let recorder = gluj_bench_core::observation_recorder();
+    let warmup_ns = gluj_bench_core::current_measurement_budget().warmup_ns;
     let thread_results = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(locations.len());
         for (thread_index, location) in locations.iter().copied().enumerate() {
+            let recorder = recorder.clone();
             let barrier = barrier.clone();
             let cancelled_all = cancelled_all.clone();
             handles.push(
                 scope.spawn(move || -> Result<Vec<ThreadSample>, BenchmarkError> {
-                    let _affinity = AffinityGuard::pin(location)?;
-                    let mut state =
-                        ThreadWorkload::new(workload, thread_index, large, locations.len());
+                    let prepared = AffinityGuard::pin(location);
+                    if prepared.is_err() {
+                        cancelled_all.store(true, Ordering::SeqCst);
+                    }
+                    barrier.wait();
+                    if cancelled_all.load(Ordering::SeqCst) {
+                        return Err(prepared.err().unwrap_or_else(|| {
+                            BenchmarkError::new(
+                                "worker_prepare_failed",
+                                "Another CPU worker could not set its processor placement.",
+                            )
+                        }));
+                    }
+                    let _affinity = prepared?;
+                    let mut state = {
+                        let _prepare = recorder
+                            .as_ref()
+                            .map(|recorder| recorder.phase_timer("preparation"));
+                        ThreadWorkload::new(workload, thread_index, large, locations.len())
+                    };
                     let mut pacer = crate::pacing::CpuPacer::new(intensity, cancellation);
+                    let warmup_timer = recorder
+                        .as_ref()
+                        .map(|recorder| recorder.phase_timer("warmup"));
                     let warmup_start = Instant::now();
-                    while warmup_start.elapsed().as_nanos() < u128::from(WARMUP_NS) {
+                    while warmup_start.elapsed().as_nanos() < u128::from(warmup_ns) {
                         let batch_start = Instant::now();
                         black_box(state.chunk());
                         if pacer.account(batch_start.elapsed()).is_err() {
@@ -649,6 +646,7 @@ fn measure_parallel(
                             break;
                         }
                     }
+                    drop(warmup_timer);
                     barrier.wait();
                     if cancelled_all.load(Ordering::SeqCst) {
                         return Err(BenchmarkError::new("cancelled", "CPU workload cancelled."));
@@ -700,7 +698,36 @@ fn measure_parallel(
                             cpu_ns,
                             checksum,
                         });
+                        if let Some(recorder) = &recorder {
+                            recorder.record(
+                                &format!("worker-{thread_index}:{workload:?}:large-{large}"),
+                                "worker_throughput",
+                                operations as f64 * 1e9 / elapsed_ns as f64,
+                                if matches!(workload, Workload::Compress | Workload::Decompress) {
+                                    "bytes/s"
+                                } else {
+                                    result_unit(workload)
+                                },
+                                operations,
+                                if matches!(workload, Workload::Compress | Workload::Decompress) {
+                                    "bytes"
+                                } else if workload == Workload::Prime {
+                                    "primes"
+                                } else if workload == Workload::String {
+                                    "strings"
+                                } else {
+                                    "operations"
+                                },
+                                elapsed_ns,
+                                start.elapsed().as_nanos() as u64,
+                                "not_recorded",
+                            );
+                        }
                     }
+                    let _validation = recorder
+                        .as_ref()
+                        .map(|recorder| recorder.phase_timer("validation"));
+                    state.validate_final()?;
                     Ok(samples)
                 }),
             );
@@ -767,10 +794,11 @@ fn run_parallel(
         phase: "prepare".into(),
         message: format!("Preparing {} logical-processor workers", locations.len()),
     });
-    let per_sample_ns =
-        config.target_duration_ms.saturating_mul(1_000_000) / u64::from(config.samples);
+    let per_sample_ns = gluj_bench_core::sample_target_ns(config);
     let mut memory_ratio = 1.0;
     if has_data_profile(definition.workload) {
+        let _probe_scope = gluj_bench_core::MeasurementScope::phase("reference-working-set-probe");
+        let probe_budget = gluj_bench_core::current_reference_budget();
         progress(ProgressUpdate {
             fraction: 0.05,
             phase: "diagnose".into(),
@@ -779,16 +807,16 @@ fn run_parallel(
         let cached = measure_parallel(
             definition.workload,
             locations,
-            PROBE_SAMPLES,
-            PROBE_NS,
+            probe_budget.minimum_samples,
+            probe_budget.minimum_sample_ns,
             cancellation,
             false,
         )?;
         let large = measure_parallel(
             definition.workload,
             locations,
-            PROBE_SAMPLES,
-            PROBE_NS,
+            probe_budget.minimum_samples,
+            probe_budget.minimum_sample_ns,
             cancellation,
             true,
         )?;
@@ -836,8 +864,23 @@ fn run_parallel(
     let aggregate_bytes = per_thread_bytes.saturating_mul(locations.len());
     let mut workload_metadata = BTreeMap::new();
     workload_metadata.insert("operation_definition".into(), definition.operation.into());
-    workload_metadata.insert("kernel_revision".into(), "4".into());
-    workload_metadata.insert("harness_revision".into(), "3".into());
+    workload_metadata.insert(
+        "kernel_revision".into(),
+        if matches!(
+            definition.workload,
+            Workload::Integer
+                | Workload::SingleThread
+                | Workload::Popcnt
+                | Workload::Avx2Fma
+                | Workload::Avx2Fma64
+        ) {
+            "5"
+        } else {
+            "4"
+        }
+        .into(),
+    );
+    workload_metadata.insert("harness_revision".into(), "4".into());
     if let Some(group) = comparison_group(definition.workload) {
         workload_metadata.insert("comparison_group".into(), group.into());
         workload_metadata.insert(
@@ -883,12 +926,25 @@ fn run_parallel(
         }
         .into(),
     );
-    workload_metadata.insert("warmup_ms".into(), (WARMUP_NS / 1_000_000).to_string());
-    workload_metadata.insert("probe_samples".into(), PROBE_SAMPLES.to_string());
+    let budget = gluj_bench_core::measurement_budget(config);
+    let reference_budget = gluj_bench_core::measurement_budget(&gluj_bench_core::reference_config(
+        config,
+        "reference-working-set-probe",
+    ));
     workload_metadata.insert(
-        "probe_duration_ms_per_sample".into(),
-        (PROBE_NS / 1_000_000).to_string(),
+        "warmup_ms".into(),
+        (budget.warmup_ns / 1_000_000).to_string(),
     );
+    if has_data_profile(definition.workload) {
+        workload_metadata.insert(
+            "probe_samples".into(),
+            reference_budget.minimum_samples.to_string(),
+        );
+        workload_metadata.insert(
+            "probe_duration_ms_per_sample".into(),
+            (reference_budget.minimum_sample_ns / 1_000_000).to_string(),
+        );
+    }
     workload_metadata.insert("scope".into(), "aggregate_selected_workers".into());
     workload_metadata.insert(
         "affinity".into(),
@@ -919,7 +975,15 @@ fn run_parallel(
         "large_data_slowdown_percent".into(),
         format!("{:.2}", (1.0 - memory_ratio.min(1.0)) * 100.0),
     );
-    workload_metadata.insert("bound_classification".into(), classify(memory_ratio).into());
+    workload_metadata.insert(
+        "bound_classification".into(),
+        if definition.workload == Workload::Prime {
+            "not_established"
+        } else {
+            classify(memory_ratio)
+        }
+        .into(),
+    );
     workload_metadata.insert(
         "classification_method".into(),
         if has_data_profile(definition.workload) {
@@ -933,6 +997,7 @@ fn run_parallel(
     );
     workload_metadata.insert("classification_is_inference".into(), "true".into());
     workload_metadata.insert("checksum".into(), measurement.checksum.to_string());
+    workload_metadata.insert("result_validation".into(), "independent INT64/POPCNT/AES and scalar/SIMD arithmetic references; codec round-trip, sieve count and finite output checks by workload; validation outside timing".into());
     let mut device_metadata = BTreeMap::new();
     device_metadata.insert("logical_processors".into(), locations.len().to_string());
     device_metadata.insert(
@@ -954,10 +1019,30 @@ pub fn run(
     config: &BenchmarkConfig,
     cancellation: &CancellationToken,
     progress: &mut ProgressCallback<'_>,
-    processor: ProcessorLocation,
     device: &DeviceDescriptor,
     topology: &CpuTopology,
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    if id == "cpu.performance.single_thread.integer.i64" {
+        let mut canonical = config.clone();
+        canonical
+            .options
+            .insert("cpu_core_limit".into(), "1".into());
+        canonical
+            .options
+            .insert("thread_mode".into(), "physical_cores".into());
+        return run(
+            "cpu.performance.integer.i64",
+            &canonical,
+            cancellation,
+            progress,
+            device,
+            topology,
+        );
+    }
+    if crate::cpu_workloads::handles(id, config) {
+        return crate::cpu_workloads::run(id, config, cancellation, progress, device, topology);
+    }
+    let _measurement_scope = gluj_bench_core::MeasurementScope::enter(config, id);
     let definition = DEFINITIONS
         .iter()
         .find(|item| item.id == id)
@@ -971,202 +1056,26 @@ pub fn run(
     if !is_available {
         return Err(BenchmarkError::new("benchmark_unavailable", reason));
     }
-    if definition.workload != Workload::SingleThread {
-        let locations = crate::topology::selected_workers(topology, config, true)?;
-        if locations.is_empty() {
-            return Err(BenchmarkError::new(
-                "topology_unavailable",
-                "No logical processors are available for the CPU performance benchmark.",
-            ));
-        }
-        return run_parallel(
-            definition,
-            config,
-            cancellation,
-            progress,
-            &locations,
-            device,
-            topology,
-        );
+    {
+        let _phase_timer = gluj_bench_core::phase_timer("validation");
+        validate_register_kernel(definition.workload)?;
     }
-    let _affinity = AffinityGuard::pin(processor)?;
-    let mut memory_ratio = 1.0;
-    let mut working_set_bytes = 0usize;
-    let instruction_path: &str;
-
-    let measurement = match definition.workload {
-        Workload::Integer => {
-            instruction_path = "scalar_i64";
-            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-            measure(config, cancellation, progress, definition.name, || {
-                integer_chunk(&mut seed)
-            })?
-        }
-        Workload::Float32 => {
-            instruction_path = "scalar_f32";
-            let mut seed = 1.000_001f32;
-            measure(config, cancellation, progress, definition.name, || {
-                float32_chunk(&mut seed)
-            })?
-        }
-        Workload::Float64 => {
-            instruction_path = "scalar_f64";
-            let mut seed = 1.000_000_001f64;
-            measure(config, cancellation, progress, definition.name, || {
-                float64_chunk(&mut seed)
-            })?
-        }
-        Workload::String => {
-            instruction_path = "scalar_ascii_scan";
-            let small = patterned_bytes(256 * 1024);
-            let large = patterned_bytes(64 * 1024 * 1024);
-            working_set_bytes = large.len();
-            let cached = quick_rate(|| scan(&small));
-            let streaming = quick_rate(|| scan(&large));
-            memory_ratio = (streaming / cached).clamp(0.0, 2.0);
-            measure(config, cancellation, progress, definition.name, || {
-                scan(&large)
-            })?
-        }
-        Workload::Prime => {
-            instruction_path = "sieve_of_eratosthenes_reused_marks";
-            let mut finder = PrimeFinder::new();
-            measure(config, cancellation, progress, definition.name, || {
-                finder.chunk()
-            })?
-        }
-        Workload::Compress => {
-            instruction_path = "miniz_oxide_deflate_level_6";
-            let small = patterned_bytes(256 * 1024);
-            let large = patterned_bytes(8 * 1024 * 1024);
-            working_set_bytes = large.len();
-            let cached = quick_rate(|| compress_chunk(&small));
-            let streaming = quick_rate(|| compress_chunk(&large));
-            memory_ratio = (streaming / cached).clamp(0.0, 2.0);
-            measure(config, cancellation, progress, definition.name, || {
-                compress_chunk(&large)
-            })?
-        }
-        Workload::Decompress => {
-            instruction_path = "miniz_oxide_deflate_level_6";
-            let small_source = patterned_bytes(256 * 1024);
-            let large_source = patterned_bytes(8 * 1024 * 1024);
-            let small = compress_to_vec(&small_source, 6);
-            let large = compress_to_vec(&large_source, 6);
-            working_set_bytes = large_source.len();
-            let cached = quick_rate(|| decompress_chunk(&small, small_source.len()));
-            let streaming = quick_rate(|| decompress_chunk(&large, large_source.len()));
-            memory_ratio = (streaming / cached).clamp(0.0, 2.0);
-            measure(config, cancellation, progress, definition.name, || {
-                decompress_chunk(&large, large_source.len())
-            })?
-        }
-        Workload::Popcnt => {
-            instruction_path = "x86_popcnt";
-            let mut seed = 0x0123_4567_89ab_cdefu64;
-            measure(config, cancellation, progress, definition.name, || {
-                popcnt_chunk(&mut seed)
-            })?
-        }
-        Workload::Aes => {
-            instruction_path = "x86_aesni";
-            let mut seed = 1u64;
-            measure(config, cancellation, progress, definition.name, || {
-                aes_chunk(&mut seed)
-            })?
-        }
-        Workload::Avx2Fma => {
-            instruction_path = "x86_avx2_fma";
-            let mut seed = 1.0f32;
-            measure(config, cancellation, progress, definition.name, || {
-                avx2_fma_chunk(&mut seed)
-            })?
-        }
-        Workload::Avx2Fma64 => {
-            instruction_path = "x86_avx2_fma_f64";
-            let mut seed = 1.0f64;
-            measure(config, cancellation, progress, definition.name, || {
-                avx2_fma64_chunk(&mut seed)
-            })?
-        }
-        Workload::SingleThread => {
-            instruction_path = "scalar_i64";
-            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-            measure(config, cancellation, progress, definition.name, || {
-                integer_chunk(&mut seed)
-            })?
-        }
-    };
-
-    progress(ProgressUpdate {
-        fraction: 1.0,
-        phase: "complete".into(),
-        message: format!("{} complete", definition.name),
-    });
-    let sample_statistics = statistics(&measurement.values);
-    let metric = Metric {
-        name: "throughput".into(),
-        value: sample_statistics.median,
-        unit: "operations/s".into(),
-        statistics: sample_statistics,
-    };
-    let busy = (measurement.cpu_ns as f64 * 100.0 / measurement.elapsed_ns.max(1) as f64)
-        .clamp(0.0, 100.0);
-    let mut workload_metadata = BTreeMap::new();
-    workload_metadata.insert("operation_definition".into(), definition.operation.into());
-    workload_metadata.insert("instruction_path".into(), instruction_path.into());
-    workload_metadata.insert("kernel_revision".into(), "4".into());
-    workload_metadata.insert("harness_revision".into(), "2".into());
-    if let Some(group) = comparison_group(definition.workload) {
-        workload_metadata.insert("comparison_group".into(), group.into());
-        workload_metadata.insert(
-            "comparison_basis".into(),
-            "lane-level multiply and add operations".into(),
-        );
+    let locations = crate::topology::selected_workers(topology, config, true)?;
+    if locations.is_empty() {
+        return Err(BenchmarkError::new(
+            "topology_unavailable",
+            "No selected CPU workers are available.",
+        ));
     }
-    workload_metadata.insert("thread_count".into(), "1".into());
-    workload_metadata.insert("scope".into(), "single_pinned_thread".into());
-    workload_metadata.insert("working_set_bytes".into(), working_set_bytes.to_string());
-    workload_metadata.insert("cpu_runnable_percent".into(), format!("{busy:.2}"));
-    workload_metadata.insert(
-        "cpu_activity_interpretation".into(),
-        "OS-scheduled thread time; memory stalls still count as running".into(),
-    );
-    workload_metadata.insert(
-        "memory_sensitivity_ratio".into(),
-        format!("{memory_ratio:.4}"),
-    );
-    workload_metadata.insert(
-        "large_data_slowdown_percent".into(),
-        format!("{:.2}", (1.0 - memory_ratio.min(1.0)) * 100.0),
-    );
-    workload_metadata.insert("bound_classification".into(), classify(memory_ratio).into());
-    workload_metadata.insert(
-        "classification_method".into(),
-        if working_set_bytes == 0 {
-            "register/compute workload with no streamed working set"
-        } else {
-            "large-working-set throughput divided by cache-resident throughput; ratio below 0.80 is memory bandwidth bound"
-        }
-        .into(),
-    );
-    workload_metadata.insert("classification_is_inference".into(), "true".into());
-    workload_metadata.insert("checksum".into(), measurement.checksum.to_string());
-    let mut device_metadata = BTreeMap::new();
-    device_metadata.insert("processor_group".into(), processor.group.to_string());
-    device_metadata.insert("processor_index".into(), processor.index.to_string());
-    device_metadata.insert(
-        "physical_cores".into(),
-        topology.physical_cores.len().to_string(),
-    );
-    Ok(BenchmarkResult {
-        benchmark_id: id.into(),
-        device_id: device.id.clone(),
-        elapsed_ns: measurement.elapsed_ns,
-        metrics: vec![metric],
-        workload_metadata,
-        device_metadata,
-    })
+    run_parallel(
+        definition,
+        config,
+        cancellation,
+        progress,
+        &locations,
+        device,
+        topology,
+    )
 }
 
 #[inline(never)]
@@ -1180,17 +1089,259 @@ fn integer_chunk(seed: &mut u64) -> (u64, u64) {
     let mut g = a ^ 0xdb4f_0b91_75ae_2165;
     let mut h = a ^ 0xbb67_ae85_84ca_a73b;
     for _ in 0..4096 {
-        a = a.wrapping_mul(0x9e37_79b1).wrapping_add(0x85eb_ca6b);
-        b = b.wrapping_mul(0x85eb_ca77).wrapping_add(0xc2b2_ae3d);
-        c = c.wrapping_mul(0xc2b2_ae3d).wrapping_add(0x27d4_eb2f);
-        d = d.wrapping_mul(0x27d4_eb2d).wrapping_add(0x1656_67b1);
-        e = e.wrapping_mul(0x1656_67b1).wrapping_add(0x9e37_79b9);
-        f = f.wrapping_mul(0x9e37_79b9).wrapping_add(0x85eb_ca77);
-        g = g.wrapping_mul(0x85eb_ca77).wrapping_add(0xc2b2_ae3d);
-        h = h.wrapping_mul(0xc2b2_ae3d).wrapping_add(0x27d4_eb2d);
+        a = black_box(a.wrapping_mul(0x9e37_79b1).wrapping_add(0x85eb_ca6b));
+        b = black_box(b.wrapping_mul(0x85eb_ca77).wrapping_add(0xc2b2_ae3d));
+        c = black_box(c.wrapping_mul(0xc2b2_ae3d).wrapping_add(0x27d4_eb2f));
+        d = black_box(d.wrapping_mul(0x27d4_eb2d).wrapping_add(0x1656_67b1));
+        e = black_box(e.wrapping_mul(0x1656_67b1).wrapping_add(0x9e37_79b9));
+        f = black_box(f.wrapping_mul(0x9e37_79b9).wrapping_add(0x85eb_ca77));
+        g = black_box(g.wrapping_mul(0x85eb_ca77).wrapping_add(0xc2b2_ae3d));
+        h = black_box(h.wrapping_mul(0xc2b2_ae3d).wrapping_add(0x27d4_eb2d));
     }
     *seed = a ^ b ^ c ^ d ^ e ^ f ^ g ^ h;
     (4096 * 8 * 2, *seed)
+}
+
+fn validate_register_kernel(workload: Workload) -> Result<(), BenchmarkError> {
+    let mut seed = 0x0123_4567_89ab_cdef_u64;
+    let valid = match workload {
+        Workload::Integer | Workload::SingleThread => {
+            let multipliers = [
+                0x9e37_79b1_u64,
+                0x85eb_ca77,
+                0xc2b2_ae3d,
+                0x27d4_eb2d,
+                0x1656_67b1,
+                0x9e37_79b9,
+                0x85eb_ca77,
+                0xc2b2_ae3d,
+            ];
+            let addends = [
+                0x85eb_ca6b_u64,
+                0xc2b2_ae3d,
+                0x27d4_eb2f,
+                0x1656_67b1,
+                0x9e37_79b9,
+                0x85eb_ca77,
+                0xc2b2_ae3d,
+                0x27d4_eb2d,
+            ];
+            let masks = [
+                0_u64,
+                0xd1b5_4a32_d192_ed03,
+                0x94d0_49bb_1331_11eb,
+                0xbf58_476d_1ce4_e5b9,
+                0x2545_f491_4f6c_dd1d,
+                0x369d_ea0f_31a5_3f85,
+                0xdb4f_0b91_75ae_2165,
+                0xbb67_ae85_84ca_a73b,
+            ];
+            let expected = (0..8)
+                .map(|lane| {
+                    // Exponentiation of affine transforms independently checks the 4096-round loop.
+                    let mut count = 4096;
+                    let (mut m, mut a) = (multipliers[lane], addends[lane]);
+                    let mut value = seed ^ masks[lane];
+                    while count > 0 {
+                        if count & 1 != 0 {
+                            value = value.wrapping_mul(m).wrapping_add(a);
+                        }
+                        a = a.wrapping_mul(m.wrapping_add(1));
+                        m = m.wrapping_mul(m);
+                        count >>= 1;
+                    }
+                    value
+                })
+                .fold(0, |a, b| a ^ b);
+            let (operations, actual) = integer_chunk(&mut seed);
+            operations == 4096 * 16 && actual == expected
+        }
+        Workload::Popcnt => {
+            let mut value = seed;
+            let mut total = 0_u64;
+            for _ in 0..4096 {
+                for mut word in [
+                    value,
+                    value ^ 0xd1b5_4a32_d192_ed03,
+                    value.wrapping_add(0x94d0_49bb_1331_11eb),
+                    value.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+                ] {
+                    while word != 0 {
+                        total += word & 1;
+                        word >>= 1;
+                    }
+                }
+                value = value.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+            }
+            let (operations, actual) = popcnt_chunk(&mut seed);
+            operations == 4096 * 4 && actual == value ^ total
+        }
+        Workload::Aes => {
+            let rotations = [0, 17, 23, 31, 37, 43, 53, 59];
+            let key = 0x1bd1_1bda_a9fc_1a22_u64.to_le_bytes();
+            let sbox = std::array::from_fn::<_, 256, _>(|value| aes_sub_byte(value as u8));
+            let mut expected = 0_u64;
+            for rotation in rotations {
+                let bytes = seed.rotate_left(rotation).to_le_bytes();
+                let mut state = [0_u8; 16];
+                state[..8].copy_from_slice(&bytes);
+                state[8..].copy_from_slice(&bytes);
+                for _ in 0..4096 {
+                    state = aes_reference_round(state, key, &sbox);
+                }
+                expected ^= u64::from_le_bytes(state[..8].try_into().expect("AES word"));
+            }
+            let (operations, actual) = aes_chunk(&mut seed);
+            operations == 4096 * 8 && actual == expected
+        }
+        Workload::Float32 | Workload::Avx2Fma => {
+            let vector = workload == Workload::Avx2Fma;
+            let mut actual = 1.0_f32;
+            let expected: Vec<f32> = (0..8)
+                .map(|lane| {
+                    let mut value = 1.0_f32 + lane as f32 * 0.25;
+                    for _ in 0..4096 {
+                        value = if vector {
+                            (f64::from(value) * f64::from(0.999_999_94_f32)
+                                + f64::from(0.000_001_f32)) as f32
+                        } else {
+                            value
+                                * if lane % 2 == 0 {
+                                    1.000_000_1
+                                } else {
+                                    0.999_999_9
+                                }
+                                + (lane + 1) as f32 * 0.000_001
+                        };
+                    }
+                    value
+                })
+                .collect();
+            let (operations, _) = if vector {
+                avx2_fma_chunk(&mut actual)
+            } else {
+                float32_chunk(&mut actual)
+            };
+            {
+                let reference = expected.iter().sum::<f32>() * 0.125;
+                if !actual.is_finite()
+                    || (actual - reference).abs() > actual.abs().max(1.0) * 1e-5
+                    || operations != 4096 * 8 * 2 * if vector { 8 } else { 1 }
+                {
+                    return Err(BenchmarkError::new(
+                        "result_validation_failed",
+                        format!(
+                            "{workload:?}: actual {actual}, expected {reference}, operations {operations}."
+                        ),
+                    ));
+                }
+                true
+            }
+        }
+        Workload::Float64 | Workload::Avx2Fma64 => {
+            let vector = workload == Workload::Avx2Fma64;
+            let mut actual = 1.0_f64;
+            let expected: Vec<f64> = (0..8)
+                .map(|lane| {
+                    let mut value = 1.0_f64 + lane as f64 * 0.25;
+                    for _ in 0..4096 {
+                        value = if vector {
+                            value * 0.999_999_999_999 + 0.000_000_001
+                        } else {
+                            value
+                                * if lane % 2 == 0 {
+                                    1.000_000_000_1
+                                } else {
+                                    0.999_999_999_9
+                                }
+                                + (lane + 1) as f64 * 0.000_000_001
+                        };
+                    }
+                    value
+                })
+                .collect();
+            let (operations, _) = if vector {
+                avx2_fma64_chunk(&mut actual)
+            } else {
+                float64_chunk(&mut actual)
+            };
+            {
+                let reference = expected.iter().sum::<f64>() * 0.125;
+                if !actual.is_finite()
+                    || (actual - reference).abs() > actual.abs().max(1.0) * 1e-10
+                    || operations != 4096 * 8 * 2 * if vector { 4 } else { 1 }
+                {
+                    return Err(BenchmarkError::new(
+                        "result_validation_failed",
+                        format!(
+                            "{workload:?}: actual {actual}, expected {reference}, operations {operations}."
+                        ),
+                    ));
+                }
+                true
+            }
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(BenchmarkError::new(
+            "result_validation_failed",
+            "Register kernel output or operation count differs from its independent reference.",
+        ))
+    }
+}
+
+fn aes_sub_byte(value: u8) -> u8 {
+    fn multiply(mut a: u8, mut b: u8) -> u8 {
+        let mut out = 0;
+        for _ in 0..8 {
+            if b & 1 != 0 {
+                out ^= a;
+            }
+            a = (a << 1) ^ if a & 128 != 0 { 0x1b } else { 0 };
+            b >>= 1;
+        }
+        out
+    }
+    let mut power = value;
+    let mut inverse = 1;
+    let mut exponent = 254;
+    while exponent > 0 {
+        if exponent & 1 != 0 {
+            inverse = multiply(inverse, power);
+        }
+        power = multiply(power, power);
+        exponent >>= 1;
+    }
+    inverse
+        ^ inverse.rotate_left(1)
+        ^ inverse.rotate_left(2)
+        ^ inverse.rotate_left(3)
+        ^ inverse.rotate_left(4)
+        ^ 0x63
+}
+fn aes_reference_round(state: [u8; 16], key: [u8; 8], sbox: &[u8; 256]) -> [u8; 16] {
+    let mut shifted = [0; 16];
+    for column in 0..4 {
+        for row in 0..4 {
+            shifted[column * 4 + row] = sbox[state[((column + row) % 4) * 4 + row] as usize];
+        }
+    }
+    let twice = |value: u8| (value << 1) ^ if value & 128 != 0 { 0x1b } else { 0 };
+    let mut result = [0; 16];
+    for column in 0..4 {
+        let i = column * 4;
+        let all = shifted[i] ^ shifted[i + 1] ^ shifted[i + 2] ^ shifted[i + 3];
+        for row in 0..4 {
+            result[i + row] = shifted[i + row]
+                ^ all
+                ^ twice(shifted[i + row] ^ shifted[i + (row + 1) % 4])
+                ^ key[(i + row) % 8];
+        }
+    }
+    result
 }
 
 #[inline(never)]
@@ -1241,14 +1392,7 @@ fn float64_chunk(seed: &mut f64) -> (u64, u64) {
     (4096 * 16, seed.to_bits())
 }
 
-fn compress_chunk(data: &[u8]) -> (u64, u64) {
-    let output = compress_to_vec(data, 6);
-    (
-        data.len() as u64,
-        output.len() as u64 ^ u64::from(output.first().copied().unwrap_or(0)),
-    )
-}
-
+#[cfg(test)]
 fn decompress_chunk(data: &[u8], output_length: usize) -> (u64, u64) {
     match decompress_to_vec(data) {
         Ok(output) => (
@@ -1266,10 +1410,14 @@ unsafe fn popcnt_inner(seed: &mut u64) -> (u64, u64) {
     let mut value = *seed;
     let mut total = 0i64;
     for _ in 0..4096 {
-        total += i64::from(_popcnt64(value as i64));
-        total += i64::from(_popcnt64(value.rotate_left(7) as i64));
-        total += i64::from(_popcnt64(value.rotate_left(17) as i64));
-        total += i64::from(_popcnt64(value.rotate_left(29) as i64));
+        total += i64::from(_popcnt64(black_box(value) as i64));
+        total += i64::from(_popcnt64(black_box(value ^ 0xd1b5_4a32_d192_ed03) as i64));
+        total += i64::from(_popcnt64(
+            black_box(value.wrapping_add(0x94d0_49bb_1331_11eb)) as i64,
+        ));
+        total += i64::from(_popcnt64(
+            black_box(value.wrapping_mul(0xbf58_476d_1ce4_e5b9)) as i64,
+        ));
         value = value.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
     }
     *seed = value ^ total as u64;
@@ -1358,7 +1506,7 @@ unsafe fn avx2_fma_inner(seed: &mut f32) -> (u64, u64) {
     *seed = _mm256_cvtss_f32(_mm256_add_ps(
         _mm256_add_ps(_mm256_add_ps(a, b), _mm256_add_ps(c, d)),
         _mm256_add_ps(_mm256_add_ps(e, f), _mm256_add_ps(g, h)),
-    ));
+    )) * 0.125;
     (4096 * 8 * 8 * 2, u64::from(seed.to_bits()))
 }
 
@@ -1400,7 +1548,7 @@ unsafe fn avx2_fma64_inner(seed: &mut f64) -> (u64, u64) {
     *seed = _mm256_cvtsd_f64(_mm256_add_pd(
         _mm256_add_pd(_mm256_add_pd(a, b), _mm256_add_pd(c, d)),
         _mm256_add_pd(_mm256_add_pd(e, f), _mm256_add_pd(g, h)),
-    ));
+    )) * 0.125;
     (4096 * 8 * 4 * 2, seed.to_bits())
 }
 
@@ -1452,6 +1600,39 @@ fn thread_cpu_time_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_register_references_cover_useful_operations() {
+        validate_register_kernel(Workload::Integer).unwrap();
+        validate_register_kernel(Workload::SingleThread).unwrap();
+        validate_register_kernel(Workload::Float32).unwrap();
+        validate_register_kernel(Workload::Float64).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("popcnt") {
+                validate_register_kernel(Workload::Popcnt).unwrap();
+            }
+            if std::arch::is_x86_feature_detected!("aes") {
+                validate_register_kernel(Workload::Aes).unwrap();
+            }
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+            {
+                validate_register_kernel(Workload::Avx2Fma).unwrap();
+                validate_register_kernel(Workload::Avx2Fma64).unwrap();
+                let (mut f32_seed, mut f64_seed) = (1.0_f32, 1.0_f64);
+                for _ in 0..1024 {
+                    avx2_fma_chunk(&mut f32_seed);
+                    avx2_fma64_chunk(&mut f64_seed);
+                }
+                assert!(f32_seed.is_finite() && f64_seed.is_finite());
+            }
+        }
+        let sbox = std::array::from_fn::<_, 256, _>(|value| aes_sub_byte(value as u8));
+        assert_eq!(sbox[0], 0x63);
+        assert_eq!(sbox[0x53], 0xed);
+        assert_eq!(aes_reference_round([0; 16], [0; 8], &sbox), [0x63; 16]);
+    }
 
     #[test]
     fn descriptors_use_workload_appropriate_units() {

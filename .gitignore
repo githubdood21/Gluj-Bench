@@ -11,6 +11,9 @@
 VP_VULKANINFO_*.json
 /results.json
 /results.json.*.tmp
+/run-history/
 /settings.json
 /settings.json.*.tmp
 /design/
+
+__pycache__/

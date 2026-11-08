@@ -4,17 +4,13 @@ use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     hint::black_box,
     ptr::NonNull,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Barrier, atomic::Ordering},
     thread,
     time::Instant,
 };
 
 const ALIGNMENT: usize = 64;
 const MAX_PASSES: usize = 1_000_000_000;
-static PREPARATION_NONCE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 pub struct AlignedBuffer {
     pointer: NonNull<u8>,
@@ -76,6 +72,7 @@ pub enum CachePreparation {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MeasurementOptions {
+    pub access: gluj_bench_core::AccessPolicy,
     pub sample_count: u32,
     pub target_ns: u64,
     pub streaming: bool,
@@ -85,11 +82,13 @@ pub struct MeasurementOptions {
 
 #[derive(Debug, Clone, Copy)]
 struct SweepOptions {
+    access: gluj_bench_core::AccessPolicy,
+    realization: u32,
+    rotation: usize,
     passes: usize,
     chunk_passes: usize,
     streaming: bool,
     preparation: CachePreparation,
-    preparation_nonce: u64,
     first_touch: bool,
 }
 
@@ -545,7 +544,21 @@ pub fn measure_parallel_sizes(
             )
         })
     })?;
+    let (visited_payload_bytes, auxiliary_bytes) = {
+        let _phase = gluj_bench_core::phase_timer("preparation");
+        let mut visited = 0;
+        let mut auxiliary = 0;
+        for (worker, bytes) in payload_sizes.iter().copied().enumerate() {
+            let schedule = options
+                .access
+                .schedule(bytes, 64, worker, 0, cancellation)?;
+            visited += schedule.visited_bytes();
+            auxiliary += schedule.auxiliary_bytes();
+        }
+        (visited, auxiliary)
+    };
     let thread_count = locations.len();
+    let preparation_timer = gluj_bench_core::phase_timer("preparation");
     let mut buffers = Vec::with_capacity(thread_count);
     for payload_size in payload_sizes.iter().copied() {
         buffers.push((
@@ -553,16 +566,19 @@ pub fn measure_parallel_sizes(
             AlignedBuffer::new(payload_size)?,
         ));
     }
+    drop(preparation_timer);
     let calibration_ns = parallel_once(
         operation,
         locations,
         &mut buffers,
         SweepOptions {
+            access: options.access,
+            realization: 0,
+            rotation: 0,
             passes: 1,
             chunk_passes: 1,
             streaming: options.streaming,
             preparation: options.preparation,
-            preparation_nonce: PREPARATION_NONCE.fetch_add(1, Ordering::Relaxed),
             first_touch: true,
         },
         cancellation,
@@ -575,11 +591,13 @@ pub fn measure_parallel_sizes(
             locations,
             &mut buffers,
             SweepOptions {
+                access: options.access,
+                realization: 0,
+                rotation: 0,
                 passes: probe_passes,
                 chunk_passes: probe_passes,
                 streaming: options.streaming,
                 preparation: options.preparation,
-                preparation_nonce: PREPARATION_NONCE.fetch_add(1, Ordering::Relaxed),
                 first_touch: false,
             },
             cancellation,
@@ -592,59 +610,141 @@ pub fn measure_parallel_sizes(
     let mut elapsed_total = 0u64;
     let mut sample_passes = passes;
     let mut cold_pacer = crate::pacing::CpuPacer::current(cancellation);
-    for _ in 0..options.sample_count {
+    for sample in 0..options.sample_count * options.access.realizations {
+        let realization = sample % options.access.realizations;
+        let observation_started = std::time::Instant::now();
         if cancellation.is_cancelled() {
             return Err(BenchmarkError::new(
                 "cancelled",
                 "The benchmark was cancelled.",
             ));
         }
-        let wall_ns = if options.preparation == CachePreparation::Cold {
-            let mut elapsed = 0u64;
-            for _ in 0..sample_passes {
-                let active_ns = parallel_once(
+        let mut window = gluj_bench_core::SampleWindow::new(options.target_ns);
+        let mut completed_passes = 0usize;
+        while window.needs_batch() {
+            let wall_ns = if options.preparation == CachePreparation::Cold {
+                let mut elapsed = 0u64;
+                for pass in 0..sample_passes {
+                    let active_ns = parallel_once(
+                        operation,
+                        locations,
+                        &mut buffers,
+                        SweepOptions {
+                            access: options.access,
+                            realization,
+                            rotation: completed_passes + pass,
+                            passes: 1,
+                            chunk_passes: 1,
+                            streaming: options.streaming,
+                            preparation: options.preparation,
+                            first_touch: false,
+                        },
+                        cancellation,
+                    )?;
+                    elapsed = elapsed.saturating_add(active_ns);
+                    cold_pacer.account(std::time::Duration::from_nanos(active_ns))?;
+                }
+                elapsed
+            } else {
+                parallel_once(
                     operation,
                     locations,
                     &mut buffers,
                     SweepOptions {
-                        passes: 1,
-                        chunk_passes: 1,
+                        access: options.access,
+                        realization,
+                        rotation: completed_passes,
+                        passes: sample_passes,
+                        chunk_passes,
                         streaming: options.streaming,
                         preparation: options.preparation,
-                        preparation_nonce: PREPARATION_NONCE.fetch_add(1, Ordering::Relaxed),
                         first_touch: false,
                     },
                     cancellation,
-                )?;
-                elapsed = elapsed.saturating_add(active_ns);
-                cold_pacer.account(std::time::Duration::from_nanos(active_ns))?;
-            }
-            elapsed
-        } else {
-            parallel_once(
-                operation,
-                locations,
-                &mut buffers,
-                SweepOptions {
-                    passes: sample_passes,
-                    chunk_passes,
-                    streaming: options.streaming,
-                    preparation: options.preparation,
-                    preparation_nonce: PREPARATION_NONCE.fetch_add(1, Ordering::Relaxed),
-                    first_touch: false,
-                },
-                cancellation,
-            )?
-        };
+                )?
+            };
+            window.add(wall_ns)?;
+            completed_passes = completed_passes.saturating_add(sample_passes);
+        }
+        let wall_ns = window.finish()?;
         elapsed_total = elapsed_total.saturating_add(wall_ns);
         values.push(bandwidth_value(
-            total_payload_bytes,
+            visited_payload_bytes,
             options.byte_multiplier,
-            sample_passes,
+            completed_passes,
             wall_ns,
         ));
-        let adjusted_passes = options.target_ns as u128 * sample_passes as u128 / wall_ns as u128;
+        if let Some(recorder) = gluj_bench_core::observation_recorder() {
+            recorder
+                .with_realization(
+                    options
+                        .access
+                        .derived_seed(0, total_payload_bytes, realization),
+                    std::collections::BTreeMap::from([
+                        ("root_seed".into(), options.access.seed.to_string()),
+                        ("realization".into(), realization.to_string()),
+                        ("access_pattern".into(), options.access.name().into()),
+                        ("worker".into(),"aggregate".into()),("dataset_bytes".into(),total_payload_bytes.to_string()),("schedule_auxiliary_bytes".into(),auxiliary_bytes.to_string()),
+                        ("worker_seed_derivation".into(),"derive(root,worker,aligned_worker_payload,realization); rotation begins at zero per observation and advances per complete pass".into()),
+                    ]),
+                )
+                .record(
+                    &format!(
+                        "{operation:?}:payload-{total_payload_bytes}:streaming-{}",
+                        options.streaming
+                    ),
+                    "bandwidth",
+                    *values.last().unwrap(),
+                    "bytes/s",
+                    (visited_payload_bytes as u64)
+                        .saturating_mul(u64::from(options.byte_multiplier))
+                        .saturating_mul(completed_passes as u64),
+                    "accounted_bytes",
+                    wall_ns,
+                    observation_started.elapsed().as_nanos() as u64,
+                    "not_recorded",
+                );
+        }
+        let adjusted_passes =
+            options.target_ns as u128 * completed_passes as u128 / wall_ns as u128;
         sample_passes = adjusted_passes.clamp(1, MAX_PASSES as u128) as usize;
+    }
+    let _validation_timer = gluj_bench_core::phase_timer("validation");
+    for (source, destination) in &buffers {
+        let first = unsafe { source.as_ptr().read() };
+        for index in gluj_bench_core::validation_indices(source.len() / 8) {
+            let source_word = unsafe {
+                source
+                    .as_ptr()
+                    .add(index * 8)
+                    .cast::<u64>()
+                    .read_unaligned()
+            };
+            let valid = match operation {
+                Operation::Read => first & 1 != 0 && source_word == u64::from_ne_bytes([first; 8]),
+                Operation::Copy => {
+                    source_word
+                        == unsafe {
+                            destination
+                                .as_ptr()
+                                .add(index * 8)
+                                .cast::<u64>()
+                                .read_unaligned()
+                        }
+                }
+                Operation::Write => {
+                    let first_word = unsafe { source.as_ptr().cast::<u64>().read_unaligned() };
+                    source_word == first_word
+                        && (!cfg!(target_arch = "x86_64") || first_word >> 32 == 0)
+                }
+            };
+            if !valid {
+                return Err(BenchmarkError::new(
+                    "result_validation_failed",
+                    "Bandwidth read-integrity/write/copy boundary or interior check failed.",
+                ));
+            }
+        }
     }
     Ok((statistics(&values), elapsed_total))
 }
@@ -662,7 +762,9 @@ fn parallel_once(
     cancellation: &CancellationToken,
 ) -> Result<u64, BenchmarkError> {
     let barrier = Arc::new(Barrier::new(locations.len()));
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let intensity = gluj_bench_core::cpu_activity_percent();
+    let recorder = gluj_bench_core::observation_recorder();
     let elapsed = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(locations.len());
         for (thread_index, ((source, destination), location)) in buffers
@@ -670,24 +772,73 @@ fn parallel_once(
             .zip(locations.iter().copied())
             .enumerate()
         {
+            let recorder = recorder.clone();
             let barrier = barrier.clone();
+            let failed = failed.clone();
             handles.push(scope.spawn(move || -> Result<u64, BenchmarkError> {
-                let _affinity = AffinityGuard::pin(location)?;
+                let prepared = (|| {
+                    let _phase = recorder.as_ref().map(|r| r.phase_timer("preparation"));
+                    let affinity = AffinityGuard::pin(location)?;
+                    let schedule = options.access.schedule(
+                        source.len().min(destination.len()),
+                        64,
+                        thread_index,
+                        options.realization,
+                        cancellation,
+                    )?;
+                    Ok::<_, BenchmarkError>((affinity, schedule))
+                })();
+                if prepared.is_err() {
+                    failed.store(true, Ordering::SeqCst);
+                }
+                barrier.wait();
+                if failed.load(Ordering::SeqCst) {
+                    return Err(prepared.err().unwrap_or_else(|| {
+                        BenchmarkError::new(
+                            "worker_prepare_failed",
+                            "Another bandwidth worker could not set processor placement.",
+                        )
+                    }));
+                }
+                let (_affinity, mut schedule) = prepared?;
+                schedule.reset_pass(options.rotation);
+                let preparation_timer = recorder
+                    .as_ref()
+                    .map(|recorder| recorder.phase_timer("preparation"));
                 if options.first_touch {
                     source.initialize(
-                        options.preparation_nonce.wrapping_add(thread_index as u64) as u8 | 1,
+                        options.access.derived_seed(thread_index, source.len(), 0) as u8 | 1,
                     );
                     destination.initialize(0);
                 }
-                prepare(operation, source, destination, options.preparation);
+                drop(preparation_timer);
+                let cache_timer = recorder.as_ref().map(|recorder| {
+                    recorder.phase_timer(if options.preparation == CachePreparation::Hot {
+                        "warmup"
+                    } else {
+                        "preparation"
+                    })
+                });
+                prepare(
+                    operation,
+                    source,
+                    destination,
+                    options.preparation,
+                    cancellation,
+                );
                 let start_offset = if options.preparation == CachePreparation::Cold {
                     rotated_offset(
-                        options.preparation_nonce ^ thread_index as u64,
+                        options.access.derived_seed(
+                            thread_index,
+                            source.len(),
+                            options.realization,
+                        ) ^ options.rotation as u64,
                         source.len().min(destination.len()),
                     )
                 } else {
                     0
                 };
+                drop(cache_timer);
                 barrier.wait();
                 let mut pacer = crate::pacing::CpuPacer::new(
                     if options.preparation == CachePreparation::Hot {
@@ -709,14 +860,33 @@ fn parallel_once(
                     }
                     let current = remaining.min(options.chunk_passes);
                     let batch_start = Instant::now();
-                    execute_rotated(
-                        operation,
-                        source,
-                        destination,
-                        current,
-                        options.streaming,
-                        start_offset,
-                    );
+                    if options.access.pattern == gluj_bench_core::AccessPattern::Sequential {
+                        execute_rotated(
+                            operation,
+                            source,
+                            destination,
+                            current,
+                            options.streaming,
+                            start_offset,
+                        );
+                    } else {
+                        for _ in 0..current {
+                            if !schedule.visit(cancellation, |range| {
+                                execute_range(
+                                    operation,
+                                    source,
+                                    destination,
+                                    range,
+                                    options.streaming,
+                                )
+                            }) {
+                                return Err(BenchmarkError::new(
+                                    "cancelled",
+                                    "Bandwidth traversal cancelled.",
+                                ));
+                            }
+                        }
+                    }
                     remaining -= current;
                     pacer.account(batch_start.elapsed())?;
                 }
@@ -753,14 +923,15 @@ fn prepare(
     source: &mut AlignedBuffer,
     destination: &mut AlignedBuffer,
     preparation: CachePreparation,
+    cancellation: &CancellationToken,
 ) {
     if preparation == CachePreparation::Hot {
         execute(operation, source, destination, 1, false);
         return;
     }
-    flush_from_cache(source);
+    flush_from_cache(source, cancellation);
     if matches!(operation, Operation::Copy) {
-        flush_from_cache(destination);
+        flush_from_cache(destination, cancellation);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -769,16 +940,22 @@ fn prepare(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn flush_from_cache(buffer: &AlignedBuffer) {
+fn flush_from_cache(buffer: &AlignedBuffer, cancellation: &CancellationToken) {
     use std::arch::x86_64::_mm_clflush;
     for offset in (0..buffer.len()).step_by(ALIGNMENT) {
+        if offset.is_multiple_of(256 * 1024) && cancellation.is_cancelled() {
+            break;
+        }
         unsafe { _mm_clflush(buffer.as_ptr().add(offset)) };
     }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn flush_from_cache(buffer: &AlignedBuffer) {
+fn flush_from_cache(buffer: &AlignedBuffer, cancellation: &CancellationToken) {
     for offset in (0..buffer.len()).step_by(ALIGNMENT) {
+        if offset.is_multiple_of(256 * 1024) && cancellation.is_cancelled() {
+            break;
+        }
         black_box(unsafe { buffer.as_ptr().add(offset).read_volatile() });
     }
 }
@@ -804,6 +981,33 @@ pub fn statistics(values: &[f64]) -> SampleStatistics {
         maximum: *sorted.last().unwrap(),
         standard_deviation: variance.sqrt(),
     }
+}
+
+fn execute_range(
+    operation: Operation,
+    source: &mut AlignedBuffer,
+    destination: &mut AlignedBuffer,
+    range: std::ops::Range<usize>,
+    streaming: bool,
+) {
+    assert!(
+        range.start.is_multiple_of(64)
+            && range.len().is_multiple_of(64)
+            && range.end <= source.len().min(destination.len())
+    );
+    // SAFETY: schedules give disjoint aligned ranges within both live exclusive buffers.
+    // These non-owning views must not deallocate the original allocations.
+    let mut a = std::mem::ManuallyDrop::new(AlignedBuffer {
+        pointer: unsafe { NonNull::new_unchecked(source.as_mut_ptr().add(range.start)) },
+        length: range.len(),
+        layout: source.layout,
+    });
+    let mut b = std::mem::ManuallyDrop::new(AlignedBuffer {
+        pointer: unsafe { NonNull::new_unchecked(destination.as_mut_ptr().add(range.start)) },
+        length: range.len(),
+        layout: destination.layout,
+    });
+    execute_rotated(operation, &mut a, &mut b, 1, streaming, 0);
 }
 
 #[cfg(test)]
@@ -847,5 +1051,51 @@ mod tests {
         );
         assert_eq!(unsafe { destination.as_ptr().read() }, 11);
         assert_eq!(unsafe { destination.as_ptr().add(4095).read() }, 11);
+    }
+}
+
+#[cfg(test)]
+mod access_regressions {
+    use super::*;
+    #[test]
+    fn scattered_and_hot_cold_bandwidth_ranges_copy_the_full_payload() {
+        let token = CancellationToken::default();
+        for pattern in [
+            "shuffled_blocks",
+            "rotating_regions",
+            "scattered",
+            "hot_cold",
+        ] {
+            let config = gluj_bench_core::BenchmarkConfig {
+                options: std::collections::BTreeMap::from([
+                    ("access_pattern".into(), pattern.into()),
+                    ("access_block_bytes".into(), "192".into()),
+                ]),
+                ..Default::default()
+            };
+            let mut schedule = gluj_bench_core::AccessPolicy::from_config(&config)
+                .unwrap()
+                .schedule(64 * 17, 64, 0, 0, &token)
+                .unwrap();
+            let mut source = AlignedBuffer::new(64 * 17).unwrap();
+            let mut destination = AlignedBuffer::new(64 * 17).unwrap();
+            for i in 0..source.len() {
+                unsafe {
+                    source.as_mut_ptr().add(i).write((i % 251) as u8);
+                }
+            }
+            assert!(schedule.visit(&token, |range| execute_range(
+                Operation::Copy,
+                &mut source,
+                &mut destination,
+                range,
+                false
+            )));
+            for i in 0..source.len() {
+                assert_eq!(unsafe { source.as_ptr().add(i).read() }, unsafe {
+                    destination.as_ptr().add(i).read()
+                });
+            }
+        }
     }
 }

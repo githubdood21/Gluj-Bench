@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "gluj-bench-core"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1700,27 +1700,30 @@ dependencies = [
 
 [[package]]
 name = "gluj-bench-cpu"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "gluj-bench-core",
  "miniz_oxide",
+ "serde_json",
  "sysinfo",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "gluj-bench-gpu"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "ash",
  "gluj-bench-core",
+ "half",
+ "serde_json",
  "sysinfo",
 ]
 
 [[package]]
 name = "gluj-bench-ui"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "clipboard-win",
  "embed-resource",
@@ -1737,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "gluj-bench-worker"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "gluj-bench-core",
  "gluj-bench-cpu",

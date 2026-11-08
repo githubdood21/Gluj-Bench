@@ -61,12 +61,26 @@ impl Buffers {
         }
         Ok(Self { input, output })
     }
+    #[cfg(test)]
     pub(crate) fn sweep(&mut self, cancellation: &CancellationToken) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let mut schedule = gluj_bench_core::AccessPolicy::from_config(&Default::default())
+            .unwrap()
+            .schedule(self.input.len(), 64, 0, 0, cancellation)
+            .unwrap();
+        self.sweep_scheduled(cancellation, &mut schedule)
+    }
+    pub(crate) fn sweep_scheduled(
+        &mut self,
+        cancellation: &CancellationToken,
+        schedule: &mut gluj_bench_core::AccessSchedule,
+    ) -> bool {
         let input = black_box(self.input.as_slice());
-        for (input, output) in input.chunks(65536).zip(self.output.chunks_mut(65536)) {
-            if cancellation.is_cancelled() {
-                return false;
-            }
+        schedule.visit(cancellation, |range| {
+            let input = &input[range.clone()];
+            let output = &mut self.output[range];
             for (source, destination) in input
                 .as_chunks::<8>()
                 .0
@@ -85,11 +99,27 @@ impl Buffers {
                 }
                 destination.copy_from_slice(&values);
             }
-        }
-        true
+        })
     }
     pub(crate) fn checksum(&self) -> u64 {
         black_box(self.output[0]) ^ black_box(*self.output.last().unwrap())
+    }
+    pub(crate) fn validate(&self) -> Result<(), BenchmarkError> {
+        for index in gluj_bench_core::validation_indices(self.output.len()) {
+            let mut expected = self.input[index];
+            for _ in 0..REUSE {
+                expected = expected
+                    .wrapping_mul(MULTIPLIERS[index % 8])
+                    .wrapping_add(ADDENDS[index % 8]);
+            }
+            if self.output[index] != expected {
+                return Err(BenchmarkError::new(
+                    "result_validation_failed",
+                    "INT64 output differs from its wrapping arithmetic reference.",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

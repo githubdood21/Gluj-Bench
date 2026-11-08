@@ -8,6 +8,9 @@ pub(super) fn append_metrics(
     end_to_end: &[f64],
 ) {
     for (suffix, samples) in [("gpu_execution_time", gpu), ("end_to_end_time", end_to_end)] {
+        if samples.is_empty() {
+            continue;
+        }
         let stats = crate::statistics(samples);
         metrics.push(Metric {
             name: format!("working_set_{bytes}.{suffix}"),
@@ -26,6 +29,13 @@ pub(super) fn per_pass(batch_ns: f64, passes: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_completions_do_not_become_zero_latency_observations() {
+        let mut metrics = Vec::new();
+        append_metrics(&mut metrics, 1024, &[], &[]);
+        assert!(metrics.is_empty());
+    }
 
     #[test]
     fn batch_normalization_preserves_measured_sample_statistics_and_pacing_gap() {

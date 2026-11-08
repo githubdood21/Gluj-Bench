@@ -26,7 +26,13 @@ layout(push_constant) uniform Parameters {
     uint tile_iterations;
     uint reuse_count;
     uint total_subgroups;
+    uint traversal_mode;
+    uint tile_multiplier;
+    uint tile_offset;
+    uint reserved;
 } params;
+
+uint add_mod(uint a,uint b,uint count) { return a>=count-b ? a-(count-b) : a+b; }
 
 void main() {
     uint subgroup_index = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
@@ -35,6 +41,8 @@ void main() {
 
     for (uint sweep = 0; sweep < params.tile_iterations; ++sweep) {
         uint tile_index = (subgroup_index + sweep * params.total_subgroups) % params.tile_count;
+        if(params.traversal_mode==1u) tile_index=add_mod((tile_index*params.tile_multiplier)%params.tile_count,params.tile_offset,params.tile_count);
+        if(params.traversal_mode==2u) tile_index=add_mod(tile_index,params.tile_offset,params.tile_count);
         uint base_a = tile_index * MATRIX_M * MATRIX_K;
         uint base_b = tile_index * MATRIX_K * MATRIX_N;
         coopmat<uint8_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_K, gl_MatrixUseA> a;

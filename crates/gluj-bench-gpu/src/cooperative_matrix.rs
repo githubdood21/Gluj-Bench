@@ -51,6 +51,8 @@ pub(super) struct CooperativeSupport {
     pub fp16: Option<MatrixShape>,
     pub int8: Option<MatrixShape>,
     pub reason: String,
+    pub fp16_shapes: Vec<MatrixShape>,
+    pub int8_shapes: Vec<MatrixShape>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,7 +394,22 @@ pub(super) fn run(
     cancellation: &CancellationToken,
     progress: &mut ProgressCallback<'_>,
 ) -> Result<BenchmarkResult, BenchmarkError> {
-    let (kind, shape) = MatrixKind::for_benchmark(record, benchmark_id)?;
+    let _measurement_scope = gluj_bench_core::MeasurementScope::enter(config, benchmark_id);
+    let (mut kind, mut shape) = MatrixKind::for_benchmark(record, benchmark_id)?;
+    if let Some(selected) = config
+        .options
+        .get("matrix_tile_shape")
+        .filter(|s| s.as_str() != "automatic")
+    {
+        shape=tile_shapes(record,benchmark_id).into_iter().find(|shape|shape_name(*shape)==*selected).ok_or_else(||BenchmarkError::new("matrix_shape_unsupported","Selected matrix tile is not advertised for this precision, signedness and accumulation type."))?;
+        kind = if shape.input == vk::ComponentTypeKHR::FLOAT16 {
+            MatrixKind::Fp16
+        } else if shape.input == vk::ComponentTypeKHR::SINT8 {
+            MatrixKind::Sint8
+        } else {
+            MatrixKind::Uint8
+        };
+    }
     if benchmark_id == kind.profile_id() {
         if config.options.get(kind.preset_key()).map(String::as_str) == Some("register") {
             let mut result = run(record, kind.register_id(), config, cancellation, progress)?;
@@ -471,11 +488,38 @@ pub(super) fn run(
                 sample_count
             ),
         });
-        let elapsed_ns = harness.measure(sample_iterations)?;
-        values.push(operations_per_dispatch as f64 * sample_iterations as f64 / (elapsed_ns / 1e9));
+        let observed = gluj_bench_core::measure_batches(
+            gluj_bench_core::sample_target_ns(config),
+            cancellation,
+            || harness.measure(sample_iterations),
+        )?;
+        let elapsed_ns = observed.active_ns;
+        let measured_iterations = sample_iterations.saturating_mul(observed.batches);
+
+        values
+            .push(operations_per_dispatch as f64 * measured_iterations as f64 / (elapsed_ns / 1e9));
+        gluj_bench_core::record_observation(
+            "register",
+            "compute",
+            *values.last().unwrap(),
+            "operations/s",
+            operations_per_dispatch.saturating_mul(u64::from(measured_iterations)),
+            "operations",
+            elapsed_ns as u64,
+            observed.elapsed_ns,
+        );
     }
+    // All dispatches in an observation are one sample, not independent repeats.
     let sample_statistics = statistics(&values);
+    ensure_not_cancelled(cancellation)?;
+    context.validate_output(
+        harness.output.handle,
+        harness.output_size,
+        kind,
+        i64::from(shape.k) * 256,
+    )?;
     let mut metadata = matrix_metadata(record, kind, shape);
+    metadata.insert("result_validation".into(), "boundary and interior register tile outputs compared with exact scalar tile arithmetic outside timing".into());
     insert_clock_policy(&mut metadata);
     metadata.insert("selected_workgroups".into(), workgroups.to_string());
     metadata.insert("working_set_bytes".into(), harness.output_size.to_string());
@@ -683,15 +727,44 @@ fn run_matrix_scaling(
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(MATRIX_PROFILE_REUSE)
         .clamp(1, 64);
-    let sample_count = config.samples.clamp(2, 5);
-    let target_seconds =
-        (config.target_duration_ms as f64 / 1000.0 / sizes.len() as f64 / sample_count as f64)
-            .clamp(0.01, 0.08);
-    let target_seconds =
-        gluj_bench_core::gpu_burst_duration(std::time::Duration::from_secs_f64(target_seconds))
-            .as_secs_f64();
+    let sample_count = config.samples.max(1);
+    let realizations = config
+        .options
+        .get("access_realizations")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1);
+    let root = config
+        .options
+        .get("access_seed")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(gluj_bench_core::DEFAULT_ACCESS_SEED);
+    let traversal = match config
+        .options
+        .get("matrix_traversal")
+        .map(String::as_str)
+        .unwrap_or("sequential")
+    {
+        "sequential" => 0,
+        "shuffled_tiles" => 1,
+        "rotating_tiles" => 2,
+        _ => {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unsupported matrix tile traversal.",
+            ));
+        }
+    };
+    let target_seconds = gluj_bench_core::sample_duration(config).as_secs_f64();
+    progress(ProgressUpdate {
+        fraction: 0.04,
+        phase: "measurement_plan".into(),
+        message: gluj_bench_core::measurement_estimate(config, sizes.len()),
+    });
     let mut timing_metrics = Vec::new();
     let mut timing_batches = Vec::new();
+    let mut timing_batch_series = Vec::new();
+    let mut dispatch_batches = Vec::new();
+    let mut sweeps_per_dispatch = Vec::new();
     let mut raw_points = Vec::with_capacity(sizes.len());
     for (index, working_set) in sizes.iter().copied().enumerate() {
         ensure_not_cancelled(cancellation)?;
@@ -706,33 +779,127 @@ fn run_matrix_scaling(
                 sizes.len()
             ),
         });
-        let _ = harness.measure(working_set, reuse_count, 1)?;
+        let cold_ns = harness.measure(working_set, reuse_count, 1)?;
+        let warm_iterations = iterations_for_target(
+            cold_ns,
+            gluj_bench_core::measurement_budget(config).warmup_ns as f64 / 1e9,
+        );
+        {
+            let _warmup = gluj_bench_core::phase_timer("warmup");
+            gluj_bench_core::measure_batches(
+                gluj_bench_core::measurement_budget(config).warmup_ns,
+                cancellation,
+                || harness.measure(working_set, reuse_count, warm_iterations),
+            )?;
+        }
+        ensure_not_cancelled(cancellation)?;
         let calibration_ns = harness.measure(working_set, reuse_count, 1)?;
         let iterations = iterations_for_target(calibration_ns, target_seconds);
+        let sweeps = harness.sweeps_per_dispatch(working_set) as u32;
+        let passes = iterations * sweeps;
         let operations = harness.operations_per_dispatch(working_set, reuse_count) as f64;
         let traffic = harness.traffic_bytes_per_dispatch(working_set) as f64;
         let mut compute_values = Vec::with_capacity(sample_count as usize);
         let mut bandwidth_values = Vec::with_capacity(sample_count as usize);
+        let mut actual_batch_counts = Vec::new();
         let mut gpu_times = Vec::with_capacity(sample_count as usize);
         let mut end_to_end_times = Vec::with_capacity(sample_count as usize);
-        for _ in 0..sample_count {
-            ensure_not_cancelled(cancellation)?;
-            let sample_started = Instant::now();
-            let elapsed_ns = harness.measure(working_set, reuse_count, iterations)?;
-            let end_to_end_ns = sample_started.elapsed().as_secs_f64() * 1e9;
-            gpu_times.push(crate::timing::per_pass(elapsed_ns, iterations));
-            end_to_end_times.push(crate::timing::per_pass(end_to_end_ns, iterations));
-            let seconds = elapsed_ns / 1e9;
-            compute_values.push(operations * iterations as f64 / seconds);
-            bandwidth_values.push(traffic * iterations as f64 / seconds);
-        }
+        for realization in 0..realizations {
+            let seed = gluj_bench_core::derive_seed(root, 0, working_set, realization as u64);
+            let _real = gluj_bench_core::MeasurementScope::realization(
+                seed,
+                BTreeMap::from([
+                    ("generator_revision".into(), "matrix-tile-affine-1".into()),
+                    ("dataset_bytes".into(), working_set.to_string()),
+                    ("root_seed".into(), root.to_string()),
+                    ("realization".into(), realization.to_string()),
+                ]),
+            );
+            harness.traversal.set((traversal, seed));
+            {
+                let _warmup = gluj_bench_core::phase_timer("warmup");
+                gluj_bench_core::measure_batches(
+                    gluj_bench_core::measurement_budget(config).warmup_ns,
+                    cancellation,
+                    || harness.measure(working_set, reuse_count, warm_iterations),
+                )?;
+            }
+            for _ in 0..sample_count {
+                ensure_not_cancelled(cancellation)?;
+                let observed = gluj_bench_core::measure_batches(
+                    gluj_bench_core::sample_target_ns(config),
+                    cancellation,
+                    || harness.measure(working_set, reuse_count, iterations),
+                )?;
+                let iterations = iterations.saturating_mul(observed.batches);
+                let passes = passes.saturating_mul(observed.batches);
+                actual_batch_counts.push(passes);
+                let elapsed_ns = observed.active_ns;
+                let end_to_end_ns = observed.elapsed_ns as f64;
+                gpu_times.push(crate::timing::per_pass(elapsed_ns, passes));
+                end_to_end_times.push(crate::timing::per_pass(end_to_end_ns, passes));
+                let seconds = elapsed_ns / 1e9;
+                compute_values.push(operations * iterations as f64 / seconds);
+                bandwidth_values.push(traffic * iterations as f64 / seconds);
+                gluj_bench_core::record_observation(
+                    &format!("bytes-{working_set}"),
+                    "compute",
+                    *compute_values.last().unwrap(),
+                    "operations/s",
+                    (operations as u64).saturating_mul(u64::from(iterations)),
+                    "operations",
+                    elapsed_ns as u64,
+                    observed.elapsed_ns,
+                );
+                gluj_bench_core::record_observation(
+                    &format!("bytes-{working_set}"),
+                    "accounted_bandwidth",
+                    *bandwidth_values.last().unwrap(),
+                    "bytes/s",
+                    (traffic as u64).saturating_mul(u64::from(iterations)),
+                    "accounted_bytes",
+                    elapsed_ns as u64,
+                    observed.elapsed_ns,
+                );
+            }
+            let operand = if kind == MatrixKind::Sint8 {
+                -1_i64
+            } else if kind == MatrixKind::Uint8 {
+                255
+            } else {
+                1
+            };
+            context.validate_output(
+                harness.output.handle,
+                harness.output_size,
+                kind,
+                operand
+                    * i64::from(shape.k)
+                    * harness.tile_iterations(working_set) as i64
+                    * i64::from(reuse_count),
+            )?;
+        } // independently validated full-coverage realizations
         crate::timing::append_metrics(
             &mut timing_metrics,
             working_set,
             &gpu_times,
             &end_to_end_times,
         );
-        timing_batches.push(format!("{working_set}:{iterations}"));
+        if let Some(&first) = actual_batch_counts.first() {
+            if actual_batch_counts.iter().all(|value| *value == first) {
+                timing_batches.push(format!("{working_set}:{first}"));
+            }
+            timing_batch_series.push(format!(
+                "{working_set}:{}",
+                actual_batch_counts
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ));
+        }
+        dispatch_batches.push(format!("{working_set}:{iterations}"));
+        sweeps_per_dispatch.push(format!("{working_set}:{sweeps}"));
         raw_points.push((
             working_set,
             statistics(&compute_values),
@@ -791,6 +958,29 @@ fn run_matrix_scaling(
         });
     }
     let mut metadata = matrix_metadata(record, kind, shape);
+    metadata.insert("matrix_tile_shape".into(), shape_name(shape));
+    metadata.insert(
+        "matrix_traversal".into(),
+        config
+            .options
+            .get("matrix_traversal")
+            .cloned()
+            .unwrap_or_else(|| "sequential".into()),
+    );
+    metadata.insert("access_seed".into(), root.to_string());
+    metadata.insert("access_realizations".into(), realizations.to_string());
+    metadata.insert("matrix_execution_definition".into(),"dense independent tile operand streaming; subgroup-private output accumulation across tile visits and reuse; not a global GEMM or CPU full multiplication; padded tile visits included".into());
+    metadata.insert("kernel_revision".into(), "matrix-tile-traversal-2".into());
+    metadata.insert(
+        "matrix_input_pattern".into(),
+        "A=1 for FP16; A=-1 for SINT8 or 255 for UINT8; B=1; exact scalar tile/reuse reference"
+            .into(),
+    );
+    metadata.insert(
+        "shader_build_manifest".into(),
+        include_str!("../shaders/memory-matrix-build.json").into(),
+    );
+    metadata.insert("result_validation".into(),"boundary and interior matrix outputs at every dataset compared with scalar tile/reuse arithmetic outside timing".into());
     metadata.insert(
         "gpu_timing_method".into(),
         "gpu_timestamp_and_host_elapsed_per_pass_v1".into(),
@@ -800,6 +990,19 @@ fn run_matrix_scaling(
         gluj_bench_core::GPU_TIMING_EXPLANATION.into(),
     );
     metadata.insert("gpu_timing_batch_passes".into(), timing_batches.join(","));
+    metadata.insert(
+        "gpu_timing_batch_passes_series".into(),
+        timing_batch_series.join(","),
+    );
+    metadata.insert(
+        "gpu_timing_batch_dispatches".into(),
+        dispatch_batches.join(","),
+    );
+    metadata.insert(
+        "matrix_sweeps_per_dispatch".into(),
+        sweeps_per_dispatch.join(","),
+    );
+    metadata.insert("matrix_dispatch_batching".into(), "Small datasets repeat complete padded operand sweeps inside each dispatch to amortize launch, barrier and final-store overhead. Tile reuse stays fixed. Operation and traffic counts include every executed tile; output is stored once per dispatch. Timings are normalized by operand sweeps, including subgroup padding.".into());
     metadata.insert("gpu_timing_samples_paired".into(), "true".into());
     insert_clock_policy(&mut metadata);
     metadata.insert(
@@ -808,7 +1011,7 @@ fn run_matrix_scaling(
     );
     metadata.insert(
         "matrix_profile_revision".into(),
-        "weight-streaming-1".into(),
+        "tile-streaming-4-signed-input".into(),
     );
     metadata.insert(
         "dataset_mode".into(),
@@ -838,7 +1041,7 @@ fn run_matrix_scaling(
     );
     metadata.insert(
         "profile_sample_count_per_tier".into(),
-        sample_count.to_string(),
+        (sample_count * realizations).to_string(),
     );
     metadata.insert(
         "maximum_operand_working_set_bytes".into(),
@@ -901,7 +1104,7 @@ fn run_matrix_scaling(
         run(
             record,
             kind.register_id(),
-            &crate::scaling::reference_config(config),
+            &gluj_bench_core::reference_config(config, "reference-after"),
             cancellation,
             &mut check_progress,
         )?
@@ -969,6 +1172,14 @@ fn matrix_profile_drop_is_significant(point: &MatrixProfilePoint) -> bool {
     1.0 - point.retained_ratio > (noise * 2.0).max(0.02)
 }
 
+fn matrix_input_a_pattern(kind: MatrixKind) -> u32 {
+    if kind == MatrixKind::Fp16 {
+        0x3c00_3c00
+    } else {
+        0xffff_ffff
+    }
+}
+
 fn matrix_profile_bytes_per_tile(shape: MatrixShape, kind: MatrixKind) -> u64 {
     (shape.m as u64 * shape.k as u64 + shape.k as u64 * shape.n as u64) * kind.operand_bytes()
 }
@@ -1033,10 +1244,41 @@ struct VulkanMatrixContext {
     timestamp_period_ns: f64,
     timestamp_valid_bits: u32,
     subgroup_size: u32,
+    queue_family: u32,
 }
 
 impl VulkanMatrixContext {
+    fn validate_output(
+        &self,
+        buffer: vk::Buffer,
+        size: u64,
+        kind: MatrixKind,
+        expected: i64,
+    ) -> Result<(), BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("validation");
+        for (index, word) in crate::validation::read_words(
+            &self.device,
+            &self.memory_properties,
+            self.queue,
+            self.queue_family,
+            buffer,
+            size,
+        )? {
+            let valid = if kind == MatrixKind::Fp16 {
+                f32::from_bits(word) == expected as f32
+            } else {
+                word == expected as u32
+            };
+            if !valid {
+                return Err(crate::validation::problem(format!(
+                    "Matrix output {index} differs from its scalar tile/reuse reference."
+                )));
+            }
+        }
+        Ok(())
+    }
     fn new(record: &AdapterRecord, kind: MatrixKind) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         // SAFETY: every handle is owned by the returned context and released by Drop.
         unsafe { Self::new_inner(record, kind) }
     }
@@ -1140,11 +1382,15 @@ impl VulkanMatrixContext {
             timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
             timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
             subgroup_size: record.vulkan.subgroup_size,
+            queue_family: record.vulkan.compute_queue_family,
         })
     }
 
     fn create_output(&self, size: u64) -> Result<Buffer, BenchmarkError> {
-        self.create_buffer(size, vk::BufferUsageFlags::STORAGE_BUFFER)
+        self.create_buffer(
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        )
     }
 
     fn create_buffer(
@@ -1297,6 +1543,7 @@ impl<'a> MatrixHarness<'a> {
         shape: MatrixShape,
         workgroups: u32,
     ) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         let subgroups = MATRIX_WORKGROUP_SIZE / context.subgroup_size as u64;
         let output_size = workgroups as u64 * subgroups * shape.m as u64 * shape.n as u64 * 4;
         let output = context.create_output(output_size)?;
@@ -1432,6 +1679,19 @@ impl<'a> MatrixHarness<'a> {
                 &[],
             );
             for _ in 0..iterations {
+                let writes = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &writes,
+                    &[],
+                    &[],
+                );
+
                 device.cmd_dispatch(command_buffer, self.workgroups, 1, 1);
             }
         })
@@ -1474,6 +1734,7 @@ struct MatrixProfileHarness<'a> {
     descriptor_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    traversal: std::cell::Cell<(u32, u64)>,
 }
 
 impl<'a> MatrixProfileHarness<'a> {
@@ -1484,11 +1745,12 @@ impl<'a> MatrixProfileHarness<'a> {
         workgroups: u32,
         requested_working_set: u64,
     ) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         let bytes_a_per_tile = shape.m as u64 * shape.k as u64 * kind.operand_bytes();
         let bytes_b_per_tile = shape.k as u64 * shape.n as u64 * kind.operand_bytes();
         let bytes_per_tile = bytes_a_per_tile + bytes_b_per_tile;
         let tile_count = (requested_working_set / bytes_per_tile).max(1);
-        if tile_count > u32::MAX as u64 {
+        if tile_count > u32::MAX as u64 / u64::from((shape.m * shape.k).max(shape.k * shape.n)) {
             return Err(BenchmarkError::new(
                 "matrix_profile_too_large",
                 "The requested matrix operand set exceeds the shader tile-index range.",
@@ -1525,7 +1787,7 @@ impl<'a> MatrixProfileHarness<'a> {
             let push_ranges = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(16)];
+                .size(32)];
             let pipeline_layout = context
                 .device
                 .create_pipeline_layout(
@@ -1631,6 +1893,7 @@ impl<'a> MatrixProfileHarness<'a> {
                 descriptor_set,
                 pipeline_layout,
                 pipeline,
+                traversal: std::cell::Cell::new((0, 0)),
             };
             context.measure(|device, command_buffer| {
                 device.cmd_fill_buffer(
@@ -1638,11 +1901,7 @@ impl<'a> MatrixProfileHarness<'a> {
                     harness.input_a.handle,
                     0,
                     input_a_size,
-                    if kind == MatrixKind::Fp16 {
-                        0x3c00_3c00
-                    } else {
-                        0x0101_0101
-                    },
+                    matrix_input_a_pattern(kind),
                 );
                 device.cmd_fill_buffer(
                     command_buffer,
@@ -1666,9 +1925,12 @@ impl<'a> MatrixProfileHarness<'a> {
             * self.bytes_per_tile
     }
 
+    fn sweeps_per_dispatch(&self, working_set: u64) -> u64 {
+        matrix_profile_dispatch_plan(working_set / self.bytes_per_tile, self.active_subgroups).0
+    }
+
     fn tile_iterations(&self, working_set: u64) -> u64 {
-        let tiles = working_set / self.bytes_per_tile;
-        tiles.div_ceil(self.active_subgroups).max(1)
+        matrix_profile_dispatch_plan(working_set / self.bytes_per_tile, self.active_subgroups).1
     }
 
     fn operations_per_dispatch(&self, working_set: u64, reuse_count: u32) -> u64 {
@@ -1696,12 +1958,19 @@ impl<'a> MatrixProfileHarness<'a> {
                 "The matrix profile requires more tile iterations than the shader can index.",
             )
         })?;
-        let params = matrix_profile_parameters(
+        let base_params = matrix_profile_parameters(
             tile_count,
             tile_iterations,
             reuse_count,
             self.active_subgroups as u32,
         );
+        let (mode, seed) = self.traversal.get();
+        let (mul, offset) = crate::memory_conditions::permutation(tile_count, seed);
+        let mut params = [0_u8; 32];
+        params[..16].copy_from_slice(&base_params);
+        params[16..20].copy_from_slice(&mode.to_le_bytes());
+        params[20..24].copy_from_slice(&mul.to_le_bytes());
+        params[24..28].copy_from_slice(&offset.to_le_bytes());
         self.context.measure(|device, command_buffer| unsafe {
             let dependency = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
@@ -1750,6 +2019,19 @@ impl<'a> MatrixProfileHarness<'a> {
                         &[],
                     );
                 }
+                let offset = if mode == 2 {
+                    ((u64::from(offset) + u64::from(iteration)) % u64::from(tile_count)) as u32
+                } else {
+                    offset
+                };
+                params[24..28].copy_from_slice(&offset.to_le_bytes());
+                device.cmd_push_constants(
+                    command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &params,
+                );
                 device.cmd_dispatch(command_buffer, self.workgroups, 1, 1);
             }
         })
@@ -1776,6 +2058,14 @@ impl Drop for MatrixProfileHarness<'_> {
             }
         }
     }
+}
+
+// Repeat whole padded sweeps, keeping operand reuse per tile fixed. This avoids
+// measuring thousands of tiny dispatches instead of sustained matrix execution.
+fn matrix_profile_dispatch_plan(tiles: u64, active_subgroups: u64) -> (u64, u64) {
+    let per_sweep = tiles.div_ceil(active_subgroups).max(1);
+    let sweeps = 64_u64.div_ceil(per_sweep).max(1);
+    (sweeps, per_sweep * sweeps)
 }
 
 fn matrix_profile_parameters(
@@ -1818,7 +2108,7 @@ fn matrix_metadata(
     metadata.insert("shader_source_language".into(), "GLSL".into());
     metadata.insert(
         "matrix_kernel_revision".into(),
-        "vulkan-khr-cooperative-1".into(),
+        "vulkan-khr-cooperative-2".into(),
     );
     metadata.insert("matrix_m".into(), shape.m.to_string());
     metadata.insert("matrix_n".into(), shape.n.to_string());
@@ -1915,6 +2205,39 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 fn error(code: &str, problem: impl std::fmt::Display) -> BenchmarkError {
     BenchmarkError::new(code, problem.to_string())
+}
+
+pub(super) fn shape_name(shape: MatrixShape) -> String {
+    let input = if shape.input == vk::ComponentTypeKHR::FLOAT16 {
+        "fp16"
+    } else if shape.input == vk::ComponentTypeKHR::SINT8 {
+        "sint8"
+    } else {
+        "uint8"
+    };
+    let accum = if shape.accumulator == vk::ComponentTypeKHR::FLOAT32 {
+        "fp32"
+    } else if shape.accumulator == vk::ComponentTypeKHR::SINT32 {
+        "sint32"
+    } else {
+        "uint32"
+    };
+    format!("{}x{}x{}:{input}:{accum}", shape.m, shape.n, shape.k)
+}
+pub(super) fn tile_shapes(record: &AdapterRecord, id: &str) -> Vec<MatrixShape> {
+    let mut values = if id.contains("fp16") {
+        record.cooperative.fp16_shapes.clone()
+    } else {
+        record.cooperative.int8_shapes.clone()
+    };
+    if values.is_empty() {
+        values.extend(if id.contains("fp16") {
+            record.cooperative.fp16
+        } else {
+            record.cooperative.int8
+        });
+    }
+    values
 }
 
 #[cfg(test)]
@@ -2050,6 +2373,15 @@ mod tests {
             device.free_memory(memory, None);
             words
         }
+    }
+
+    #[test]
+    fn buffered_input_patterns_exercise_signedness_and_match_scalar_operands() {
+        let signed = matrix_input_a_pattern(MatrixKind::Sint8).to_ne_bytes();
+        let unsigned = matrix_input_a_pattern(MatrixKind::Uint8).to_ne_bytes();
+        assert!(signed.iter().all(|b| i8::from_ne_bytes([*b]) == -1));
+        assert!(unsigned.iter().all(|b| *b == 255));
+        assert_eq!(matrix_input_a_pattern(MatrixKind::Fp16), 0x3c00_3c00);
     }
 
     #[test]
@@ -2356,6 +2688,23 @@ mod tests {
             shape.operations_per_mma() * MATRIX_PROFILE_REUSE as u64,
             65_536
         );
+    }
+
+    #[test]
+    fn matrix_dispatch_batching_preserves_whole_sweeps_and_executed_work() {
+        for tiles in [1, 256, 513, 8192, 65536, 262144] {
+            let (sweeps, loops) = matrix_profile_dispatch_plan(tiles, 512);
+            let padded_tiles = tiles.div_ceil(512) * 512;
+            assert!(loops >= 64);
+            assert_eq!(loops * 512, padded_tiles * sweeps);
+            let mma_operations = 8192 * 8;
+            assert_eq!(
+                loops * 512 * mma_operations / sweeps,
+                padded_tiles * mma_operations
+            );
+        }
+        assert_eq!(matrix_profile_dispatch_plan(256, 512), (64, 64));
+        assert_eq!(matrix_profile_dispatch_plan(65536, 512), (1, 128));
     }
 
     #[test]

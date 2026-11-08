@@ -1,0 +1,70 @@
+{
+  "compiler": "Glslang Version: 11:16.6.0\nESSL Version: OpenGL ES GLSL 3.20 glslang Khronos. 16.6.0\nGLSL Version: 4.60 glslang Khronos. 16.6.0\nSPIR-V Version 0x00010600, Revision 1\nGLSL.std.450 Version 100, Revision 1\nKhronos Tool ID 8\nSPIR-V Generator Version 11\nGL_KHR_vulkan_glsl version 100\nARB_GL_gl_spirv version 100",
+  "target": "vulkan1.1 / SPIR-V 1.3",
+  "validation": "glslang --spirv-val",
+  "shaders": [
+    {
+      "name": "bandwidth_read_cache",
+      "source": "bandwidth.comp",
+      "define": "-DKERNEL=0",
+      "source_sha256": "c220c2b19f2515ceaa713958e3eb64bbba747050d98efbb609528f294f2fe7f7",
+      "spirv_sha256": "4d510116eb4bc08f93c27a707aaf78be15effd326f1f5127ddc94d5be69070d5"
+    },
+    {
+      "name": "bandwidth_write_cache",
+      "source": "bandwidth.comp",
+      "define": "-DKERNEL=1",
+      "source_sha256": "c220c2b19f2515ceaa713958e3eb64bbba747050d98efbb609528f294f2fe7f7",
+      "spirv_sha256": "e2559d6791b85fbf571719fae57bf72b2dbc1b9b429b3f647a5c3db7f22c6312"
+    },
+    {
+      "name": "bandwidth_copy_cache",
+      "source": "bandwidth.comp",
+      "define": "-DKERNEL=2",
+      "source_sha256": "c220c2b19f2515ceaa713958e3eb64bbba747050d98efbb609528f294f2fe7f7",
+      "spirv_sha256": "4d5caaa0d6588f9131939d6899b34bd4dede9004d370b5819f7c1c7dd156a466"
+    },
+    {
+      "name": "bandwidth_read_stream",
+      "source": "bandwidth.comp",
+      "define": "-DKERNEL=3",
+      "source_sha256": "c220c2b19f2515ceaa713958e3eb64bbba747050d98efbb609528f294f2fe7f7",
+      "spirv_sha256": "14a8086285b62d62905deea569437d5ae1e5071efd642d1a68667066b18d1d96"
+    },
+    {
+      "name": "bandwidth_write_stream",
+      "source": "bandwidth.comp",
+      "define": "-DKERNEL=4",
+      "source_sha256": "c220c2b19f2515ceaa713958e3eb64bbba747050d98efbb609528f294f2fe7f7",
+      "spirv_sha256": "fdc6518980d3dc06bb4b23260d29359e08881528d02db077e3182c5feeff180e"
+    },
+    {
+      "name": "bandwidth_copy_stream",
+      "source": "bandwidth.comp",
+      "define": "-DKERNEL=5",
+      "source_sha256": "c220c2b19f2515ceaa713958e3eb64bbba747050d98efbb609528f294f2fe7f7",
+      "spirv_sha256": "f15f0affeb42a686187a4b3792d22a99b98246e64032da486b976a25481e0939"
+    },
+    {
+      "name": "matrix_profile_fp16",
+      "source": "matrix_profile_fp16.comp",
+      "define": "",
+      "source_sha256": "f13c1c1b6f1d90157eff9b4fd792b1dc8eae47feca7d4fb4dbbd4de9a8d52b0b",
+      "spirv_sha256": "ed84e33151961ab7fae93de44a2520931dc137e9e62eeb3d16857de1d4ffe9a2"
+    },
+    {
+      "name": "matrix_profile_int8",
+      "source": "matrix_profile_int8.comp",
+      "define": "",
+      "source_sha256": "ca27c10cb8f0d74eb89f99cd82e094af597985a474f9bd596807062697fe722f",
+      "spirv_sha256": "aa6f4244f1ccf263f730a39f0c2bcf0159c53415087a26fe9223f1b322f0a108"
+    },
+    {
+      "name": "matrix_profile_uint8",
+      "source": "matrix_profile_uint8.comp",
+      "define": "",
+      "source_sha256": "52f4d4439b50a6d581f60d9c9c1937161c3bce3499b813d2f063de3dde87c35a",
+      "spirv_sha256": "28ac18ab0c5f22abe4e8a8ae4054998b5920cd3f45bf6caa6748f9573180f592"
+    }
+  ]
+}

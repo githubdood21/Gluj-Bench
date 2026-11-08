@@ -15,13 +15,14 @@ pub(super) fn point(
         "{} {unit}",
         display_value.trim_end_matches('0').trim_end_matches('.')
     );
+    let size = format_binary_size(bytes as f64);
     ChartPoint {
         x: x as f32,
         y: y as f32,
-        left: 110.0,
         bottom: bottom as f32,
         value_label: format!("{:.3} {unit}", metric.value / scale).into(),
-        dataset_label: format_binary_size(bytes as f64).into(),
+        context: format!("{size} dataset").into(),
+        x_label: size.into(),
         series: title.split(" · ").next().unwrap_or(title).into(),
         display_value: display_value.into(),
         accent,

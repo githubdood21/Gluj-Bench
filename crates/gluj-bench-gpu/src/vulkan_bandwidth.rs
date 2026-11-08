@@ -1,6 +1,6 @@
 use crate::{
-    AdapterRecord, DispatchMeasurement, GPU_PRECONDITION_MS, HOST_STAGING_BUFFER_COUNT,
-    KernelFlavor, KernelOperation, WORKGROUP_SIZE, ensure_not_cancelled,
+    AdapterRecord, DispatchMeasurement, HOST_STAGING_BUFFER_COUNT, KernelFlavor, KernelOperation,
+    WORKGROUP_SIZE, ensure_not_cancelled,
 };
 use ash::{Entry, vk};
 use gluj_bench_core::{BenchmarkError, CancellationToken};
@@ -22,6 +22,73 @@ struct Buffer {
     coherent: bool,
 }
 
+struct ConstructionGuard<'a> {
+    actions: Vec<Box<dyn FnOnce() + 'a>>,
+}
+impl<'a> ConstructionGuard<'a> {
+    fn new() -> Self {
+        Self {
+            actions: Vec::new(),
+        }
+    }
+    fn buffer(&mut self, context: &'a VulkanBandwidthContext, buffer: &Buffer) {
+        let handle = buffer.handle;
+        let memory = buffer.memory;
+        self.actions.push(Box::new(move || {
+            // SAFETY: this guard owns partial construction until disarmed.
+            unsafe {
+                context.device.destroy_buffer(handle, None);
+                context.device.free_memory(memory, None);
+            }
+        }));
+    }
+    fn disarm(&mut self) {
+        self.actions.clear();
+    }
+}
+impl Drop for ConstructionGuard<'_> {
+    fn drop(&mut self) {
+        while let Some(action) = self.actions.pop() {
+            action();
+        }
+    }
+}
+
+struct BufferGuard<'a> {
+    context: &'a VulkanBandwidthContext,
+    buffer: Option<Buffer>,
+}
+impl std::ops::Deref for BufferGuard<'_> {
+    type Target = Buffer;
+    fn deref(&self) -> &Buffer {
+        self.buffer.as_ref().unwrap()
+    }
+}
+impl Drop for BufferGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.context.destroy_buffer(buffer);
+        }
+    }
+}
+struct StagingRing<'a> {
+    context: &'a VulkanBandwidthContext,
+    buffers: Vec<Buffer>,
+}
+impl std::ops::Deref for StagingRing<'_> {
+    type Target = [Buffer];
+    fn deref(&self) -> &[Buffer] {
+        &self.buffers
+    }
+}
+impl Drop for StagingRing<'_> {
+    fn drop(&mut self) {
+        for buffer in self.buffers.drain(..) {
+            self.context.destroy_buffer(buffer);
+        }
+    }
+}
+
 pub(super) struct VulkanBandwidthContext {
     _entry: Entry,
     instance: ash::Instance,
@@ -31,12 +98,60 @@ pub(super) struct VulkanBandwidthContext {
     command_buffer: vk::CommandBuffer,
     query_pool: vk::QueryPool,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
+    queue_family: u32,
+    discrete: bool,
     timestamp_period_ns: f64,
     timestamp_valid_bits: u32,
 }
 
 impl VulkanBandwidthContext {
+    fn prepare_pattern(
+        &self,
+        buffer: vk::Buffer,
+        size: u64,
+        pattern: u32,
+    ) -> Result<(), BenchmarkError> {
+        self.record_timestamps(|device, command| unsafe {
+            device.cmd_fill_buffer(command, buffer, 0, size, pattern);
+            let barriers = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::SHADER_READ)];
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &barriers,
+                &[],
+                &[],
+            );
+        })?;
+        Ok(())
+    }
+    fn validate_pattern(
+        &self,
+        buffer: vk::Buffer,
+        size: u64,
+        expected: u32,
+    ) -> Result<(), BenchmarkError> {
+        for (_, word) in crate::validation::read_words(
+            &self.device,
+            &self.memory_properties,
+            self.queue,
+            self.queue_family,
+            buffer,
+            size,
+        )? {
+            if word != expected {
+                return Err(crate::validation::problem(
+                    "Transfer output differs from the known source pattern.",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub fn new(record: &AdapterRecord) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         // SAFETY: handles are owned by this context and released in reverse order by Drop.
         unsafe { Self::new_inner(record) }
     }
@@ -84,47 +199,50 @@ impl VulkanBandwidthContext {
             }
         };
         let queue = unsafe { device.get_device_queue(record.vulkan.compute_queue_family, 0) };
-        let command_pool = unsafe {
-            device.create_command_pool(
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let mut owner = Self {
+            _entry: entry,
+            instance,
+            device,
+            queue,
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            query_pool: vk::QueryPool::null(),
+            memory_properties,
+            queue_family: record.vulkan.compute_queue_family,
+            discrete: record.vulkan.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
+            timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
+            timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
+        };
+        owner.command_pool = unsafe {
+            owner.device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .queue_family_index(record.vulkan.compute_queue_family)
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_command_pool_failed", problem))?;
-        let command_buffer = unsafe {
-            device.allocate_command_buffers(
+        .map_err(|p| error("vulkan_command_pool_failed", p))?;
+        owner.command_buffer = unsafe {
+            owner.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(command_pool)
+                    .command_pool(owner.command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
         }
-        .map_err(|problem| error("vulkan_command_buffer_failed", problem))?[0];
-        let query_pool = unsafe {
-            device.create_query_pool(
+        .map_err(|p| error("vulkan_command_buffer_failed", p))?[0];
+        owner.query_pool = unsafe {
+            owner.device.create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(2),
                 None,
             )
         }
-        .map_err(|problem| error("vulkan_query_pool_failed", problem))?;
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        Ok(Self {
-            _entry: entry,
-            instance,
-            device,
-            queue,
-            command_pool,
-            command_buffer,
-            query_pool,
-            memory_properties,
-            timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
-            timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
-        })
+        .map_err(|p| error("vulkan_query_pool_failed", p))?;
+        Ok(owner)
     }
 
     fn create_buffer(
@@ -134,6 +252,7 @@ impl VulkanBandwidthContext {
         required: vk::MemoryPropertyFlags,
         preferred: vk::MemoryPropertyFlags,
     ) -> Result<Buffer, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         // SAFETY: allocation and binding are local; partial resources are cleaned on failure.
         unsafe {
             let handle = self
@@ -147,12 +266,21 @@ impl VulkanBandwidthContext {
                 )
                 .map_err(allocation_error)?;
             let requirements = self.device.get_buffer_memory_requirements(handle);
-            let memory_type = match find_memory_type(
-                &self.memory_properties,
-                requirements.memory_type_bits,
-                required,
-                preferred,
-            ) {
+            let memory_type = match if required.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                find_staging_memory_type(
+                    &self.memory_properties,
+                    requirements.memory_type_bits,
+                    preferred,
+                    self.discrete,
+                )
+            } else {
+                find_memory_type(
+                    &self.memory_properties,
+                    requirements.memory_type_bits,
+                    required,
+                    preferred,
+                )
+            } {
                 Some(index) => index,
                 None => {
                     self.device.destroy_buffer(handle, None);
@@ -317,6 +445,7 @@ struct KernelHarness<'a> {
     workgroups_x: u32,
     workgroups_y: u32,
     params: [u32; 4],
+    access: std::cell::Cell<(u32, u64)>,
     traffic_bytes: u64,
 }
 
@@ -328,6 +457,7 @@ impl<'a> KernelHarness<'a> {
         operation: KernelOperation,
         flavor: KernelFlavor,
     ) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         if size == 0
             || !size.is_multiple_of(16)
             || dispatch_bytes < size
@@ -360,18 +490,21 @@ impl<'a> KernelHarness<'a> {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;
+        let mut construction = ConstructionGuard::new();
         let source = context.create_buffer(
             size,
             usage,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             vk::MemoryPropertyFlags::empty(),
         )?;
+        construction.buffer(context, &source);
         let destination = context.create_buffer(
             size,
             usage,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             vk::MemoryPropertyFlags::empty(),
         )?;
+        construction.buffer(context, &destination);
         let checksum_size = if operation == KernelOperation::Read {
             (invocations * 4).max(4)
         } else {
@@ -379,10 +512,11 @@ impl<'a> KernelHarness<'a> {
         };
         let checksums = context.create_buffer(
             checksum_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             vk::MemoryPropertyFlags::empty(),
         )?;
+        construction.buffer(context, &checksums);
         // SAFETY: all Vulkan objects below are owned by the harness and destroyed by Drop.
         unsafe {
             let bindings = [
@@ -397,11 +531,16 @@ impl<'a> KernelHarness<'a> {
                     None,
                 )
                 .map_err(|problem| error("vulkan_descriptor_layout_failed", problem))?;
+            construction.actions.push(Box::new(move || {
+                context
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_layout, None)
+            }));
             let set_layouts = [descriptor_layout];
             let push_ranges = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(16)];
+                .size(32)];
             let pipeline_layout = context
                 .device
                 .create_pipeline_layout(
@@ -411,6 +550,11 @@ impl<'a> KernelHarness<'a> {
                     None,
                 )
                 .map_err(|problem| error("vulkan_pipeline_layout_failed", problem))?;
+            construction.actions.push(Box::new(move || {
+                context
+                    .device
+                    .destroy_pipeline_layout(pipeline_layout, None)
+            }));
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(3)];
@@ -423,6 +567,11 @@ impl<'a> KernelHarness<'a> {
                     None,
                 )
                 .map_err(|problem| error("vulkan_descriptor_pool_failed", problem))?;
+            construction.actions.push(Box::new(move || {
+                context
+                    .device
+                    .destroy_descriptor_pool(descriptor_pool, None)
+            }));
             let descriptor_set = context
                 .device
                 .allocate_descriptor_sets(
@@ -469,6 +618,9 @@ impl<'a> KernelHarness<'a> {
             context.device.destroy_shader_module(module, None);
             let pipeline = pipeline_result
                 .map_err(|(_, problem)| error("vulkan_compute_pipeline_failed", problem))?[0];
+            construction.actions.push(Box::new(move || {
+                context.device.destroy_pipeline(pipeline, None)
+            }));
             let harness = Self {
                 context,
                 source,
@@ -487,17 +639,51 @@ impl<'a> KernelHarness<'a> {
                     workgroups_x * WORKGROUP_SIZE as u32,
                     access_count as u32,
                 ],
+                access: std::cell::Cell::new((0, 0)),
                 traffic_bytes: dispatch_bytes,
             };
+            construction.disarm();
+            context.record_timestamps(|device, command| {
+                device.cmd_fill_buffer(command, harness.source.handle, 0, size, 0xa5a5_a5a5);
+                device.cmd_fill_buffer(command, harness.destination.handle, 0, size, 0xcccc_cccc);
+                let barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                );
+            })?;
             harness.measure(1)?;
             Ok(harness)
         }
     }
 
     fn measure(&self, iterations: u32) -> Result<f64, BenchmarkError> {
-        let push = words_as_bytes(&self.params);
+        let (mode, seed) = self.access.get();
+        let (mul, offset) = crate::memory_conditions::permutation(self.params[0] / 64, seed);
         self.context
             .record_timestamps(|device, command_buffer| unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(
+                            vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    &[],
+                    &[],
+                );
                 device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
@@ -511,14 +697,44 @@ impl<'a> KernelHarness<'a> {
                     &[self.descriptor_set],
                     &[],
                 );
-                device.cmd_push_constants(
-                    command_buffer,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    push,
-                );
-                for _ in 0..iterations {
+                for iteration in 0..iterations {
+                    let offset = if mode == 2 {
+                        ((u64::from(offset) + u64::from(iteration))
+                            % u64::from((self.params[0] / 64).max(1)))
+                            as u32
+                    } else {
+                        offset
+                    };
+                    let params = [
+                        self.params[0],
+                        self.params[1],
+                        self.params[2],
+                        self.params[3],
+                        mode,
+                        mul,
+                        offset,
+                        (seed as u32) | 1,
+                    ];
+                    device.cmd_push_constants(
+                        command_buffer,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        words_as_bytes(&params),
+                    );
+                    if iteration > 0 {
+                        device.cmd_pipeline_barrier(
+                            command_buffer,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[vk::MemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)],
+                            &[],
+                            &[],
+                        );
+                    }
                     device.cmd_dispatch(command_buffer, self.workgroups_x, self.workgroups_y, 1);
                 }
             })
@@ -554,8 +770,29 @@ pub(super) fn measure_gpu_operation(
     measurement: DispatchMeasurement,
     cancellation: &CancellationToken,
 ) -> Result<Vec<f64>, BenchmarkError> {
-    if measurement.operation == KernelOperation::Copy && measurement.flavor == KernelFlavor::Stream
-    {
+    measure_gpu_operation_access(
+        context,
+        measurement,
+        cancellation,
+        measurement.flavor == KernelFlavor::Stream,
+        0,
+        0,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn measure_gpu_operation_access(
+    context: &VulkanBandwidthContext,
+    measurement: DispatchMeasurement,
+    cancellation: &CancellationToken,
+    native_copy: bool,
+    mode: u32,
+    seed: u64,
+) -> Result<Vec<f64>, BenchmarkError> {
+    let _scope = gluj_bench_core::MeasurementScope::condition(&format!(
+        "{:?}:{:?}:bytes-{}",
+        measurement.flavor, measurement.operation, measurement.size
+    ));
+    if measurement.operation == KernelOperation::Copy && native_copy {
         return measure_native_copy(context, measurement, cancellation);
     }
     let harness = KernelHarness::new(
@@ -565,14 +802,50 @@ pub(super) fn measure_gpu_operation(
         measurement.operation,
         measurement.flavor,
     )?;
-    calibrated_samples(
+    harness.access.set((mode, seed));
+    let values = calibrated_samples(
         harness.traffic_bytes * measurement.operation.reported_byte_multiplier(),
         measurement.sample_count,
         measurement.target_per_sample,
         measurement.precondition,
         cancellation,
         |iterations| harness.measure(iterations),
-    )
+    )?;
+    let (output, size) = if measurement.operation == KernelOperation::Read {
+        (
+            harness.checksums.handle,
+            measurement.dispatch_bytes
+                / 16
+                / measurement
+                    .operation
+                    .accesses_per_invocation(measurement.flavor)
+                * 4,
+        )
+    } else {
+        (harness.destination.handle, measurement.size)
+    };
+    for (index, word) in crate::validation::read_words(
+        &context.device,
+        &context.memory_properties,
+        context.queue,
+        context.queue_family,
+        output,
+        size,
+    )? {
+        let expected = match measurement.operation {
+            KernelOperation::Read => 0x9e37_79b9,
+            KernelOperation::Write => {
+                (0x9e37_79b9 ^ (index / 4) as u32).wrapping_add((index % 4) as u32)
+            }
+            KernelOperation::Copy => 0xa5a5_a5a5,
+        };
+        if word != expected {
+            return Err(crate::validation::problem(
+                "GPU bandwidth output differs from its source/write/checksum reference.",
+            ));
+        }
+    }
+    Ok(values)
 }
 
 fn measure_native_copy(
@@ -593,6 +866,7 @@ fn measure_native_copy(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
         vk::MemoryPropertyFlags::empty(),
     )?;
+    context.prepare_pattern(source.handle, measurement.size, 0xa5a5_a5a5)?;
     let result = calibrated_samples(
         measurement.size * 2,
         measurement.sample_count,
@@ -602,6 +876,7 @@ fn measure_native_copy(
         |iterations| {
             context.record_timestamps(|device, command_buffer| unsafe {
                 for _ in 0..iterations {
+                    transfer_dependency(device, command_buffer);
                     device.cmd_copy_buffer(
                         command_buffer,
                         source.handle,
@@ -611,7 +886,11 @@ fn measure_native_copy(
                 }
             })
         },
-    );
+    )
+    .and_then(|values| {
+        context.validate_pattern(destination.handle, measurement.size, 0xa5a5_a5a5)?;
+        Ok(values)
+    });
     context.destroy_buffer(source);
     context.destroy_buffer(destination);
     result
@@ -628,7 +907,7 @@ fn calibrated_samples<F>(
 where
     F: FnMut(u32) -> Result<f64, BenchmarkError>,
 {
-    let target = gluj_bench_core::gpu_burst_duration(target);
+    let burst = gluj_bench_core::gpu_burst_duration(target);
     let calibration_iterations = 64;
     let mut per_iteration_ns = measure(calibration_iterations)? / calibration_iterations as f64;
     if per_iteration_ns <= 0.0 || !per_iteration_ns.is_finite() {
@@ -638,24 +917,28 @@ where
         ));
     }
     if precondition {
-        let warm_iterations = (gluj_bench_core::gpu_burst_duration(Duration::from_secs_f64(
-            GPU_PRECONDITION_MS / 1000.0,
-        ))
-        .as_secs_f64()
-            * 1e9
-            / per_iteration_ns)
-            .ceil()
-            .clamp(1.0, 4096.0) as u32;
-        per_iteration_ns = measure(warm_iterations)? / warm_iterations as f64;
+        let target = gluj_bench_core::current_measurement_budget().warmup_ns;
+        let warm_iterations = (target as f64 / per_iteration_ns).ceil().clamp(1., 4096.) as u32;
+        let _warmup = gluj_bench_core::phase_timer("warmup");
+        let observed =
+            gluj_bench_core::measure_batches(target, cancellation, || measure(warm_iterations))?;
+        per_iteration_ns =
+            observed.active_ns / (u64::from(warm_iterations) * u64::from(observed.batches)) as f64;
     }
-    let iterations = (target.as_secs_f64() * 1e9 / per_iteration_ns)
+    let iterations = (burst.as_secs_f64() * 1e9 / per_iteration_ns)
         .ceil()
         .clamp(1.0, 4096.0) as u32;
     let mut values = Vec::with_capacity(sample_count as usize);
     for _ in 0..sample_count {
         ensure_not_cancelled(cancellation)?;
-        let elapsed_ns = measure(iterations)?;
-        let bandwidth = bytes_per_iteration as f64 * iterations as f64 / (elapsed_ns / 1e9);
+        let observation =
+            gluj_bench_core::measure_batches(target.as_nanos() as u64, cancellation, || {
+                measure(iterations)
+            })?;
+        let elapsed_ns = observation.active_ns;
+        let completed_iterations = iterations.saturating_mul(observation.batches);
+        let bandwidth =
+            bytes_per_iteration as f64 * completed_iterations as f64 / (elapsed_ns / 1e9);
         if !bandwidth.is_finite() || bandwidth <= 0.0 {
             return Err(BenchmarkError::new(
                 "device_lost",
@@ -663,6 +946,16 @@ where
             ));
         }
         values.push(bandwidth);
+        gluj_bench_core::record_observation(
+            &format!("traffic-{bytes_per_iteration}"),
+            "local_bandwidth",
+            bandwidth,
+            "bytes/s",
+            bytes_per_iteration.saturating_mul(u64::from(completed_iterations)),
+            "accounted_bytes",
+            elapsed_ns as u64,
+            observation.elapsed_ns,
+        );
     }
     Ok(values)
 }
@@ -674,32 +967,65 @@ pub(super) fn measure_host_to_device(
     target: Duration,
     cancellation: &CancellationToken,
 ) -> Result<Vec<f64>, BenchmarkError> {
-    let staging = create_staging_ring(context, size, 0xa5)?;
-    let destination = context.create_buffer(
+    measure_host_to_device_config(
+        context,
         size,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        vk::MemoryPropertyFlags::empty(),
-    )?;
+        samples,
+        target,
+        cancellation,
+        TransferOptions::default(),
+    )
+}
+pub(super) fn measure_host_to_device_config(
+    context: &VulkanBandwidthContext,
+    size: u64,
+    samples: u32,
+    target: Duration,
+    cancellation: &CancellationToken,
+    options: TransferOptions,
+) -> Result<Vec<f64>, BenchmarkError> {
+    let _scope = gluj_bench_core::MeasurementScope::condition("host_to_device");
+    let staging = create_staging_ring(context, size, 0xa5, options.ring, cancellation)?;
+    let destination = BufferGuard {
+        context,
+        buffer: Some(context.create_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::empty(),
+        )?),
+    };
     let result = wall_clock_copy_samples(size, samples, target, cancellation, |iterations| {
-        context.begin()?;
-        // SAFETY: all buffers and the recording command buffer belong to this context.
-        unsafe {
-            for iteration in 0..iterations as usize {
-                context.device.cmd_copy_buffer(
-                    context.command_buffer,
-                    staging[iteration % staging.len()].handle,
-                    destination.handle,
-                    &[vk::BufferCopy::default().size(size)],
-                );
+        let batch = if options.serial {
+            1
+        } else {
+            options.batch.max(1)
+        };
+        for first in (0..iterations).step_by(batch as usize) {
+            ensure_not_cancelled(cancellation)?;
+            context.begin()?;
+            // SAFETY: each group completes before command-pool or staging-slot reuse.
+            unsafe {
+                for iteration in first..iterations.min(first + batch) {
+                    transfer_dependency(&context.device, context.command_buffer);
+                    context.device.cmd_copy_buffer(
+                        context.command_buffer,
+                        staging[iteration as usize % staging.len()].handle,
+                        destination.handle,
+                        &[vk::BufferCopy::default().size(size)],
+                    );
+                }
             }
+            context.submit_and_wait()?;
         }
-        context.submit_and_wait()
+        Ok(())
+    })
+    .and_then(|values| {
+        context.validate_pattern(destination.handle, size, 0xa5a5_a5a5)?;
+        Ok(values)
     });
-    for buffer in staging {
-        context.destroy_buffer(buffer);
-    }
-    context.destroy_buffer(destination);
+    drop(staging);
+    drop(destination);
     result
 }
 
@@ -710,27 +1036,71 @@ pub(super) fn measure_device_to_host(
     target: Duration,
     cancellation: &CancellationToken,
 ) -> Result<Vec<f64>, BenchmarkError> {
-    let source = context.create_buffer(
+    measure_device_to_host_config(
+        context,
         size,
-        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        vk::MemoryPropertyFlags::empty(),
-    )?;
-    let readbacks = create_staging_ring(context, size, 0)?;
+        samples,
+        target,
+        cancellation,
+        TransferOptions::default(),
+    )
+}
+pub(super) fn measure_device_to_host_config(
+    context: &VulkanBandwidthContext,
+    size: u64,
+    samples: u32,
+    target: Duration,
+    cancellation: &CancellationToken,
+    options: TransferOptions,
+) -> Result<Vec<f64>, BenchmarkError> {
+    let _scope = gluj_bench_core::MeasurementScope::condition("device_to_host");
+    let source = BufferGuard {
+        context,
+        buffer: Some(context.create_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::empty(),
+        )?),
+    };
+    let readbacks = create_staging_ring(context, size, 0, options.ring, cancellation)?;
+    context.prepare_pattern(source.handle, size, 0xa5a5_a5a5)?;
+    let mut used_slots = 0usize;
     let result = wall_clock_copy_samples(size, samples, target, cancellation, |iterations| {
-        context.begin()?;
-        // SAFETY: all buffers and the recording command buffer belong to this context.
-        unsafe {
-            for iteration in 0..iterations as usize {
-                context.device.cmd_copy_buffer(
+        used_slots = used_slots.max((iterations as usize).min(readbacks.len()));
+        let batch = if options.serial {
+            1
+        } else {
+            options.batch.max(1)
+        };
+        for first in (0..iterations).step_by(batch as usize) {
+            ensure_not_cancelled(cancellation)?;
+            context.begin()?;
+            // SAFETY: valid ranges, ordered writes, host visibility before mapped reads.
+            unsafe {
+                for iteration in first..iterations.min(first + batch) {
+                    transfer_dependency(&context.device, context.command_buffer);
+                    context.device.cmd_copy_buffer(
+                        context.command_buffer,
+                        source.handle,
+                        readbacks[iteration as usize % readbacks.len()].handle,
+                        &[vk::BufferCopy::default().size(size)],
+                    );
+                }
+                context.device.cmd_pipeline_barrier(
                     context.command_buffer,
-                    source.handle,
-                    readbacks[iteration % readbacks.len()].handle,
-                    &[vk::BufferCopy::default().size(size)],
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                    &[],
+                    &[],
                 );
             }
+            context.submit_and_wait()?;
         }
-        context.submit_and_wait()?;
         for buffer in readbacks
             .iter()
             .take((iterations as usize).min(readbacks.len()))
@@ -739,10 +1109,14 @@ pub(super) fn measure_device_to_host(
         }
         Ok(())
     });
-    context.destroy_buffer(source);
-    for buffer in readbacks {
-        context.destroy_buffer(buffer);
-    }
+    let result = result.and_then(|values| {
+        for buffer in readbacks.iter().take(used_slots) {
+            context.validate_pattern(buffer.handle, size, 0xa5a5_a5a5)?;
+        }
+        Ok(values)
+    });
+    drop(source);
+    drop(readbacks);
     result
 }
 
@@ -762,33 +1136,81 @@ where
     let iterations = (target.as_secs_f64() / trial_seconds)
         .ceil()
         .clamp(1.0, 4096.0) as u32;
+    {
+        let _warmup = gluj_bench_core::phase_timer("warmup");
+        gluj_bench_core::measure_batches(
+            gluj_bench_core::current_measurement_budget().warmup_ns,
+            cancellation,
+            || {
+                let started = Instant::now();
+                copy(iterations)?;
+                Ok(started.elapsed().as_secs_f64() * 1e9)
+            },
+        )?;
+    }
     let mut values = Vec::with_capacity(samples as usize);
     for _ in 0..samples {
         ensure_not_cancelled(cancellation)?;
-        let started = Instant::now();
-        copy(iterations)?;
-        values.push(size as f64 * iterations as f64 / started.elapsed().as_secs_f64());
+        let observation =
+            gluj_bench_core::measure_batches(target.as_nanos() as u64, cancellation, || {
+                let started = Instant::now();
+                copy(iterations)?;
+                Ok(started.elapsed().as_secs_f64() * 1e9)
+            })?;
+        let completed = u64::from(iterations).saturating_mul(u64::from(observation.batches));
+        values.push(size as f64 * completed as f64 * 1e9 / observation.active_ns);
+        gluj_bench_core::record_observation(
+            &format!("transfer-bytes-{size}"),
+            "mean_request_cost",
+            observation.active_ns / completed as f64,
+            "ns",
+            completed,
+            "copies",
+            observation.active_ns as u64,
+            observation.elapsed_ns,
+        );
+        gluj_bench_core::record_observation(
+            &format!("transfer-bytes-{size}"),
+            "host_transfer",
+            *values.last().unwrap(),
+            "bytes/s",
+            size.saturating_mul(completed),
+            "payload_bytes",
+            observation.active_ns as u64,
+            observation.elapsed_ns,
+        );
     }
     Ok(values)
 }
 
-fn create_staging_ring(
-    context: &VulkanBandwidthContext,
+fn create_staging_ring<'a>(
+    context: &'a VulkanBandwidthContext,
     size: u64,
     pattern: u8,
-) -> Result<Vec<Buffer>, BenchmarkError> {
-    (0..HOST_STAGING_BUFFER_COUNT)
-        .map(|_| {
-            let buffer = context.create_buffer(
-                size,
-                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                vk::MemoryPropertyFlags::HOST_VISIBLE,
-                vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
-            initialize_host_buffer(context, &buffer, size, pattern)?;
-            Ok(buffer)
-        })
-        .collect()
+    count: usize,
+    cancellation: &CancellationToken,
+) -> Result<StagingRing<'a>, BenchmarkError> {
+    let mut ring = StagingRing {
+        context,
+        buffers: Vec::new(),
+    };
+    for _ in 0..count {
+        let buffer = context.create_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        ring.buffers.push(buffer);
+        initialize_host_buffer(
+            context,
+            ring.buffers.last().unwrap(),
+            size,
+            pattern,
+            cancellation,
+        )?;
+    }
+    Ok(ring)
 }
 
 fn initialize_host_buffer(
@@ -796,6 +1218,7 @@ fn initialize_host_buffer(
     buffer: &Buffer,
     size: u64,
     pattern: u8,
+    cancellation: &CancellationToken,
 ) -> Result<(), BenchmarkError> {
     // SAFETY: memory is HOST_VISIBLE, the mapped range is within the allocation, and is unmapped.
     unsafe {
@@ -803,17 +1226,28 @@ fn initialize_host_buffer(
             .device
             .map_memory(buffer.memory, 0, size, vk::MemoryMapFlags::empty())
             .map_err(|problem| error("mapping_failed", problem))?;
-        ptr::write_bytes(mapped.cast::<u8>(), pattern, size as usize);
-        if !buffer.coherent {
-            context
-                .device
-                .flush_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
-                    .memory(buffer.memory)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE)])
-                .map_err(|problem| error("mapping_failed", problem))?;
-        }
+        let initialized = (|| {
+            for offset in (0..size as usize).step_by(1024 * 1024) {
+                ensure_not_cancelled(cancellation)?;
+                ptr::write_bytes(
+                    mapped.cast::<u8>().add(offset),
+                    pattern,
+                    (size as usize - offset).min(1024 * 1024),
+                );
+            }
+            if !buffer.coherent {
+                context
+                    .device
+                    .flush_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                        .memory(buffer.memory)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE)])
+                    .map_err(|problem| error("mapping_failed", problem))?;
+            }
+            Ok(())
+        })();
         context.device.unmap_memory(buffer.memory);
+        initialized?;
     }
     Ok(())
 }
@@ -829,17 +1263,22 @@ fn touch_host_buffer(
             .device
             .map_memory(buffer.memory, 0, size, vk::MemoryMapFlags::empty())
             .map_err(|problem| error("mapping_failed", problem))?;
-        if !buffer.coherent {
+        let visible = if !buffer.coherent {
             context
                 .device
                 .invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
                     .memory(buffer.memory)
                     .offset(0)
                     .size(vk::WHOLE_SIZE)])
-                .map_err(|problem| error("mapping_failed", problem))?;
+                .map_err(|problem| error("mapping_failed", problem))
+        } else {
+            Ok(())
+        };
+        if visible.is_ok() {
+            std::hint::black_box(ptr::read_volatile(mapped.cast::<u8>()));
         }
-        std::hint::black_box(ptr::read_volatile(mapped.cast::<u8>()));
         context.device.unmap_memory(buffer.memory);
+        visible?;
     }
     Ok(())
 }
@@ -928,9 +1367,9 @@ fn wrapped_timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
     }
 }
 
-fn words_as_bytes(words: &[u32; 4]) -> &[u8] {
+fn words_as_bytes(words: &[u32]) -> &[u8] {
     // SAFETY: u32 has no padding and the returned slice borrows the source array.
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), 16) }
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -956,6 +1395,68 @@ fn error(code: &str, problem: impl std::fmt::Display) -> BenchmarkError {
     BenchmarkError::new(code, problem.to_string())
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TransferOptions {
+    pub ring: usize,
+    pub batch: u32,
+    pub serial: bool,
+}
+impl Default for TransferOptions {
+    fn default() -> Self {
+        Self {
+            ring: HOST_STAGING_BUFFER_COUNT,
+            batch: 4096,
+            serial: false,
+        }
+    }
+}
+unsafe fn transfer_dependency(device: &ash::Device, command: vk::CommandBuffer) {
+    // SAFETY: caller owns a recording command buffer; orders WAW copy destinations.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+            &[],
+            &[],
+        );
+    }
+}
+
+fn find_staging_memory_type(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    preferred: vk::MemoryPropertyFlags,
+    discrete: bool,
+) -> Option<u32> {
+    let candidates = (0..properties.memory_type_count)
+        .filter(|index| {
+            let ty = properties.memory_types[*index as usize];
+            bits & (1 << index) != 0
+                && ty
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                && (!discrete
+                    || !properties.memory_heaps[ty.heap_index as usize]
+                        .flags
+                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .copied()
+        .find(|i| {
+            properties.memory_types[*i as usize]
+                .property_flags
+                .contains(preferred)
+        })
+        .or_else(|| candidates.first().copied())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,5 +1479,45 @@ mod tests {
     fn timestamp_delta_wraps_to_valid_width() {
         assert_eq!(wrapped_timestamp_delta(250, 5, 8), 11);
         assert_eq!(wrapped_timestamp_delta(10, 25, 64), 15);
+    }
+    #[test]
+    fn discrete_staging_excludes_host_visible_bar_vram_and_shared_devices_keep_their_heap() {
+        let mut p = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            memory_heap_count: 2,
+            ..Default::default()
+        };
+        p.memory_heaps[0].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
+        p.memory_types[0] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            heap_index: 0,
+        };
+        p.memory_types[1] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE,
+            heap_index: 1,
+        };
+        p.memory_types[2] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT,
+            heap_index: 1,
+        };
+        assert_eq!(
+            find_staging_memory_type(&p, 7, vk::MemoryPropertyFlags::HOST_COHERENT, true),
+            Some(2)
+        );
+        assert_eq!(
+            find_staging_memory_type(&p, 3, vk::MemoryPropertyFlags::HOST_COHERENT, true),
+            Some(1)
+        );
+        assert_eq!(
+            find_staging_memory_type(&p, 1, vk::MemoryPropertyFlags::HOST_COHERENT, true),
+            None
+        );
+        assert_eq!(
+            find_staging_memory_type(&p, 1, vk::MemoryPropertyFlags::HOST_COHERENT, false),
+            Some(0)
+        );
     }
 }

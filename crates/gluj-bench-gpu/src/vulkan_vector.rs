@@ -30,6 +30,9 @@ pub(super) struct VulkanVectorHarness {
     workgroups: u32,
     loop_count: u32,
     pub output_size: u64,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    queue_family: u32,
+    kind: ComputeKind,
 }
 
 impl VulkanVectorHarness {
@@ -39,6 +42,7 @@ impl VulkanVectorHarness {
         workgroups: u32,
         loop_count: u32,
     ) -> Result<Self, BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("preparation");
         // SAFETY: every created Vulkan handle is owned by the returned harness and destroyed
         // in reverse dependency order by Drop.
         unsafe { Self::new_inner(record, kind, workgroups, loop_count) }
@@ -85,10 +89,16 @@ impl VulkanVectorHarness {
         }
         let mut float16_features = vk::PhysicalDeviceShaderFloat16Int8Features::default()
             .shader_float16(kind == ComputeKind::Fp16);
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
-            .enabled_features(&core_features)
-            .push_next(&mut float16_features);
+            .enabled_features(&core_features);
+        let extensions = [c"VK_KHR_shader_float16_int8".as_ptr()];
+        if kind == ComputeKind::Fp16 {
+            device_info = device_info.push_next(&mut float16_features);
+            if record.vulkan.api_version < vk::API_VERSION_1_2 {
+                device_info = device_info.enabled_extension_names(&extensions);
+            }
+        }
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
             Ok(device) => device,
             Err(problem) => {
@@ -216,6 +226,8 @@ impl VulkanVectorHarness {
         }
         .map_err(|problem| error("vulkan_command_buffer_failed", problem))?[0];
 
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
         Ok(Self {
             _entry: entry,
             instance,
@@ -230,6 +242,9 @@ impl VulkanVectorHarness {
             pipeline,
             query_pool,
             output,
+            memory_properties,
+            queue_family: record.vulkan.compute_queue_family,
+            kind,
             timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
             timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
             workgroups,
@@ -240,6 +255,36 @@ impl VulkanVectorHarness {
 
     pub fn operations_per_dispatch(&self) -> u64 {
         self.workgroups as u64 * WORKGROUP_SIZE * self.loop_count as u64 * 64
+    }
+    pub fn validate_output(&self) -> Result<(), BenchmarkError> {
+        let _phase_timer = gluj_bench_core::phase_timer("validation");
+        let words = crate::validation::read_words(
+            &self.device,
+            &self.memory_properties,
+            self.queue,
+            self.queue_family,
+            self.output.handle,
+            self.output_size,
+        )?;
+        for (index, word) in words {
+            let expected =
+                crate::validation::vector_reference(self.kind, (index / 4) as u32, self.loop_count)
+                    [index % 4];
+            let actual = f32::from_bits(word);
+            let tolerance = if self.kind == ComputeKind::Fp16 {
+                0.01
+            } else {
+                0.0001
+            };
+            if !actual.is_finite()
+                || (actual - expected).abs() > expected.abs().max(1.0) * tolerance
+            {
+                return Err(crate::validation::problem(format!(
+                    "Vector output {index} differs from the precision-specific scalar reference ({actual} vs {expected})."
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn measure(&self, iterations: u32) -> Result<f64, BenchmarkError> {
@@ -287,6 +332,19 @@ impl VulkanVectorHarness {
                 &params,
             );
             for _ in 0..iterations {
+                let writes = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
+                self.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &writes,
+                    &[],
+                    &[],
+                );
+
                 self.device
                     .cmd_dispatch(self.command_buffer, self.workgroups, 1, 1);
             }
@@ -384,7 +442,7 @@ unsafe fn create_device_buffer(
         device.create_buffer(
             &vk::BufferCreateInfo::default()
                 .size(size)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE),
             None,
         )
@@ -468,6 +526,27 @@ fn error(code: &str, problem: impl std::fmt::Display) -> BenchmarkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "checks precision-specific output on available Vulkan hardware"]
+    fn precision_reference_smoke() {
+        let provider = crate::GpuBandwidthProvider::discover();
+        let mut checked = 0;
+        for record in &provider.adapters {
+            for kind in [ComputeKind::Fp16, ComputeKind::Fp32, ComputeKind::Fp64] {
+                if record.supports_vulkan_timestamps() && kind.supported_by_vulkan(record) {
+                    let harness = VulkanVectorHarness::new(record, kind, 1, 16).unwrap();
+                    harness.measure(1).unwrap();
+                    harness.validate_output().unwrap();
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "No supported Vulkan vector device was available for this explicit hardware check."
+        );
+    }
 
     #[test]
     fn embedded_shaders_are_spirv_modules() {

@@ -1,5 +1,5 @@
 use gluj_bench_core::{
-    BenchmarkConfig, BenchmarkRegistry, CancellationToken, ProtocolCommand,
+    BenchmarkConfig, BenchmarkRegistry, CancellationToken, ProtocolCommand, RunRecord, RunStore,
     benchmark_error_response, error_response, parse_request, progress_response, result_response,
     success_response,
 };
@@ -23,8 +23,33 @@ fn build_registry() -> BenchmarkRegistry {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  gluj-bench-worker devices [--json]\n  gluj-bench-worker benchmarks [--json]\n  gluj-bench-worker run <benchmark-id> [--json]\n  gluj-bench-worker --stdio"
+        "Usage:\n  gluj-bench-worker devices [--json]\n  gluj-bench-worker benchmarks [--json]\n  gluj-bench-worker families [--json]\n  gluj-bench-worker resolve <benchmark-id> [--config <file>] [--json]\n  gluj-bench-worker run <benchmark-id> [--config <file>] [--json]\n  gluj-bench-worker --stdio"
     );
+}
+
+fn run_store() -> RunStore {
+    RunStore::new(gluj_bench_core::app_data_path("run-history"))
+}
+
+/// Persist before responding. Storage failure is visible while the complete record remains
+/// in the response, allowing a caller to save it elsewhere without losing measurements.
+fn recorded_response(request_id: &str, record: &RunRecord) -> Value {
+    let storage = run_store().save(record);
+    let mut response = match &record.result {
+        Some(result) => result_response(request_id, result),
+        None => benchmark_error_response(
+            request_id,
+            record.error.clone().unwrap_or_else(|| {
+                gluj_bench_core::BenchmarkError::new("incomplete_run", "The run did not complete.")
+            }),
+        ),
+    };
+    response["run_record"] = json!(record);
+    response["run_storage"] = match storage {
+        Ok(()) => json!({ "saved": true, "run_id": record.run_id }),
+        Err(error) => json!({ "saved": false, "error": error }),
+    };
+    response
 }
 
 #[derive(Clone)]
@@ -101,8 +126,30 @@ fn stdio_host() -> io::Result<()> {
                 let registry = registry.get_or_insert_with(build_registry);
                 let _ = output.send(success_response(
                     &request.id,
-                    json!({ "benchmarks": registry.benchmarks() }),
+                    json!({ "benchmarks": registry.benchmarks(), "conditions": registry.conditions() }),
                 ));
+            }
+            ProtocolCommand::Families => {
+                let mut registry = registry.lock().expect("registry lock");
+                let registry = registry.get_or_insert_with(build_registry);
+                let _ = output.send(success_response(
+                    &request.id,
+                    json!({ "families": registry.families() }),
+                ));
+            }
+            ProtocolCommand::Resolve {
+                benchmark_id,
+                config,
+            } => {
+                let mut registry = registry.lock().expect("registry lock");
+                let registry = registry.get_or_insert_with(build_registry);
+                let response = match registry.resolve(&benchmark_id, &config) {
+                    Ok(condition) => {
+                        success_response(&request.id, json!({ "condition": condition }))
+                    }
+                    Err(error) => benchmark_error_response(&request.id, error),
+                };
+                let _ = output.send(response);
             }
             ProtocolCommand::Cancel { request_id } => {
                 let running = active.lock().expect("active lock").clone();
@@ -127,9 +174,6 @@ fn stdio_host() -> io::Result<()> {
                 benchmark_id,
                 config,
             } => {
-                let mut registry_guard = registry.lock().expect("registry lock");
-                registry_guard.get_or_insert_with(build_registry);
-                drop(registry_guard);
                 let mut current = active.lock().expect("active lock");
                 if current.is_some() {
                     let _ = output.send(error_response(
@@ -160,14 +204,9 @@ fn stdio_host() -> io::Result<()> {
                     let result = registry
                         .lock()
                         .expect("registry lock")
-                        .as_mut()
-                        .expect("registry initialized")
-                        .run(&benchmark_id, &config, &cancellation, &mut progress);
-                    let response = match result {
-                        Ok(result) => result_response(&request_id, &result),
-                        Err(error) => benchmark_error_response(&request_id, error),
-                    };
-                    let _ = output.send(response);
+                        .get_or_insert_with(build_registry)
+                        .run_recorded(&benchmark_id, &config, &cancellation, &mut progress);
+                    let response = recorded_response(&request_id, &result);
                     let mut current = active.lock().expect("active lock");
                     if current
                         .as_ref()
@@ -175,6 +214,8 @@ fn stdio_host() -> io::Result<()> {
                     {
                         *current = None;
                     }
+                    drop(current);
+                    let _ = output.send(response);
                 });
             }
         }
@@ -185,20 +226,31 @@ fn stdio_host() -> io::Result<()> {
         .map_err(|_| io::Error::other("stdout writer panicked"))?
 }
 
-fn run_cli(registry: &mut BenchmarkRegistry, id: &str, json_output: bool) -> ExitCode {
+fn run_cli(
+    registry: &mut BenchmarkRegistry,
+    id: &str,
+    config: &BenchmarkConfig,
+    json_output: bool,
+) -> ExitCode {
     let cancellation = CancellationToken::default();
     let mut progress = |update: gluj_bench_core::ProgressUpdate| {
         eprintln!("{:>3.0}% {}", update.fraction * 100.0, update.message)
     };
-    match registry.run(
-        id,
-        &BenchmarkConfig::default(),
-        &cancellation,
-        &mut progress,
-    ) {
+    let record = registry.run_recorded(id, config, &cancellation, &mut progress);
+    let response = recorded_response("cli-1", &record);
+    if response["run_storage"]["saved"] == false {
+        eprintln!(
+            "Could not save native run: {}",
+            response["run_storage"]["error"]["message"]
+        );
+    }
+    match record
+        .result
+        .ok_or_else(|| record.error.expect("unsuccessful run has an error"))
+    {
         Ok(result) => {
             if json_output {
-                println!("{}", result_response("cli-1", &result));
+                println!("{response}");
             } else {
                 for metric in result.metrics {
                     println!(
@@ -212,7 +264,7 @@ fn run_cli(registry: &mut BenchmarkRegistry, id: &str, json_output: bool) -> Exi
         }
         Err(problem) => {
             if json_output {
-                println!("{}", benchmark_error_response("cli-1", problem));
+                println!("{response}");
             } else {
                 eprintln!("{problem}");
             }
@@ -332,13 +384,67 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        "run" if arguments.len() == 2 + usize::from(json_output) => {
-            run_cli(&mut registry, &arguments[1], json_output)
+        "families" if arguments.len() == 1 + usize::from(json_output) => {
+            println!(
+                "{}",
+                success_response("cli-1", json!({"families": registry.families()}))
+            );
+            ExitCode::SUCCESS
+        }
+        "run" | "resolve" if arguments.len() >= 2 => {
+            let config = match cli_config(&arguments[2..]) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::from(2);
+                }
+            };
+            if arguments[0] == "run" {
+                run_cli(&mut registry, &arguments[1], &config, json_output)
+            } else {
+                match registry.resolve(&arguments[1], &config) {
+                    Ok(condition) => {
+                        println!(
+                            "{}",
+                            success_response("cli-1", json!({"condition": condition}))
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        println!("{}", benchmark_error_response("cli-1", error));
+                        ExitCode::from(3)
+                    }
+                }
+            }
         }
         _ => {
             usage();
             ExitCode::from(2)
         }
+    }
+}
+
+fn cli_config(arguments: &[String]) -> Result<BenchmarkConfig, String> {
+    let mut path = None;
+    let mut json_seen = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--json" if !json_seen => {
+                json_seen = true;
+            }
+            "--config" if path.is_none() => {
+                index += 1;
+                path = Some(arguments.get(index).ok_or("--config requires a filename")?);
+            }
+            option => return Err(format!("Unknown or repeated argument '{option}'.")),
+        }
+        index += 1;
+    }
+    match path {
+        Some(path) => serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string()),
+        None => Ok(BenchmarkConfig::default()),
     }
 }
 

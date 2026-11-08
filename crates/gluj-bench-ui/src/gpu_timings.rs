@@ -1,3 +1,4 @@
+mod queue_chart;
 use super::{BenchmarkResult, ChartLabel, ChartPoint, Color, Metric, format_binary_size};
 
 pub(super) fn format_time(ns: f64) -> String {
@@ -31,6 +32,27 @@ pub(super) fn point(result: &BenchmarkResult, bytes: u64) -> Option<(&Metric, &M
     ))
 }
 
+pub(super) fn batch_summary(result: &BenchmarkResult, bytes: u64) -> Option<String> {
+    let series = result
+        .workload_metadata
+        .get("gpu_timing_batch_passes_series")?;
+    let counts = series.split(',').find_map(|pair| {
+        let (size, counts) = pair.split_once(':')?;
+        (size.parse::<u64>().ok()? == bytes).then_some(counts)
+    })?;
+    let counts: Vec<u32> = counts
+        .split('/')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let (minimum, maximum) = (counts.iter().min()?, counts.iter().max()?);
+    Some(format!(
+        "{} observations; {minimum} to {maximum} passes per observation. Times use each observation's actual work.",
+        counts.len()
+    ))
+}
+
+#[cfg(test)]
 fn batch_passes(result: &BenchmarkResult, bytes: u64) -> Option<u32> {
     result
         .workload_metadata
@@ -45,12 +67,50 @@ fn batch_passes(result: &BenchmarkResult, bytes: u64) -> Option<u32> {
         })
 }
 
+#[cfg(test)]
 pub(super) fn details(result: &BenchmarkResult, bytes: u64, throughput: &Metric) -> String {
     let mut text = String::new();
+    if super::is_offered_load(result) {
+        for (suffix, label) in [
+            ("offered_requests", "Requested"),
+            ("submitted_requests", "Submitted"),
+            ("completed_requests", "Completed before cutoff"),
+            ("unserved_requests", "Pending at cutoff"),
+        ] {
+            if let Some(m) = super::demand_metric(result, bytes, suffix) {
+                text.push_str(&format!(
+                    "\n{label}: {:.0} requests (sample median)",
+                    m.value
+                ));
+            }
+        }
+        for (suffix, label) in [
+            ("queue_wait", "Arrival to submission"),
+            ("oldest_pending_age", "Oldest pending request"),
+        ] {
+            if let Some(m) = super::demand_metric(result, bytes, suffix) {
+                text.push_str(&format!("\n{label}: {}", format_time(m.value)));
+            }
+        }
+    }
     if let Some((gpu, wall)) = point(result, bytes) {
         for (label, metric) in [
-            ("GPU execution per pass", gpu),
-            ("End-to-end per pass (incl. pacing)", wall),
+            (
+                if super::is_offered_load(result) {
+                    "GPU service per request"
+                } else {
+                    "GPU execution per pass"
+                },
+                gpu,
+            ),
+            (
+                if super::is_offered_load(result) {
+                    "Request completion delay (arrival to observed completion)"
+                } else {
+                    "End-to-end per pass (incl. pacing)"
+                },
+                wall,
+            ),
         ] {
             text.push_str(&format!(
                 "\n{label}: {} (min {}, max {}; {} samples)",
@@ -60,22 +120,137 @@ pub(super) fn details(result: &BenchmarkResult, bytes: u64, throughput: &Metric)
                 metric.statistics.sample_count
             ));
         }
-        if let Some(passes) = batch_passes(result, bytes) {
+        if !super::is_offered_load(result)
+            && let Some(passes) = batch_passes(result, bytes)
+        {
             text.push_str(&format!(
                 "\nSample batch: {passes} full dataset passes; timings normalized per pass."
             ));
         }
     }
-    if result.benchmark_id.starts_with("gpu.")
+    if let Some(density) = result
+        .workload_metadata
+        .get("gpu_profile_points_per_doubling")
+    {
+        text.push_str(&format!("\nSweep density: {density} measured intervals per size doubling. Each plotted point has its own repeated samples; denser sweeps take longer without shortening each point's sample budget."));
+    }
+    if let Some(start) = result
+        .workload_metadata
+        .get("gpu_saturation_start_bytes")
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        text.push_str(&format!("\nAutomatic start: {} from same-kernel VRAM calibration; smaller warm-up probes are excluded from results. Targets below this start are raised within budget.", super::format_binary_size(start as f64)));
+        if result
+            .workload_metadata
+            .get("gpu_saturation_boundary_peak")
+            .is_some_and(|s| s == "true")
+        {
+            text.push_str(" Best throughput was still rising at the calibration limit; this is the best observed start, not a confirmed plateau.");
+        }
+        if result
+            .workload_metadata
+            .get("gpu_saturation_peak_repeatable")
+            .is_some_and(|s| s == "false")
+        {
+            text.push_str(" Calibration was noisy; repeat before judging the peak.");
+        }
+    }
+    if !super::is_offered_load(result)
+        && result
+            .workload_metadata
+            .contains_key("gpu_command_recording_policy")
+    {
+        text.push_str("\nSample batch is pre-recorded and warmed; end-to-end sample time covers submission, completion and activity pacing.");
+    }
+    if let Some(groups) = result
+        .workload_metadata
+        .get("gpu_profile_workgroups_per_pass")
+        .and_then(|values| {
+            values.split(',').find_map(|pair| {
+                let (size, groups) = pair.split_once(':')?;
+                (size.parse::<u64>().ok()? == bytes).then_some(groups)
+            })
+        })
+    {
+        text.push_str(&format!(
+            "\nWorkgroups per pass: {groups} (separate region/chunk dispatches)."
+        ));
+        if let Some(size) = result.workload_metadata.get("gpu_profile_workgroup_size") {
+            text.push_str(&format!("\nThreads per workgroup: {size} (launch shape measured before the sweep; data and arithmetic unchanged)."));
+        }
+        text.push_str("\nSmall datasets may not fill the GPU; increasing dataset size can raise throughput before memory pressure appears. Warmup is excluded from the recorded samples.");
+    }
+    if super::gpu_offload(&result.benchmark_id)
+        && let Some(share) = result
+            .workload_metadata
+            .get("ram_offload_percent")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s <= 100)
+    {
+        let host = bytes / 100 * share + bytes % 100 * share / 100;
+        if let Some(target) = result
+            .workload_metadata
+            .get("offload_traffic_bytes_per_second")
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            let target = if result
+                .workload_metadata
+                .contains_key("offload_traffic_ramp_revision")
+            {
+                gluj_bench_core::dynamic_offload_traffic(target, bytes)
+            } else {
+                target
+            };
+            text.push_str(&format!(
+                "\nDynamic traffic target: {}/s total · {}/s RAM · {:.6} passes/s at this size.",
+                super::format_binary_size(target),
+                super::format_binary_size(target * share as f64 / 100.0),
+                target / bytes as f64
+            ));
+        }
+        if let Some(target) = result
+            .workload_metadata
+            .get("offload_passes_per_second")
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            text.push_str(&format!(
+                "\nTraffic target: {target:.0} passes/s · {}/s total · {}/s RAM.",
+                super::format_binary_size(bytes as f64 * target),
+                super::format_binary_size(host as f64 * target)
+            ));
+        }
+        if let Some(rate) = result.metrics.iter().find(|m| {
+            m.name == format!("working_set_{bytes}.pass_rate")
+                && m.value.is_finite()
+                && m.value > 0.0
+        }) {
+            text.push_str(&format!("\nAchieved average over observation time: {:.2} passes/s · {}/s total · {}/s RAM (nominal accesses, not PCIe counters).", rate.value,
+                super::format_binary_size(bytes as f64 * rate.value), super::format_binary_size(host as f64 * rate.value)));
+        }
+
+        text.push_str(&format!(
+            "\nDataset split: {} RAM + {} VRAM (both inputs and output combined).",
+            super::format_binary_size(host as f64),
+            super::format_binary_size((bytes - host) as f64)
+        ));
+    }
+    if throughput.name.ends_with(".active_compute") {
+        if result
+            .metrics
+            .iter()
+            .any(|m| m.name == format!("working_set_{bytes}.active_host_bandwidth"))
+        {
+            text.push_str("\nCompute and the traffic graph both use active GPU time. Achieved passes/s above includes intentional waits.");
+        } else {
+            text.push_str("\nActive host traffic was not recorded in this saved run; active compute and traffic comparison is unavailable. Averaged traffic remains in the raw measurements.");
+        }
+    }
+    if !super::is_offered_load(result)
+        && result.benchmark_id.starts_with("gpu.")
         && throughput.unit == "operations/s"
         && throughput.value.is_finite()
         && throughput.value > 0.0
-        && let Some(reference) = result.metrics.iter().find(|m| {
-            m.name == "measured_compute_ceiling"
-                && m.unit == "operations/s"
-                && m.value.is_finite()
-                && m.value > 0.0
-        })
+        && let Some(reference) = super::dataset_compute_reference(result)
     {
         let retained = throughput.value / reference.value * 100.0;
         if retained.is_finite() {
@@ -88,6 +263,9 @@ pub(super) fn details(result: &BenchmarkResult, bytes: u64, throughput: &Metric)
 }
 
 pub(super) fn note(result: &BenchmarkResult) -> String {
+    if super::is_offered_load(result) {
+        return "Average time from request arrival to completion, including queueing. Red marks unfinished requests at cutoff. Hover for completed/pending counts and wait time. Gaps mean no requests completed.".into();
+    }
     if !result.benchmark_id.starts_with("gpu.") {
         return String::new();
     }
@@ -95,16 +273,20 @@ pub(super) fn note(result: &BenchmarkResult) -> String {
         .iter()
         .any(|(bytes, _)| point(result, *bytes).is_some())
     {
-        return "Per-dataset timing data is not recorded in this result. Rerun a GPU scaling test to measure GPU execution and end-to-end time; older throughput values are not converted into timings.".into();
+        return "Per-dataset timing data is not recorded in this result. Older throughput values are not converted into unrecorded timings.".into();
     }
-    let mut text = gluj_bench_core::GPU_TIMING_EXPLANATION.to_owned();
+    let mut text = if super::is_offered_load(result) {
+        "GPU service measures execution after preceding output dependencies. Request completion measures arrival to host-observed completion, including queueing, submission and polling. Requests arrive independently of completions; activity pacing is disabled. Pending work at cutoff indicates unmet demand, not a failed request. Drain time receives no throughput credit.".to_owned()
+    } else {
+        gluj_bench_core::GPU_TIMING_EXPLANATION.to_owned()
+    };
     if result
         .metrics
         .iter()
         .filter(|m| m.name.ends_with(".gpu_execution_time") || m.name.ends_with(".end_to_end_time"))
         .any(|m| !super::consistent_metric(m))
     {
-        text.push_str(" Sample timings vary or have insufficient repeats; rerun before judging small differences.");
+        text.push_str(" Observed timing variation and recorded sample counts describe this run; small differences are descriptive.");
     }
     text
 }
@@ -117,6 +299,9 @@ pub(super) fn chart(result: &BenchmarkResult) -> Option<(String, Vec<ChartLabel>
 pub(super) fn interactive_chart(
     result: &BenchmarkResult,
 ) -> Option<(String, Vec<ChartLabel>, Vec<ChartPoint>)> {
+    if super::is_offered_load(result) {
+        return queue_chart::chart(result);
+    }
     use std::fmt::Write;
     let points = super::scaling_compute_tiers(result)
         .into_iter()
@@ -161,9 +346,9 @@ pub(super) fn interactive_chart(
         accent,
         alignment,
     };
-    let green = Color::from_rgb_u8(115, 220, 202);
-    let amber = Color::from_rgb_u8(237, 199, 120);
-    let neutral = Color::from_rgb_u8(184, 198, 215);
+    let brass = Color::from_rgb_u8(220, 198, 107);
+    let iris = Color::from_rgb_u8(172, 165, 227);
+    let neutral = Color::from_rgb_u8(198, 191, 206);
     let mut labels = vec![
         label(
             80.0,
@@ -174,26 +359,44 @@ pub(super) fn interactive_chart(
             neutral,
             0,
         ),
-        label(80.0, 32.0, 330.0, "● GPU execution".into(), 13.0, green, 0),
+        label(
+            80.0,
+            32.0,
+            330.0,
+            (if super::is_offered_load(result) {
+                "GPU service"
+            } else {
+                "GPU execution"
+            })
+            .into(),
+            13.0,
+            brass,
+            0,
+        ),
         label(
             440.0,
             32.0,
             400.0,
-            "● End-to-end (includes pacing)".into(),
+            (if super::is_offered_load(result) {
+                "Request completion delay"
+            } else {
+                "End-to-end (includes pacing)"
+            })
+            .into(),
             13.0,
-            amber,
+            iris,
             0,
         ),
     ];
     let mut svg = String::from(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="280" viewBox="0 0 900 280"><rect width="900" height="280" rx="10" fill="#101c29"/>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="280" viewBox="0 0 900 280"><rect width="900" height="280" rx="10" fill="#222129"/>"##,
     );
     let mut hover_points = Vec::new();
     for tick in 0..=4 {
         let ns = maximum * tick as f64 / 4.0;
         writeln!(
             svg,
-            r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#2b3d50"/>"##,
+            r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#474352"/>"##,
             y(ns)
         )
         .unwrap();
@@ -209,7 +412,7 @@ pub(super) fn interactive_chart(
     }
     for pair in points.windows(2) {
         if let (Some(a), Some(b)) = (pair[0].1, pair[1].1) {
-            for (from, to, color) in [(a.0, b.0, "#73dcca"), (a.1, b.1, "#edc778")] {
+            for (from, to, color) in [(a.0, b.0, "#dcc66b"), (a.1, b.1, "#aca5e3")] {
                 let (from_min, from_max) = super::chart_sample_range(from);
                 let (to_min, to_max) = super::chart_sample_range(to);
                 writeln!(svg, r#"<polygon points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="{color}" fill-opacity="0.16"/><line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{color}" stroke-width="2.5"/>"#,
@@ -219,21 +422,27 @@ pub(super) fn interactive_chart(
         }
     }
     for (bytes, (gpu, wall)) in &valid {
-        for (metric, color) in [(*gpu, "#73dcca"), (*wall, "#edc778")] {
+        for (metric, color) in [(*gpu, "#dcc66b"), (*wall, "#aca5e3")] {
             hover_points.push(super::chart_hover::point(
                 *bytes,
                 metric,
                 [x(*bytes), y(metric.value), 220.0],
                 (
-                    if color == "#73dcca" {
-                        "GPU execution per pass"
+                    if color == "#dcc66b" {
+                        if super::is_offered_load(result) {
+                            "GPU service per request"
+                        } else {
+                            "GPU execution per pass"
+                        }
+                    } else if super::is_offered_load(result) {
+                        "Request completion delay"
                     } else {
                         "End-to-end per pass"
                     },
                     scale,
                     unit,
                 ),
-                if color == "#73dcca" { green } else { amber },
+                if color == "#dcc66b" { brass } else { iris },
             ));
             writeln!(
                 svg,
@@ -356,11 +565,68 @@ mod tests {
         assert_eq!((image.width(), image.height()), (900, 280));
     }
     #[test]
+    fn offload_details_explain_actual_workgroups_split_and_sampled_boundary() {
+        let mut result = result();
+        result.workload_metadata.extend([
+            (
+                "gpu_profile_workgroups_per_pass".into(),
+                "262144:16+6,1048576:64+22".into(),
+            ),
+            ("ram_offload_percent".into(), "75".into()),
+            ("bandwidth_transition_status".into(), "observed".into()),
+            (
+                "bandwidth_transition_previous_working_set_bytes".into(),
+                "2097152".into(),
+            ),
+            (
+                "bandwidth_transition_working_set_bytes".into(),
+                "4194304".into(),
+            ),
+        ]);
+        let text = details(&result, 262144, &result.metrics[1]);
+        assert!(text.contains("16+6"));
+        assert!(text.contains("192.00 KiB RAM + 64.00 KiB VRAM"));
+        assert!(text.contains("may not fill the GPU"));
+        let row = super::super::result_row(&result, &[], &[]);
+        assert!(row.diagnosis.contains("2.00 MiB to 4.00 MiB"));
+        assert!(row.diagnosis.contains("not a measured cache capacity"));
+    }
+
+    #[test]
+    fn traffic_target_and_achieved_rate_are_distinct_from_resident_size() {
+        let mut result = result();
+        result
+            .workload_metadata
+            .insert("ram_offload_percent".into(), "75".into());
+        result
+            .workload_metadata
+            .insert("offload_passes_per_second".into(), "100".into());
+        let mut rate = result.metrics[1].clone();
+        rate.name = "working_set_262144.pass_rate".into();
+        rate.unit = "passes/s".into();
+        rate.value = 98.0;
+        result.metrics.push(rate);
+        let text = details(&result, 262144, &result.metrics[1]);
+        assert!(text.contains("100 passes/s · 25.00 MiB/s total · 18.75 MiB/s RAM"));
+        assert!(text.contains("98.00 passes/s · 24.50 MiB/s total"));
+        assert!(text.contains("not PCIe counters"));
+        result.workload_metadata.remove("offload_passes_per_second");
+        result
+            .workload_metadata
+            .insert("offload_traffic_bytes_per_second".into(), "8388608".into());
+        let dynamic = details(&result, 262144, &result.metrics[1]);
+        assert!(dynamic.contains(
+            "Dynamic traffic target: 8.00 MiB/s total · 6.00 MiB/s RAM · 32.000000 passes/s"
+        ));
+    }
+
+    #[test]
     fn old_results_are_not_back_calculated_and_cpu_results_are_untouched() {
         let mut result = result();
         result.metrics.retain(|m| m.unit != "ns");
         assert!(chart(&result).is_none());
-        assert!(note(&result).contains("Rerun"));
+        assert!(note(&result).contains("not recorded"));
+        assert!(!note(&result).to_lowercase().contains("rerun"));
         result.benchmark_id = "cpu.performance.matrix.fp32.scaling".into();
         assert!(note(&result).is_empty());
         assert!(details(&result, 262144, &result.metrics[1]).is_empty());

@@ -6,6 +6,11 @@ pub enum ProtocolCommand {
     Fingerprint,
     Devices,
     Benchmarks,
+    Families,
+    Resolve {
+        benchmark_id: String,
+        config: BenchmarkConfig,
+    },
     Run {
         benchmark_id: String,
         config: BenchmarkConfig,
@@ -91,7 +96,8 @@ pub fn parse_request(value: &Value) -> Result<ProtocolRequest, Value> {
         "fingerprint" => ProtocolCommand::Fingerprint,
         "devices" => ProtocolCommand::Devices,
         "benchmarks" => ProtocolCommand::Benchmarks,
-        "run" => {
+        "families" => ProtocolCommand::Families,
+        "run" | "resolve" => {
             let arguments = arguments(object, id)?;
             let Some(benchmark_id) = arguments.get("benchmark_id").and_then(Value::as_str) else {
                 return Err(error_response(
@@ -101,10 +107,19 @@ pub fn parse_request(value: &Value) -> Result<ProtocolRequest, Value> {
                 ));
             };
             let mut config = BenchmarkConfig::default();
-            if let Some(duration) = arguments.get("target_duration_ms").and_then(Value::as_u64) {
-                config.target_duration_ms = duration;
+            if let Some(duration) = arguments.get("target_duration_ms") {
+                config.target_duration_ms = duration.as_u64().ok_or_else(|| {
+                    error_response(
+                        id,
+                        "invalid_request",
+                        "target_duration_ms must be a positive integer.",
+                    )
+                })?;
             }
-            if let Some(samples) = arguments.get("samples").and_then(Value::as_u64) {
+            if let Some(samples) = arguments.get("samples") {
+                let samples = samples.as_u64().ok_or_else(|| {
+                    error_response(id, "invalid_request", "samples must be a positive integer.")
+                })?;
                 config.samples = u32::try_from(samples)
                     .map_err(|_| error_response(id, "invalid_request", "samples is too large."))?;
             }
@@ -127,9 +142,23 @@ pub fn parse_request(value: &Value) -> Result<ProtocolRequest, Value> {
                     config.options.insert(name.clone(), value.to_owned());
                 }
             }
-            ProtocolCommand::Run {
-                benchmark_id: benchmark_id.to_owned(),
-                config,
+            if config.samples == 0 || config.target_duration_ms == 0 {
+                return Err(error_response(
+                    id,
+                    "invalid_request",
+                    "samples and target_duration_ms must be positive.",
+                ));
+            }
+            if command == "resolve" {
+                ProtocolCommand::Resolve {
+                    benchmark_id: benchmark_id.to_owned(),
+                    config,
+                }
+            } else {
+                ProtocolCommand::Run {
+                    benchmark_id: benchmark_id.to_owned(),
+                    config,
+                }
             }
         }
         "cancel" => {

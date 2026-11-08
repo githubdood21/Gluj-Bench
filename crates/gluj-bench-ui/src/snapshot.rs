@@ -14,6 +14,7 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 pub(super) struct SnapshotState {
     pub open: bool,
+    pub include_all: bool,
     pub ui_dirty: std::cell::Cell<bool>,
     choices_model: Rc<VecModel<SnapshotChoice>>,
     pub choices: Vec<Choice>,
@@ -29,6 +30,7 @@ pub(super) struct SnapshotState {
 
 // Only plain owned benchmark data crosses into the renderer. No App/Slint state is shared.
 struct RenderSource {
+    include_all: bool,
     results: Vec<BenchmarkResult>,
     devices: Vec<DeviceDescriptor>,
     benchmarks: Vec<BenchmarkDescriptor>,
@@ -284,7 +286,9 @@ impl Write for CancellableWriter<'_> {
             return Err(std::io::Error::other("Snapshot selection changed."));
         }
         if self.bytes.len().saturating_add(bytes.len()) > MAX_BYTES {
-            return Err(std::io::Error::other("Snapshot exceeds the 64 MiB limit."));
+            return Err(std::io::Error::other(
+                "PNG exceeds 64 MiB. Export fewer summaries or use native JSON; no data was stripped.",
+            ));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -338,7 +342,10 @@ fn render(
         return Err("Select at least one completed result for the picture.".into());
     }
     if selected.len() > 128 {
-        return Err("Select up to 128 rows per picture. All results are still embedded.".into());
+        return Err(
+            "Select up to 128 rows per picture. Native JSON export supports larger raw records."
+                .into(),
+        );
     }
     let mut hardware = Vec::new();
     for index in &selected {
@@ -400,13 +407,13 @@ fn render(
     let header = 158 + hardware.len() as u32 * 34;
     let height = header + selected.len() as u32 * 132 + 86;
     let mut svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" font-family="Segoe UI, sans-serif"><rect width="100%" height="100%" fill="#0c131e"/><rect x="0" y="0" width="1200" height="6" fill="#61dec8"/>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" font-family="Segoe UI, sans-serif"><rect width="100%" height="100%" fill="#18171b"/><rect x="0" y="0" width="1200" height="6" fill="#dcc66b"/>"##
     );
     text_svg(
         &mut svg,
         (100, 66),
         30,
-        "#edf3fc",
+        "#f4f0ed",
         "GLUJ-BENCH",
         true,
         false,
@@ -415,7 +422,7 @@ fn render(
         &mut svg,
         (1152, 62),
         18,
-        "#91a5bd",
+        "#b9b3c2",
         &format!("v{}", env!("CARGO_PKG_VERSION")),
         false,
         true,
@@ -424,7 +431,7 @@ fn render(
         &mut svg,
         (40, 113),
         14,
-        "#61dec8",
+        "#dcc66b",
         "BENCHMARK SNAPSHOT",
         true,
         false,
@@ -434,7 +441,7 @@ fn render(
             &mut svg,
             (40, 150 + i as u32 * 34),
             21,
-            "#c2d0e3",
+            "#e3dee7",
             &short(line, 92),
             false,
             false,
@@ -445,12 +452,12 @@ fn render(
         let result = &app.results[*index];
         let name = result_title(result, &app.benchmarks);
         let y = header + i as u32 * 132;
-        svg.push_str(&format!(r##"<rect x="32" y="{y}" width="1136" height="120" rx="12" fill="#172333"/><rect x="32" y="{}" width="4" height="64" rx="2" fill="#61dec8"/>"##, y + 16));
+        svg.push_str(&format!(r##"<rect x="32" y="{y}" width="1136" height="120" rx="12" fill="#222129"/><rect x="32" y="{}" width="4" height="64" rx="2" fill="#dcc66b"/>"##, y + 16));
         text_svg(
             &mut svg,
             (54, y + 29),
             20,
-            "#edf3fc",
+            "#f4f0ed",
             &short(&name, 62),
             true,
             false,
@@ -459,7 +466,7 @@ fn render(
             &mut svg,
             (54, y + 53),
             14,
-            "#c2d0e3",
+            "#e3dee7",
             &short(&target_label(result, &app.devices), 110),
             false,
             false,
@@ -468,7 +475,7 @@ fn render(
             &mut svg,
             (54, y + 75),
             13,
-            "#9bb0c8",
+            "#b9b3c2",
             &short(&result_configuration_label(result), 110),
             false,
             false,
@@ -492,7 +499,7 @@ fn render(
                 &mut svg,
                 (1144, y + 106),
                 18,
-                "#70e4cc",
+                "#aca5e3",
                 &scores,
                 true,
                 true,
@@ -502,7 +509,7 @@ fn render(
                 &mut svg,
                 (1144, y + 106),
                 26,
-                "#70e4cc",
+                "#aca5e3",
                 &featured_metric(result)
                     .map(|m| format_metric(m.value, &m.unit))
                     .unwrap_or_else(|| "—".into()),
@@ -515,8 +522,8 @@ fn render(
         &mut svg,
         (40, height - 38),
         14,
-        "#91a5bd",
-        "Full completed-results list embedded in this PNG · Import snapshot in Gluj-Bench to compare",
+        "#b9b3c2",
+        "Selected-scope summary data embedded in this PNG | Native JSON retains raw observations",
         false,
         false,
     );
@@ -524,7 +531,7 @@ fn render(
         &mut svg,
         (40, height - 17),
         12,
-        "#7186a0",
+        "#a7a0b2",
         "Measured workloads and units. Different configurations are separate measurements.",
         false,
         false,
@@ -555,6 +562,16 @@ fn render(
         return Err("Snapshot selection changed.".into());
     }
     let rgba = pixels.data().to_vec(); // Opaque background: premultiplied and straight RGBA coincide.
+    let exported_results: Vec<_> = if app.include_all {
+        app.results.iter().collect()
+    } else {
+        selected.iter().map(|index| &app.results[*index]).collect()
+    };
+    let exported_indices = if app.include_all {
+        selected
+    } else {
+        (0..exported_results.len()).collect()
+    };
     let payload = Payload {
         format: "gluj-bench-snapshot".into(),
         version: 1,
@@ -563,8 +580,8 @@ fn render(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        selected_result_indices: selected,
-        results: &app.results,
+        selected_result_indices: exported_indices,
+        results: exported_results,
     };
     let mut json = CancellableWriter {
         bytes: Vec::new(),
@@ -731,6 +748,7 @@ impl App {
     }
     fn snapshot_source(&self) -> RenderSource {
         RenderSource {
+            include_all: self.snapshot.include_all,
             results: self.results.clone(),
             devices: self.devices.clone(),
             benchmarks: self.benchmarks.clone(),
@@ -829,7 +847,11 @@ impl App {
                             self.snapshot.status = format!(
                                 "{} selected · {} completed results embedded",
                                 self.snapshot.choices.iter().filter(|c| c.selected).count(),
-                                self.results.len()
+                                if self.snapshot.include_all {
+                                    self.results.len()
+                                } else {
+                                    self.snapshot.choices.iter().filter(|c| c.selected).count()
+                                }
                             );
                         }
                         Err(error) => {
@@ -862,6 +884,7 @@ impl App {
         use slint::Model;
         app.snapshot.ui_dirty.set(false);
         window.set_snapshot_open(app.snapshot.open);
+        window.set_snapshot_include_all(app.snapshot.include_all);
         window.set_snapshot_status(app.snapshot.status.clone().into());
         let model = &app.snapshot.choices_model;
         let rows = app.snapshot.choices.iter().map(|choice| SnapshotChoice {
@@ -891,7 +914,10 @@ impl App {
     pub(super) fn save_snapshot_in_background(&mut self, picture: Arc<Rendered>, path: PathBuf) {
         self.snapshot_io(move || {
             Completion::Status(match fs::write(&path, &picture.png) {
-                Ok(()) => format!("Saved snapshot with full result data: {}", path.display()),
+                Ok(()) => format!(
+                    "Saved snapshot with selected-scope summary data: {}",
+                    path.display()
+                ),
                 Err(error) => format!("Could not save PNG: {error}"),
             })
         });
@@ -954,6 +980,22 @@ impl App {
         }
     }
     pub(super) fn import_snapshot_results(&mut self, mut results: Vec<BenchmarkResult>) {
+        if let Some(path) = &self.native_history_path {
+            let store = gluj_bench_core::RunStore::new(path);
+            for result in &results {
+                let record = gluj_bench_core::RunRecord::legacy(
+                    result.clone(),
+                    gluj_bench_core::RunSource::ImportedComparison,
+                    "PNG snapshot".into(),
+                );
+                if let Err(error) = store.save(&record) {
+                    self.results_file_status = format!(
+                        "Imported comparison could not be archived: {error}. Full record retained in this session."
+                    );
+                    self.unsaved_native_runs.push(record);
+                }
+            }
+        }
         normalize_results(&mut results);
         let count = results.len();
         // Add as a separate comparison source, retaining the recorded hardware identity in the label.
@@ -1012,6 +1054,17 @@ mod tests {
                 .contains("selection changed")
         );
         assert_eq!(checks.get(), 4);
+    }
+
+    #[test]
+    fn original_version_one_png_still_imports_all_embedded_summaries() {
+        let results = import(include_bytes!("../tests/fixtures/legacy-v1-snapshot.png")).unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|r| !r.metrics.is_empty() && r.metrics.iter().all(|m| m.value.is_finite()))
+        );
     }
 
     #[test]
@@ -1115,8 +1168,9 @@ mod tests {
             .get_text()
             .unwrap();
         let payload: Payload = serde_json::from_str(&text).unwrap();
-        assert_eq!(payload.selected_result_indices, [1]);
-        assert_eq!(payload.results.len(), 2);
+        assert_eq!(payload.selected_result_indices, [0]);
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].benchmark_id, GPU_OFFLOAD_ID);
         let path = std::env::temp_dir().join(format!(
             "gluj-snapshot-{}-{}.png",
             std::process::id(),
@@ -1131,7 +1185,7 @@ mod tests {
         let mut target = crate::configuration_tests::fixture();
         target.import_snapshot_in_background(path.clone());
         target.finish_snapshot_for_test();
-        assert_eq!(target.baseline_results.len(), 2);
+        assert_eq!(target.baseline_results.len(), 1);
         assert!(target.results.is_empty());
         assert!(target.saved_results.is_empty());
         fs::remove_file(path).unwrap();
@@ -1262,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn png_round_trip_embeds_unselected_results_and_all_measurements() {
+    fn png_round_trip_defaults_to_selected_scope_and_explicit_all_preserves_every_summary() {
         let mut app = crate::configuration_tests::fixture();
         app.results = vec![
             measured(GPU_VECTOR_ID, 10e12),
@@ -1280,7 +1334,7 @@ mod tests {
         assert_eq!(&picture.png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
         assert_eq!(
             serde_json::to_value(import(&picture.png).unwrap()).unwrap(),
-            serde_json::to_value(&app.results).unwrap()
+            serde_json::to_value(&app.results[..1]).unwrap()
         );
         let mut decoder = png::Decoder::new(Cursor::new(&picture.png))
             .read_info()
@@ -1288,6 +1342,15 @@ mod tests {
         let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
         decoder.next_frame(&mut pixels).unwrap();
         assert_eq!(pixels, picture.rgba);
+        app.snapshot.include_all = true;
+        app.refresh_snapshot_choices();
+        app.finish_snapshot_for_test();
+        assert_eq!(
+            import(&app.snapshot.image.as_ref().unwrap().png)
+                .unwrap()
+                .len(),
+            3
+        );
         for choice in &mut app.snapshot.choices {
             choice.selected = false;
         }
@@ -1339,6 +1402,7 @@ mod tests {
             measured(GPU_VECTOR_ID, 10e12),
             measured(GPU_OFFLOAD_ID, 4e12),
         ];
+        source.snapshot.include_all = true;
         source.open_snapshot();
         source.finish_snapshot_for_test();
         let imported = import(&source.snapshot.image.as_ref().unwrap().png).unwrap();
@@ -1403,7 +1467,7 @@ mod tests {
             import(&app.snapshot.image.as_ref().unwrap().png)
                 .unwrap()
                 .len(),
-            3
+            2
         );
     }
 

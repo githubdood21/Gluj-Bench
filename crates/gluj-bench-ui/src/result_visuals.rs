@@ -15,7 +15,7 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
         && metric.value > 0.0
         && stats.standard_deviation.is_finite())
     .then(|| stats.standard_deviation.abs() / metric.value * 100.0);
-    [
+    let mut facts: Vec<TuningFact> = [
         (
             if super::read_latency(result) {
                 "MEASURED READ LATENCY"
@@ -24,7 +24,7 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
             },
             format_metric(metric.value, &metric.unit),
             super::display_metric_name(&metric.name),
-            Color::from_rgb_u8(115, 220, 202),
+            Color::from_rgb_u8(220, 198, 107),
         ),
         (
             "SAMPLE RANGE",
@@ -42,7 +42,7 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
                 stats.sample_count,
                 result.elapsed_ns as f64 / 1e6
             ),
-            Color::from_rgb_u8(120, 169, 255),
+            Color::from_rgb_u8(172, 165, 227),
         ),
         (
             "SAMPLE VARIATION",
@@ -51,9 +51,9 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
                 .unwrap_or_else(|| "Not enough samples".into()),
             "Standard deviation relative to measured value".into(),
             if variation.is_some_and(|v| v > 10.0) {
-                Color::from_rgb_u8(237, 199, 120)
+                Color::from_rgb_u8(241, 181, 121)
             } else {
-                Color::from_rgb_u8(184, 198, 215)
+                Color::from_rgb_u8(198, 191, 206)
             },
         ),
     ]
@@ -64,7 +64,63 @@ pub(super) fn facts(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tu
         detail: detail.into(),
         accent,
     })
-    .collect()
+    .collect();
+    if let Some(fact) = sustained_fact(result, metric) {
+        facts.push(fact);
+    }
+    facts
+}
+
+pub(super) fn sustained_fact(result: &BenchmarkResult, metric: &Metric) -> Option<TuningFact> {
+    let accent = Color::from_rgb_u8(172, 165, 227);
+    let prefix = metric
+        .name
+        .strip_suffix(".compute")
+        .map(|s| format!("{s}."))
+        .unwrap_or_default();
+    if let (Some(early), Some(late)) = (
+        result
+            .metrics
+            .iter()
+            .find(|m| m.name == format!("{prefix}early_throughput")),
+        result
+            .metrics
+            .iter()
+            .find(|m| m.name == format!("{prefix}late_throughput")),
+    ) {
+        return Some(TuningFact {label:"EARLY / LATE MEDIANS".into(),value:format!("{} → {}",format_metric(early.value,&early.unit),format_metric(late.value,&late.unit)).into(),detail:format!("First/last third of aggregate observations ({} each). Chronological worker samples remain in the native record; no thermal cause inferred.",early.statistics.sample_count).into(),accent});
+    }
+    let series: serde_json::Value =
+        serde_json::from_str(result.workload_metadata.get("sustained_early_late")?).ok()?;
+    let selected = metric
+        .name
+        .strip_prefix("working_set_")
+        .and_then(|s| s.split_once('.'))
+        .and_then(|(bytes, _)| bytes.parse::<u64>().ok());
+    let values: Vec<_> = series
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| selected.is_none_or(|bytes| key.contains(&format!("bytes-{bytes}:"))))
+        .filter_map(|(_, v)| {
+            Some((
+                v.get("early_mean")?.as_f64()?,
+                v.get("late_mean")?.as_f64()?,
+                v.get("unit")?.as_str()?,
+            ))
+        })
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let (mut first_min, mut first_max, mut last_min, mut last_max) =
+        (f64::INFINITY, 0.0_f64, f64::INFINITY, 0.0_f64);
+    for (early, late, _) in &values {
+        first_min = first_min.min(*early);
+        first_max = first_max.max(*early);
+        last_min = last_min.min(*late);
+        last_max = last_max.max(*late);
+    }
+    Some(TuningFact {label:"SCOPED EARLY / LATE MEANS".into(),value:format!("{}–{} → {}–{}",format_metric(first_min,values[0].2),format_metric(first_max,values[0].2),format_metric(last_min,values[0].2),format_metric(last_max,values[0].2)).into(),detail:format!("Ranges over {} worker/condition/realization series, not total throughput. Full scoped time series retained in native records; no thermal cause inferred.",values.len()).into(),accent})
 }
 
 pub(super) fn bars(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<TuningBar> {
@@ -99,7 +155,7 @@ pub(super) fn bars(result: &BenchmarkResult, metric: Option<&Metric>) -> Vec<Tun
         minimum: 0.0,
         maximum: 0.0,
         range_visible: false,
-        accent: Color::from_rgb_u8(120, 169, 255),
+        accent: Color::from_rgb_u8(172, 165, 227),
     })
     .collect()
 }

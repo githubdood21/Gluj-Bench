@@ -1,5 +1,11 @@
 # Ideas for later
 
+## Multi-GPU and multi-socket CPU measurements
+
+- Start with independent workloads on each selected GPU or CPU socket. Report per-device or per-socket throughput and aggregate completed work over the same wall-clock interval.
+- Record work distribution, device placement, memory locality, and transfer time. For CPU sockets, validate affinity and local versus remote NUMA allocation. For multiple GPUs, record staging and inter-device transfer paths where supported.
+- Keep concurrent independent jobs and coordinated workloads as distinct modes. Validate cancellation, memory limits, and results on representative multi-device and multi-socket hardware before exposing either mode in Curated.
+
 ## Logo arrow alignment
 
 Completed for the rebuilt 0.3.1 release on 2026-10-10.
@@ -24,7 +30,7 @@ Accepted as a small automated feature idea; not implemented or scheduled.
 - Run an existing CPU scaling workload at several physical-core counts, reusing allocation, affinity, sampling, and cancellation support.
 - Keep the aggregate dataset size and workload definition fixed across runs. Record per-worker dataset sizes because changing the core count also changes cache residency.
 - Show throughput against core count and identify the smallest tested allocation that retains a user-selected share of the best measured throughput, such as 95%.
-- Report noisy or borderline results as inconclusive and offer a repeat measurement rather than presenting a definite recommendation.
+- Report the measured spread and account for variability within the planned sampling budget.
 - Keep the result specific to the tested workload, dataset, and selected cores; do not claim an optimal allocation for other applications or measured power savings.
 - Start with one supported CPU scaling workload and a short selection of core counts to keep the workflow lightweight.
 

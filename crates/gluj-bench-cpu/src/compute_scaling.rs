@@ -1,6 +1,5 @@
 use crate::{
     compute,
-    kernels::statistics,
     topology::{AffinityGuard, CpuTopology, ProcessorLocation},
 };
 use gluj_bench_core::{
@@ -50,7 +49,7 @@ pub fn integer_descriptor(
         .unwrap();
     item.workload = "64-bit wrapping multiply/add with register, cache, RAM or custom data".into();
     item.metadata
-        .insert("kernel_revision".into(), "int64-streaming-1".into());
+        .insert("kernel_revision".into(), "int64-streaming-2-access".into());
     item.metadata
         .insert("profile_axis".into(), "aggregate_working_set_bytes".into());
     item.metadata.insert(
@@ -74,10 +73,39 @@ pub(crate) enum Kernel {
     Integer,
 }
 impl WorkBuffers {
+    fn validate(&self) -> Result<(), BenchmarkError> {
+        match self {
+            Self::Integer(buffers) => buffers.validate(),
+            Self::Matrix(buffers) => buffers.validate(),
+            Self::Ascii(buffers) => buffers.validate(),
+            Self::Vector(buffers) => {
+                for index in gluj_bench_core::validation_indices(buffers.output.len()) {
+                    let mut expected = buffers.a[index];
+                    for _ in 0..REUSE {
+                        expected = gluj_bench_core::reference_fma_f32(
+                            expected,
+                            buffers.b[index],
+                            0.000_001,
+                        );
+                    }
+                    if !buffers.output[index].is_finite()
+                        || (buffers.output[index] - expected).abs() > expected.abs().max(1.0) * 1e-6
+                    {
+                        return Err(BenchmarkError::new(
+                            "result_validation_failed",
+                            "FP32 output differs from the scalar FMA reference.",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
     fn new(
         elements: usize,
         worker: usize,
         kernel: Kernel,
+        config: &BenchmarkConfig,
         cancellation: &CancellationToken,
     ) -> Result<Self, BenchmarkError> {
         if matches!(kernel, Kernel::Integer) {
@@ -87,27 +115,39 @@ impl WorkBuffers {
                 cancellation,
             )?))
         } else if matches!(kernel, Kernel::Ascii) {
-            Ok(Self::Ascii(crate::ascii_scaling::Buffers::new(
+            Ok(Self::Ascii(crate::ascii_scaling::Buffers::new_content(
                 elements,
+                config
+                    .options
+                    .get("ascii_content")
+                    .map(String::as_str)
+                    .unwrap_or("patterned"),
+                gluj_bench_core::AccessPolicy::from_config(config)?
+                    .derived_seed(worker, elements, 0),
                 cancellation,
             )?))
         } else if matches!(kernel, Kernel::Matrix) {
             Ok(Self::Matrix(crate::matrix_scaling::Buffers::new(
-                elements, worker,
+                elements,
+                worker,
+                cancellation,
             )?))
         } else {
-            Ok(Self::Vector(Buffers::new(elements, worker)?))
+            Ok(Self::Vector(Buffers::new(elements, worker, cancellation)?))
         }
     }
-    fn sweep(&mut self, cancellation: &CancellationToken) -> bool {
+    fn sweep(
+        &mut self,
+        cancellation: &CancellationToken,
+        schedule: &mut gluj_bench_core::AccessSchedule,
+    ) -> bool {
         match self {
             Self::Vector(buffers) => {
-                buffers.sweep();
-                true
+                schedule.visit(cancellation, |range| buffers.sweep_range(range))
             }
             Self::Matrix(buffers) => buffers.sweep(cancellation),
-            Self::Ascii(buffers) => buffers.sweep(cancellation),
-            Self::Integer(buffers) => buffers.sweep(cancellation),
+            Self::Ascii(buffers) => buffers.sweep_scheduled(cancellation, schedule),
+            Self::Integer(buffers) => buffers.sweep_scheduled(cancellation, schedule),
         }
     }
     fn checksum(&self) -> u64 {
@@ -135,7 +175,7 @@ pub fn descriptor(device: &DeviceDescriptor, topology_available: bool) -> Benchm
     descriptor.display_order = 11;
     descriptor.metadata = BTreeMap::from([
         ("profile_axis".into(), "aggregate_working_set_bytes".into()),
-        ("kernel_revision".into(), "avx2-streaming-1".into()),
+        ("kernel_revision".into(), "avx2-streaming-2-access".into()),
         ("data_type".into(), "fp32".into()),
         ("compute_reference_benchmark".into(), REFERENCE.into()),
         (
@@ -225,7 +265,13 @@ pub(crate) fn cache_dataset_aligned(
 
 pub fn cache_previews(descriptor: &mut BenchmarkDescriptor, topology: &CpuTopology) {
     let matrix = descriptor.id == crate::matrix_scaling::ID;
-    let alignment = if descriptor.id == crate::integer_scaling::ID {
+    let alignment = if gluj_bench_core::cpu_data_mode(&descriptor.id) {
+        64 * if descriptor.id == "cpu.performance.extended.popcnt" {
+            8
+        } else {
+            24
+        }
+    } else if descriptor.id == crate::integer_scaling::ID {
         crate::integer_scaling::BLOCK_ELEMENTS * crate::integer_scaling::BYTES_PER_ELEMENT
     } else {
         BLOCK as u64 * BYTES_PER_ELEMENT
@@ -438,26 +484,50 @@ struct Buffers {
     output: Vec<f32>,
 }
 impl Buffers {
-    fn new(elements: usize, worker: usize) -> Result<Self, BenchmarkError> {
-        fn array(elements: usize, value: f32) -> Result<Vec<f32>, BenchmarkError> {
+    fn new(
+        elements: usize,
+        worker: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, BenchmarkError> {
+        fn array(
+            elements: usize,
+            value: f32,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<f32>, BenchmarkError> {
             let mut data = Vec::new();
             data.try_reserve_exact(elements)
                 .map_err(|e| BenchmarkError::new("allocation_failed", e.to_string()))?;
-            data.resize(elements, value);
+            for begin in (0..elements).step_by(65536) {
+                if cancellation.is_cancelled() {
+                    return Err(BenchmarkError::new(
+                        "cancelled",
+                        "Numeric buffer preparation cancelled.",
+                    ));
+                }
+                data.resize(elements.min(begin + 65536), value);
+            }
             Ok(data)
         }
         Ok(Self {
-            a: array(elements, 1.0 + worker as f32 * 0.001)?,
-            b: array(elements, 0.999_999_94)?,
-            output: array(elements, 0.0)?,
+            a: array(elements, 1.0 + worker as f32 * 0.001, cancellation)?,
+            b: array(elements, 0.999_999_94, cancellation)?,
+            output: array(elements, 0.0, cancellation)?,
         })
     }
+    #[cfg(test)]
     fn sweep(&mut self) {
+        self.sweep_range(0..self.a.len());
+    }
+    fn sweep_range(&mut self, range: std::ops::Range<usize>) {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: run() gates AVX2/FMA, arrays have equal lengths divisible by 64,
         // and disjoint buffers are exclusively owned by this pinned worker.
         unsafe {
-            vector_sweep(&self.a, &self.b, &mut self.output);
+            vector_sweep(
+                &self.a[range.clone()],
+                &self.b[range.clone()],
+                &mut self.output[range],
+            );
         }
         black_box(&self.output);
     }
@@ -496,6 +566,12 @@ pub(crate) fn measure(
     cancellation: &CancellationToken,
     kernel: Kernel,
 ) -> Result<(Vec<f64>, Vec<f64>, u64, u64), BenchmarkError> {
+    let access = gluj_bench_core::AccessPolicy::from_config(config)?;
+    let realizations = if matches!(kernel, Kernel::Matrix) {
+        1
+    } else {
+        access.realizations
+    };
     let matrix = matches!(kernel, Kernel::Matrix);
     let ascii = matches!(kernel, Kernel::Ascii);
     let bytes_per_element = if matches!(kernel, Kernel::Integer) {
@@ -530,19 +606,52 @@ pub(crate) fn measure(
     };
     let barrier = Barrier::new(locations.len());
     let failed = AtomicBool::new(false);
-    let duration_ns = config.target_duration_ms.saturating_mul(1_000_000) / config.samples as u64;
+    let duration_ns = gluj_bench_core::sample_target_ns(config);
     let intensity = gluj_bench_core::cpu_activity_percent();
+    let recorder = gluj_bench_core::observation_recorder();
     let results = thread::scope(|scope| {
         let handles = locations
             .iter()
             .enumerate()
             .map(|(index, location)| {
+                let recorder = recorder.clone();
                 let (barrier, failed) = (&barrier, &failed);
                 scope.spawn(move || -> Result<Vec<(u64, u64, u64)>, BenchmarkError> {
                     let prepared = (|| {
+                        let _preparation = recorder
+                            .as_ref()
+                            .map(|recorder| recorder.phase_timer("preparation"));
                         let affinity = AffinityGuard::pin(*location)?;
-                        let buffers = WorkBuffers::new(elements, index, kernel, cancellation)?;
-                        Ok::<_, BenchmarkError>((affinity, buffers))
+                        let mut buffers =
+                            WorkBuffers::new(elements, index, kernel, config, cancellation)?;
+                        let unit = if ascii { 1 } else { bytes_per_element as usize };
+                        let mut policy = access;
+                        policy.seed = gluj_bench_core::derive_seed(
+                            access.seed,
+                            0,
+                            bytes,
+                            recorder
+                                .as_ref()
+                                .map(|r| r.block_index())
+                                .unwrap_or(0)
+                                .into(),
+                        );
+                        policy.block_bytes = (access.block_bytes / unit / 64).max(1) * 64;
+                        let mut schedules = (0..realizations)
+                            .map(|r| {
+                                policy.schedule(
+                                    if matrix { 64 } else { elements.max(64) },
+                                    64,
+                                    index,
+                                    r,
+                                    cancellation,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if let WorkBuffers::Ascii(ascii) = &mut buffers {
+                            ascii.prepare_reference(&mut schedules[0], cancellation);
+                        }
+                        Ok::<_, BenchmarkError>((affinity, buffers, schedules))
                     })();
                     if prepared.is_err() {
                         failed.store(true, Ordering::SeqCst);
@@ -557,16 +666,119 @@ pub(crate) fn measure(
                             )
                         }));
                     }
-                    let (_affinity, mut buffers) = prepared?;
+                    let (_affinity, mut buffers, mut schedules) = prepared?;
                     let mut pacer = crate::pacing::CpuPacer::new(intensity, cancellation);
+                    let warmup_timer = recorder
+                        .as_ref()
+                        .map(|recorder| recorder.phase_timer("warmup"));
                     let warmup = Instant::now();
-                    while warmup.elapsed().as_millis() < 100 && !cancellation.is_cancelled() {
-                        if !buffers.sweep(cancellation) {
+                    while warmup.elapsed().as_nanos()
+                        < u128::from(gluj_bench_core::measurement_budget(config).warmup_ns)
+                        && !cancellation.is_cancelled()
+                    {
+                        if !buffers.sweep(cancellation, &mut schedules[0]) {
                             break;
                         }
                     }
+                    drop(warmup_timer);
+                    for schedule in &mut schedules {
+                        schedule.reset_pass(0);
+                    }
                     let mut samples = Vec::new();
-                    for _ in 0..config.samples {
+                    for sample in 0..config.samples * realizations {
+                        let realization = sample % realizations;
+                        let schedule = &mut schedules[realization as usize];
+                        let work_factor = if matrix {
+                            1.0
+                        } else {
+                            schedule.visited_bytes() as f64 / elements.max(64) as f64
+                        };
+                        let observation = if matrix {
+                            recorder.clone()
+                        } else {
+                            recorder.as_ref().map(|r| {
+                                r.with_realization(
+                                    access.derived_seed(index, elements, realization),
+                                    std::collections::BTreeMap::from([
+                                        ("root_seed".into(), access.seed.to_string()),
+                                        ("worker".into(), index.to_string()),
+                                        (
+                                            format!(
+                                                "block-{}-schedule-seed",
+                                                recorder
+                                                    .as_ref()
+                                                    .map(|r| r.block_index())
+                                                    .unwrap_or(0)
+                                            ),
+                                            gluj_bench_core::derive_seed(
+                                                access.seed,
+                                                0,
+                                                bytes,
+                                                recorder
+                                                    .as_ref()
+                                                    .map(|r| r.block_index())
+                                                    .unwrap_or(0)
+                                                    .into(),
+                                            )
+                                            .to_string(),
+                                        ),
+                                        ("dataset_bytes".into(), bytes.to_string()),
+                                        ("realization".into(), realization.to_string()),
+                                        (
+                                            "schedule_auxiliary_bytes".into(),
+                                            (schedule.auxiliary_bytes() * realizations as usize)
+                                                .to_string(),
+                                        ),
+                                        ("access_pattern".into(), access.name().into()),
+                                        (
+                                            "expected_ascii_hits_per_pass".into(),
+                                            match &buffers {
+                                                WorkBuffers::Ascii(a) => {
+                                                    a.expected_hits().to_string()
+                                                }
+                                                _ => "not_applicable".into(),
+                                            },
+                                        ),
+                                        (
+                                            "actual_schedule_block_footprint_bytes".into(),
+                                            if access.pattern
+                                                == gluj_bench_core::AccessPattern::Scattered
+                                            {
+                                                64 * if ascii {
+                                                    1
+                                                } else {
+                                                    bytes_per_element as usize
+                                                }
+                                            } else {
+                                                (access.block_bytes
+                                                    / if ascii {
+                                                        1
+                                                    } else {
+                                                        bytes_per_element as usize
+                                                    }
+                                                    / 64)
+                                                    .max(1)
+                                                    * 64
+                                                    * if ascii {
+                                                        1
+                                                    } else {
+                                                        bytes_per_element as usize
+                                                    }
+                                            }
+                                            .to_string(),
+                                        ),
+                                    ]),
+                                )
+                            })
+                        };
+
+                        if sample < realizations {
+                            let _warmup = recorder.as_ref().map(|r| r.phase_timer("warmup"));
+                            if !buffers.sweep(cancellation, schedule) {
+                                failed.store(true, Ordering::SeqCst);
+                            }
+                            schedule.reset_pass(0);
+                        }
                         barrier.wait();
                         let start = Instant::now();
                         let idle_before = pacer.idle();
@@ -576,7 +788,7 @@ pub(crate) fn measure(
                             && !cancellation.is_cancelled()
                         {
                             let batch_start = Instant::now();
-                            if !buffers.sweep(cancellation) {
+                            if !buffers.sweep(cancellation, schedule) {
                                 break;
                             }
                             sweeps += 1;
@@ -586,9 +798,39 @@ pub(crate) fn measure(
                         }
                         let elapsed =
                             pacer.active_elapsed(start, idle_before).as_nanos().max(1) as u64;
+                        if cancellation.is_cancelled() || sweeps == 0 {
+                            failed.store(true, Ordering::SeqCst);
+                        }
                         barrier.wait();
+                        if failed.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let checksum = buffers.checksum();
-                        samples.push((sweeps, elapsed, checksum));
+                        samples.push((
+                            (sweeps as f64 * operations_per_sweep as f64 * work_factor) as u64,
+                            elapsed,
+                            checksum,
+                        ));
+                        if let Some(recorder) = &observation {
+                            recorder.record(
+                                &format!("bytes-{bytes}:worker-{index}"),
+                                "worker_compute",
+                                sweeps as f64 * operations_per_sweep as f64 * work_factor * 1e9
+                                    / elapsed as f64,
+                                if ascii { "strings/s" } else { "operations/s" },
+                                (sweeps as f64 * operations_per_sweep as f64 * work_factor) as u64,
+                                if ascii { "strings" } else { "operations" },
+                                elapsed,
+                                start.elapsed().as_nanos() as u64,
+                                "not_recorded",
+                            );
+                        }
+                    }
+                    if !cancellation.is_cancelled() {
+                        let _validation = recorder
+                            .as_ref()
+                            .map(|recorder| recorder.phase_timer("validation"));
+                        buffers.validate()?;
                     }
                     Ok(samples)
                 })
@@ -613,11 +855,14 @@ pub(crate) fn measure(
     let mut bandwidth = Vec::new();
     let mut total_elapsed = 0;
     let mut checksum = 0;
-    for index in 0..config.samples as usize {
+    for index in 0..(config.samples * realizations) as usize {
         let sweeps = results.iter().map(|s| s[index].0).sum::<u64>();
         let elapsed = results.iter().map(|s| s[index].1).max().unwrap().max(1);
-        compute.push(sweeps as f64 * operations_per_sweep as f64 * 1e9 / elapsed as f64);
-        bandwidth.push(sweeps as f64 * traffic_per_sweep as f64 * 1e9 / elapsed as f64);
+        compute.push(sweeps as f64 * 1e9 / elapsed as f64);
+        bandwidth.push(
+            sweeps as f64 * traffic_per_sweep as f64 / operations_per_sweep as f64 * 1e9
+                / elapsed as f64,
+        );
         total_elapsed += elapsed;
         checksum ^= results
             .iter()
@@ -635,6 +880,7 @@ pub fn run(
     device: &DeviceDescriptor,
     topology: &CpuTopology,
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    let _measurement_scope = gluj_bench_core::MeasurementScope::enter(config, id);
     let matrix = id == crate::matrix_scaling::ID;
     let integer = id == crate::integer_scaling::ID;
     let reference_id = if integer {
@@ -676,7 +922,6 @@ pub fn run(
             config,
             cancellation,
             progress,
-            topology.representative,
             device,
             topology,
         )?;
@@ -743,6 +988,15 @@ pub fn run(
     let maximum = allocation_budget(system.total_memory(), available, ram_percent, requested_mib);
 
     let allocation_limit = maximum;
+    let maximum = if matrix {
+        maximum
+    } else {
+        gluj_bench_core::AccessPolicy::from_config(config)?.payload_budget(
+            maximum,
+            locations.len(),
+            if integer { 16 } else { 12 },
+        )
+    };
     let (maximum, single_dataset) = if matrix {
         matrix_dataset(config, maximum, topology, &locations)?
     } else if integer {
@@ -783,8 +1037,7 @@ pub fn run(
             "Not enough free RAM for a CPU scaling sweep.",
         ));
     }
-    let mut ref_config = config.clone();
-    ref_config.target_duration_ms = config.target_duration_ms.clamp(150, 500);
+    let mut ref_config = gluj_bench_core::reference_config(config, "reference-before");
     let mut quiet = |_| {};
     progress(ProgressUpdate {
         fraction: 0.0,
@@ -796,16 +1049,23 @@ pub fn run(
         &ref_config,
         cancellation,
         &mut quiet,
-        topology.representative,
         device,
         topology,
     )?;
     let mut metrics = Vec::new();
     let mut elapsed = 0;
+    progress(ProgressUpdate {
+        fraction: 0.04,
+        phase: "measurement_plan".into(),
+        message: gluj_bench_core::measurement_estimate(config, tiers.len()),
+    });
+    let visits = gluj_bench_core::condition_visits(&tiers, config);
+    let mut accumulated: BTreeMap<(u64, &str, &str), Vec<f64>> = BTreeMap::new();
     let mut checksum = 0;
-    for (index, bytes) in tiers.iter().enumerate() {
+    for (index, (bytes, block_config, block)) in visits.iter().enumerate() {
+        let _block_scope = gluj_bench_core::MeasurementScope::block(block_config, id, *block);
         progress(ProgressUpdate {
-            fraction: 0.05 + 0.85 * index as f64 / tiers.len() as f64,
+            fraction: 0.05 + 0.85 * index as f64 / visits.len() as f64,
             phase: if matrix {
                 "cpu_matrix_scaling"
             } else if integer {
@@ -819,13 +1079,13 @@ pub fn run(
                 *bytes as f64 / MIB as f64,
                 *bytes as f64 / locations.len() as f64 / 1024.0,
                 index + 1,
-                tiers.len()
+                visits.len()
             ),
         });
         let (compute, bandwidth, time, hash) = measure(
             &locations,
             *bytes,
-            config,
+            block_config,
             cancellation,
             if matrix {
                 Kernel::Matrix
@@ -841,26 +1101,34 @@ pub fn run(
             ("compute", compute, "operations/s"),
             ("bandwidth", bandwidth, "bytes/s"),
         ] {
-            let stats = statistics(&samples);
-            metrics.push(Metric {
-                name: format!("working_set_{bytes}.{suffix}"),
-                value: stats.median,
-                unit: unit.into(),
-                statistics: stats,
-            });
+            accumulated
+                .entry((*bytes, suffix, unit))
+                .or_default()
+                .extend(samples);
         }
+    }
+    for ((bytes, suffix, unit), values) in accumulated {
+        let stats = crate::kernels::statistics(&values);
+        metrics.push(Metric {
+            name: format!("working_set_{bytes}.{suffix}"),
+            value: stats.median,
+            unit: unit.into(),
+            statistics: stats,
+        });
     }
     progress(ProgressUpdate {
         fraction: 0.92,
         phase: "cpu_compute_reference".into(),
         message: format!("Checking current {label} compute reference"),
     });
+    ref_config
+        .options
+        .insert("measurement_role".into(), "reference-after".into());
     let check = compute::run(
         reference_id,
         &ref_config,
         cancellation,
         &mut quiet,
-        topology.representative,
         device,
         topology,
     )?;
@@ -880,17 +1148,19 @@ pub fn run(
     let transition = transition_index(&compute_tiers, baseline);
     let largest = compute_tiers.last().unwrap().value;
     let mut metadata = BTreeMap::from([
+        ("result_validation".into(), "every visited dataset: each worker validates boundary/interior arithmetic or matrix outputs outside timing; register reference checked separately".into()),
         ("compute_reference_benchmark".into(), reference_id.into()),
         ("compute_reference_selection".into(), "latest_post_sweep".into()),
         ("compute_reference_kind".into(), "measured_register_resident; not_theoretical_peak".into()),
         ("compute_reference_drift_percent".into(), format!("{drift:.2}")),
-        ("kernel_revision".into(), "avx2-streaming-1".into()),
+        ("kernel_revision".into(), "avx2-streaming-2-access".into()),
         ("arithmetic_iterations".into(), REUSE.to_string()),
         ("data_type".into(), "fp32".into()),
         ("operation_definition".into(), "one floating-point multiply or add per lane; each FMA counts as two".into()),
-        ("profile_sample_count_per_tier".into(), config.samples.to_string()),
-        ("target_duration_ms_per_tier".into(), config.target_duration_ms.to_string()),
-        ("warmup_ms_per_tier".into(), "100".into()),
+        ("profile_sample_count_per_tier".into(), (config.samples * if matrix {1} else {gluj_bench_core::AccessPolicy::from_config(config)?.realizations}).to_string()),
+        ("target_duration_ms_per_realization".into(), config.target_duration_ms.to_string()),
+        ("target_duration_ms_per_tier".into(), (config.target_duration_ms * gluj_bench_core::AccessPolicy::from_config(config)?.realizations as u64).to_string()),
+        ("warmup_ms_per_tier".into(), (gluj_bench_core::measurement_budget(config).warmup_ns/1_000_000).to_string()),
         ("arithmetic_intensity_operations_per_byte".into(), format!("{:.4}", (2 * REUSE) as f64 / BYTES_PER_ELEMENT as f64)),
         ("thread_count".into(), locations.len().to_string()),
         ("thread_mode".into(), if crate::topology::explicit_core_limit(config) || config.options.get("thread_mode").is_some_and(|s| s == "physical_cores") { "physical_cores" } else { "logical_processors" }.into()),
@@ -949,15 +1219,31 @@ pub fn run(
         })
         && crate::topology::explicit_core_limit(config)
     {
-        let trial = (locations.len() * 3 / 4).max(1);
+        let candidates =
+            gluj_bench_core::cpu_efficiency_trials(locations.len() as u32, largest / baseline);
+        let trial = candidates[0];
+        let steps = candidates
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        metadata.insert("cpu_core_count_trial_candidates".into(), steps.clone());
+        metadata.insert(
+            "efficiency_search_revision".into(),
+            "manual-staged-1".into(),
+        );
         metadata.insert("suggested_cpu_core_count_trial".into(), trial.to_string());
         metadata.insert(
             "cpu_core_trial_baseline_operations_per_second".into(),
             largest.to_string(),
         );
-        metadata.insert("tuning_guidance".into(), format!("Try {trial} physical cores instead of {} and retest the same largest aggregate dataset. Keep the change only if throughput stays within 0–5% of this run or improves; restore more cores if loss exceeds 5%. Memory pressure motivates this exploratory trial, but fewer cores have not been measured. Power and temperatures are not measured. For another process, set its worker count or affinity manually and verify its own workload; this benchmark cannot predict its benefit. Matrix dimensions per worker change with the worker count, so inspect the recorded shapes when comparing. No process settings or clocks were changed.", locations.len()));
+        metadata.insert("tuning_guidance".into(), format!("Efficiency goal: retain throughput while seeking lower power use and heat. Explore {steps} physical cores in that order, starting from {}. These are untested search candidates, not a measured optimum. Compare every step with the original baseline at the same aggregate dataset and arithmetic settings. Keep at least 95% of original throughput; otherwise restore the last passing allocation and refine between passing and failing counts. Matrix dimensions and operations per pass may change with worker count, so inspect recorded shapes and validate application completion time. Power and temperatures are not measured. No process settings or clocks were changed.", locations.len()));
     } else {
-        metadata.insert("tuning_guidance".into(), "No measured optimal core count. Select an exact physical-core allocation and compare repeated runs at the same aggregate dataset size. Fewer workers may reduce contention, power use or heat, but can also lower throughput. Power and temperatures are not measured; application benefits require testing that application's workload. No process affinity or clock setting was changed.".into());
+        metadata.insert("tuning_guidance".into(), "No measured optimal core count. Select an exact physical-core allocation and inspect results for the same aggregate dataset size. Fewer workers may reduce contention, power use or heat, but can also lower throughput. Power and temperatures are not measured; application benefits require testing that application's workload. No process affinity or clock setting was changed.".into());
+    }
+    if let Some(guidance) = metadata.get_mut("tuning_guidance") {
+        guidance.push(' ');
+        guidance.push_str(gluj_bench_core::COMPUTE_MEMORY_BALANCE_GUIDANCE);
     }
     if let Some(index) = transition {
         metadata.insert(
@@ -974,7 +1260,7 @@ pub fn run(
             "dataset_mode".into(),
             if single_dataset { "single" } else { "sweep" }.into(),
         );
-        metadata.insert("kernel_revision".into(), "int64-streaming-1".into());
+        metadata.insert("kernel_revision".into(), "int64-streaming-2-access".into());
         metadata.insert(
             "compiler_guard".into(),
             "per_value_per_round_black_box".into(),
@@ -1082,6 +1368,18 @@ pub fn run(
                 .into(),
             );
         }
+    }
+    if !matrix {
+        metadata.extend(gluj_bench_core::AccessPolicy::from_config(config)?.metadata());
+        metadata.insert(
+            "kernel_revision".into(),
+            if integer {
+                "int64-streaming-2-access"
+            } else {
+                "avx2-streaming-2-access"
+            }
+            .into(),
+        );
     }
     Ok(BenchmarkResult {
         benchmark_id: id.into(),
@@ -1313,7 +1611,7 @@ mod tests {
             }
             assert_eq!(
                 result.workload_metadata["kernel_revision"],
-                "int64-streaming-1"
+                "int64-streaming-2-access"
             );
             assert_eq!(
                 result.workload_metadata["compute_reference_benchmark"],
@@ -1578,7 +1876,7 @@ mod tests {
     fn vector_kernel_matches_scalar_fma_and_operation_accounting() {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            let mut data = Buffers::new(BLOCK * 3, 0).unwrap();
+            let mut data = Buffers::new(BLOCK * 3, 0, &CancellationToken::default()).unwrap();
             for (i, v) in data.a.iter_mut().enumerate() {
                 *v += i as f32 * 0.001;
             }
@@ -1627,5 +1925,57 @@ mod tests {
             transition_index(&tiers.iter().collect::<Vec<_>>(), 100.0),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod access_regressions {
+    use super::*;
+    #[test]
+    fn scheduled_kernels_preserve_reference_outputs_and_ascii_expected_hits() {
+        let token = CancellationToken::default();
+        for pattern in [
+            "sequential",
+            "shuffled_blocks",
+            "rotating_regions",
+            "scattered",
+            "hot_cold",
+        ] {
+            for kernel in [Kernel::Integer, Kernel::Ascii, Kernel::Vector] {
+                if matches!(kernel, Kernel::Vector) && !is_vector_available() {
+                    continue;
+                }
+                let config = BenchmarkConfig {
+                    options: BTreeMap::from([
+                        ("access_pattern".into(), pattern.into()),
+                        ("access_block_bytes".into(), "128".into()),
+                        ("ascii_content".into(), "mixed".into()),
+                    ]),
+                    ..Default::default()
+                };
+                let mut schedule = gluj_bench_core::AccessPolicy::from_config(&config)
+                    .unwrap()
+                    .schedule(64 * 17, 64, 2, 1, &token)
+                    .unwrap();
+                let mut buffers = WorkBuffers::new(64 * 17, 2, kernel, &config, &token).unwrap();
+                if let WorkBuffers::Ascii(a) = &mut buffers {
+                    a.prepare_reference(&mut schedule, &token);
+                }
+                for _ in 0..3 {
+                    assert!(buffers.sweep(&token, &mut schedule));
+                    buffers.validate().unwrap();
+                }
+            }
+        }
+    }
+    fn is_vector_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     }
 }

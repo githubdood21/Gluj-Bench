@@ -2,7 +2,60 @@
 
 All notable changes to Gluj-Bench are documented here. The project follows semantic versioning.
 
-## [Unreleased]
+## [1.0.0] - 2026-11-08
+
+### Added
+
+- Fifteen workload families with Curated plans and configurable Custom tests, including CPU core allocation, GPU precision, dataset sweeps, and seeded access patterns.
+- Interactive TOPS charts with click-to-copy values and a compact reference-gap percentage for the largest tested dataset.
+- Saved run timestamps, New badges, raw observation charts, named baselines, and native JSON import and export. PNG snapshots embed selected comparison summaries by default.
+- System memory data bus width across populated channels when firmware exposes reliable topology.
+
+### Changed
+
+- Default to six observations per condition, with three in Shorter run. Curated uses standard access and a single realization. Custom supports opt-in randomness and multiple seeds.
+- Keep the test checklist visible, show the queue only during execution, and group history actions by the selected run.
+- Use a brass-and-iris palette and compact Settings, hardware, and result layouts. Keep raw identifiers in technical views and native records.
+
+### Fixed
+
+- Match visible test names in Run History, synchronize the component picker when opening a saved run, and keep existing measurements in their original result groups.
+- Show clear import failures near the Files menu and keep parser details available on demand.
+
+## [0.5.0-rc.1] - 2026-11-03
+
+Local candidate; cross-vendor hardware qualification remains open.
+
+### Added
+
+- Fifteen-family catalogue, shared condition contracts, extensive bounded sampling,
+  immutable native run/sample records and capability-checked curated/custom plans.
+- Seeded access conditions, upgraded CPU workloads, buffered GPU precision modes,
+  directional transfers and cooperative-matrix shape/reuse/traversal controls.
+- Selected-dataset results, native history with names/notes/pinned baselines,
+  selected-only PNGs, full native JSON round trips, tasks and queue inspection.
+- Isolated data-folder support and source/toolchain provenance in release packages.
+
+### Fixed
+
+- Match buffered INT8 matrix initialization to the independent signed/unsigned
+  reference; version the input definition and retain failed-run evidence.
+- Handle worker disconnects without leaving an active run stuck; expose explicit
+  reconnect and disable offline starts.
+- Preserve pending plan status after cancelling only the current condition;
+  distinguish installed RAM from OS-visible memory.
+- Keep long results/queue lists bounded, expose benchmark errors, and distinguish
+  access/size/copy choices in custom plan previews.
+- Report existing memory/pointer-chain validation scope and preserve more than 128
+  distinct saved configurations.
+
+### Changed
+
+- Keep customized randomness opt-in; curated sequential/shuffled conditions have
+  separate equal coverage. Report variability without generated rerun advice.
+- Preserve original migration files, raw coverage and comparison revisions. Package
+  existing versioned artifacts without silently replacing them.
+
 
 ## [0.4.0] - 2026-10-19
 

@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x_id = 0) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputA { f16vec4 values[]; } input_a;
+layout(set = 0, binding = 1, std430) readonly buffer InputB { f16vec4 values[]; } input_b;
+layout(set = 0, binding = 2, std430) writeonly buffer Output { f16vec4 values[]; } output_data;
+layout(push_constant) uniform Parameters {
+    uint loop_count;
+    uint element_count;
+    uint seed;
+    uint access_mode;
+    uint block_multiplier;
+    uint block_offset;
+    uint lane_multiplier;
+    uint lane_offset;
+} params;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.element_count) return;
+    uint block=index/256u; uint lane=index%256u; uint blocks=params.element_count/256u;
+    if(params.access_mode==1u || params.access_mode==3u) block=(block*params.block_multiplier+params.block_offset)%blocks;
+    if(params.access_mode==2u) block=(block+params.block_offset)%blocks;
+    if(params.access_mode==3u) lane=(lane*params.lane_multiplier+params.lane_offset)&255u;
+    index=block*256u+lane;
+    f16vec4 x = input_a.values[index];
+    f16vec4 y = input_b.values[index];
+    float16_t perturbation = float16_t((index ^ params.seed) & 255u) * float16_t(0.000001);
+    f16vec4 a0=x+f16vec4(perturbation); f16vec4 a1=x+f16vec4(0.01); f16vec4 a2=x+f16vec4(0.02); f16vec4 a3=x+f16vec4(0.03);
+    f16vec4 a4=x+f16vec4(0.04); f16vec4 a5=x+f16vec4(0.05); f16vec4 a6=x+f16vec4(0.06); f16vec4 a7=x+f16vec4(0.07);
+    f16vec4 multiplier = y * f16vec4(0.001953125) + f16vec4(0.998046875);
+    for (uint iteration = 0; iteration < params.loop_count; ++iteration) {
+        a0=fma(a0,multiplier,f16vec4(0.00048828125)); a1=fma(a1,multiplier,f16vec4(0.0009765625));
+        a2=fma(a2,multiplier,f16vec4(0.00146484375)); a3=fma(a3,multiplier,f16vec4(0.001953125));
+        a4=fma(a4,multiplier,f16vec4(0.00244140625)); a5=fma(a5,multiplier,f16vec4(0.0029296875));
+        a6=fma(a6,multiplier,f16vec4(0.00341796875)); a7=fma(a7,multiplier,f16vec4(0.00390625));
+    }
+    output_data.values[index] = a0+a1+a2+a3+a4+a5+a6+a7;
+}

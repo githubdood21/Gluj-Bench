@@ -2,6 +2,7 @@ mod ascii_scaling;
 mod cache_latency;
 mod compute;
 mod compute_scaling;
+mod cpu_workloads;
 mod integer_scaling;
 mod kernels;
 mod latency;
@@ -220,6 +221,10 @@ impl CpuBandwidthProvider {
     fn cache_descriptor(&self, level: u8) -> BenchmarkDescriptor {
         let id = format!("cpu.bandwidth.cache.l{level}");
         let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "bandwidth_kernel_revision".into(),
+            "cpu-bandwidth-3-access-payload".into(),
+        );
         metadata.insert("cache_level".into(), level.to_string());
         metadata.insert("cache_capacity_fraction".into(), "0.40".into());
         metadata.insert("cache_state".into(), "preloaded_before_timing".into());
@@ -238,6 +243,14 @@ impl CpuBandwidthProvider {
                         layout
                             .iter()
                             .map(|(_, bytes)| *bytes as u64)
+                            .sum::<u64>()
+                            .to_string(),
+                    );
+                    metadata.insert(
+                        "estimated_peak_test_buffer_bytes".into(),
+                        layout
+                            .iter()
+                            .map(|(_, bytes)| 2 * *bytes as u64)
                             .sum::<u64>()
                             .to_string(),
                     );
@@ -271,6 +284,10 @@ impl CpuBandwidthProvider {
 
     fn memory_descriptor(&self) -> BenchmarkDescriptor {
         let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "bandwidth_kernel_revision".into(),
+            "cpu-bandwidth-3-access-payload".into(),
+        );
         metadata.insert("cache_state".into(), "flushed_before_each_sweep".into());
         metadata.insert("cache_flush_method".into(), cold_cache_method().into());
         metadata.insert("access_order".into(), "sequential_rotated_per_sweep".into());
@@ -278,6 +295,10 @@ impl CpuBandwidthProvider {
             Ok(topology) => match self.ram_payload(topology) {
                 Ok(bytes) => {
                     metadata.insert("working_set_bytes".into(), bytes.to_string());
+                    metadata.insert(
+                        "estimated_peak_test_buffer_bytes".into(),
+                        (2 * bytes as u64).to_string(),
+                    );
                     (true, String::new())
                 }
                 Err(reason) => (false, reason),
@@ -305,16 +326,16 @@ impl CpuBandwidthProvider {
     }
 
     fn validate(config: &BenchmarkConfig) -> Result<(), BenchmarkError> {
-        if !(3..=20).contains(&config.samples) {
+        if !(1..=64).contains(&config.samples) {
             return Err(BenchmarkError::new(
                 "invalid_config",
-                "samples must be between 3 and 20.",
+                "samples must be between 1 and 64.",
             ));
         }
-        if !(150..=30_000).contains(&config.target_duration_ms) {
+        if !(100..=120_000).contains(&config.target_duration_ms) {
             return Err(BenchmarkError::new(
                 "invalid_config",
-                "target_duration_ms must be between 150 and 30000.",
+                "target_duration_ms must be between 100 and 120000.",
             ));
         }
         if let Some(mode) = config.options.get("thread_mode")
@@ -366,7 +387,7 @@ impl CpuBandwidthProvider {
             .map(|cache| (cache.group, cache.mask))
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        let target_ns = config.target_duration_ms.saturating_mul(1_000_000) / config.samples as u64;
+        let target_ns = gluj_bench_core::sample_target_ns(config);
         let mut metrics = Vec::new();
         let mut total_elapsed = 0u64;
         for (index, (name, operation)) in [
@@ -383,7 +404,10 @@ impl CpuBandwidthProvider {
                 message: format!("Measuring L{level} {name} bandwidth"),
             });
             let payload_sizes: Vec<_> = if matches!(operation, Operation::Copy) {
-                full_payload_sizes.iter().map(|bytes| bytes / 2).collect()
+                full_payload_sizes
+                    .iter()
+                    .map(|bytes| (bytes / 128 * 64).max(64))
+                    .collect()
             } else {
                 full_payload_sizes.clone()
             };
@@ -392,15 +416,12 @@ impl CpuBandwidthProvider {
                 &locations,
                 &payload_sizes,
                 MeasurementOptions {
+                    access: gluj_bench_core::AccessPolicy::from_config(config)?,
                     sample_count: config.samples,
                     target_ns,
                     streaming: false,
                     preparation: CachePreparation::Hot,
-                    byte_multiplier: if matches!(operation, Operation::Copy) {
-                        2
-                    } else {
-                        1
-                    },
+                    byte_multiplier: 1,
                 },
                 cancellation,
             )?;
@@ -419,11 +440,19 @@ impl CpuBandwidthProvider {
         );
         workload_metadata.insert(
             "aggregate_copy_useful_payload_bytes".into(),
-            (aggregate_working_set / 2).to_string(),
+            full_payload_sizes
+                .iter()
+                .map(|bytes| (bytes / 128 * 64).max(64))
+                .sum::<usize>()
+                .to_string(),
         );
         workload_metadata.insert(
             "aggregate_copy_traffic_bytes".into(),
-            aggregate_working_set.to_string(),
+            (2 * full_payload_sizes
+                .iter()
+                .map(|bytes| (bytes / 128 * 64).max(64))
+                .sum::<usize>())
+            .to_string(),
         );
         workload_metadata.insert("access_policy".into(), "temporal".into());
         workload_metadata.insert("cache_state".into(), "preloaded_before_timing".into());
@@ -442,6 +471,7 @@ impl CpuBandwidthProvider {
         );
         workload_metadata.insert("cross_instance_shared_lines".into(), "none".into());
         workload_metadata.insert("buffer_ownership".into(), "pinned_core_first_touch".into());
+        workload_metadata.insert("result_validation".into(), "sampled source integrity and write/copy boundary/interior checks outside timed batches".into());
         workload_metadata.insert("simd_path".into(), simd_path().into());
         workload_metadata.insert("thread_count".into(), locations.len().to_string());
         workload_metadata.insert(
@@ -463,10 +493,7 @@ impl CpuBandwidthProvider {
             }
             .into(),
         );
-        workload_metadata.insert(
-            "copy_byte_definition".into(),
-            "read_plus_write_traffic".into(),
-        );
+        workload_metadata.insert("copy_byte_definition".into(), "useful_payload".into());
         let mut device_metadata = BTreeMap::new();
         device_metadata.insert("cache_level".into(), level.to_string());
         device_metadata.insert(
@@ -478,6 +505,39 @@ impl CpuBandwidthProvider {
             target.descriptor.line_size_bytes.to_string(),
         );
         device_metadata.insert("cache_instances".into(), cache_instances.to_string());
+        workload_metadata.insert(
+            "allocated_test_buffer_bytes".into(),
+            (2 * aggregate_working_set).to_string(),
+        );
+        workload_metadata.extend(gluj_bench_core::AccessPolicy::from_config(config)?.metadata());
+        if gluj_bench_core::AccessPolicy::from_config(config)?.pattern
+            != gluj_bench_core::AccessPattern::Sequential
+        {
+            workload_metadata.insert(
+                "access_order".into(),
+                gluj_bench_core::AccessPolicy::from_config(config)?
+                    .name()
+                    .into(),
+            );
+        }
+        workload_metadata.insert(
+            "bandwidth_kernel_revision".into(),
+            "cpu-bandwidth-3-access-payload".into(),
+        );
+        workload_metadata.insert(
+            "copy_accounting_revision".into(),
+            "useful-payload-plus-logical-traffic-v1".into(),
+        );
+        if let Some(copy) = metrics.iter().find(|m| m.name == "copy").cloned() {
+            let mut traffic = copy;
+            traffic.name = "copy_accounted_read_write".into();
+            traffic.value *= 2.0;
+            traffic.statistics.minimum *= 2.0;
+            traffic.statistics.median *= 2.0;
+            traffic.statistics.maximum *= 2.0;
+            traffic.statistics.standard_deviation *= 2.0;
+            metrics.push(traffic);
+        }
         Ok(BenchmarkResult {
             benchmark_id: format!("cpu.bandwidth.cache.l{level}"),
             device_id: self.cpu_device.id.clone(),
@@ -495,11 +555,124 @@ impl CpuBandwidthProvider {
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
         let topology = self.topology.as_ref().map_err(Clone::clone)?;
+        let mode = config
+            .options
+            .get("dataset_mode")
+            .map(String::as_str)
+            .unwrap_or("automatic");
+        let maximum = if mode == "automatic" {
+            self.ram_payload(topology)
+                .map_err(|e| BenchmarkError::new("benchmark_unavailable", e))? as u64
+        } else {
+            config
+                .options
+                .get("dataset_bytes")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    BenchmarkError::new("invalid_config", "Choose the RAM bandwidth target size.")
+                })?
+        };
+        let cap = (self.available_memory / 16).min(MAX_RAM_PAYLOAD);
+        if maximum < 65536 || maximum > cap {
+            return Err(BenchmarkError::new(
+                "working_set_too_large",
+                format!(
+                    "RAM bandwidth target must be between 64 KiB and {cap} bytes, preserving allocation headroom."
+                ),
+            ));
+        }
+        let maximum = usize::try_from(maximum).map_err(|_| {
+            BenchmarkError::new("working_set_too_large", "Target exceeds address space.")
+        })?;
+        let mut sizes = vec![maximum];
+        if mode == "sweep" {
+            sizes.clear();
+            let mut size = 65536usize;
+            while size < maximum {
+                sizes.push(size);
+                size = size.saturating_mul(2);
+            }
+            sizes.push(maximum);
+        }
+        let mut latest = None;
+        let mut points = Vec::new();
+        let mut elapsed = 0u64;
+        for (index, size) in sizes.iter().copied().enumerate() {
+            let _condition =
+                gluj_bench_core::MeasurementScope::condition(&format!("ram-size-{size}"));
+            progress(ProgressUpdate {
+                fraction: index as f64 / sizes.len() as f64,
+                phase: "dataset".into(),
+                message: format!("RAM bandwidth: {size} payload bytes"),
+            });
+            let result = self.run_memory_size(size, config, cancellation, progress)?;
+            elapsed = elapsed.saturating_add(result.elapsed_ns);
+            if mode == "sweep" {
+                for metric in &result.metrics {
+                    let mut point = metric.clone();
+                    point.name = format!("bytes.{size}.{}", metric.name);
+                    points.push(point);
+                }
+            }
+            latest = Some(result);
+        }
+        let mut result = latest.expect("nonempty size plan");
+        result.elapsed_ns = elapsed;
+        result.metrics.extend(points);
+        result
+            .workload_metadata
+            .insert("dataset_mode".into(), mode.into());
+        result
+            .workload_metadata
+            .insert("requested_dataset_bytes".into(), maximum.to_string());
+        result.workload_metadata.insert(
+            "bandwidth_tested_payload_sizes".into(),
+            sizes
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let llc = topology
+            .caches
+            .iter()
+            .filter(|c| c.level == topology.caches.iter().map(|c| c.level).max().unwrap_or(0))
+            .map(|c| c.size_bytes * c.instances as u64)
+            .sum::<u64>();
+        result.workload_metadata.insert(
+            "working_set_label".into(),
+            if maximum as u64 <= llc {
+                "custom system-memory allocation; cache-sized working set"
+            } else {
+                "system-memory allocation; residency not measured"
+            }
+            .into(),
+        );
+        Ok(result)
+    }
+
+    fn run_memory_size(
+        &self,
+        payload: usize,
+        config: &BenchmarkConfig,
+        cancellation: &CancellationToken,
+        progress: &mut ProgressCallback<'_>,
+    ) -> Result<BenchmarkResult, BenchmarkError> {
+        let topology = self.topology.as_ref().map_err(Clone::clone)?;
         let locations = topology::selected_workers(topology, config, false)?;
-        let payload = self
-            .ram_payload(topology)
-            .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;
-        let target_ns = config.target_duration_ms.saturating_mul(1_000_000) / config.samples as u64;
+        let highest = topology.caches.iter().map(|c| c.level).max().unwrap_or(0);
+        let llc = topology
+            .caches
+            .iter()
+            .filter(|c| c.level == highest)
+            .map(|c| c.size_bytes * c.instances as u64)
+            .sum::<u64>();
+        let preparation = if payload as u64 <= llc {
+            CachePreparation::Hot
+        } else {
+            CachePreparation::Cold
+        };
+        let target_ns = gluj_bench_core::sample_target_ns(config);
         let mut metrics = Vec::new();
         let mut total_elapsed = 0u64;
         for (index, (name, operation)) in [
@@ -521,10 +694,11 @@ impl CpuBandwidthProvider {
                 &locations,
                 payload,
                 MeasurementOptions {
+                    access: gluj_bench_core::AccessPolicy::from_config(config)?,
                     sample_count: config.samples,
                     target_ns,
                     streaming,
-                    preparation: CachePreparation::Cold,
+                    preparation,
                     byte_multiplier: 1,
                 },
                 cancellation,
@@ -550,8 +724,24 @@ impl CpuBandwidthProvider {
         );
         workload_metadata.insert("write_copy_policy".into(), "non_temporal_streaming".into());
         workload_metadata.insert("read_policy".into(), "temporal".into());
-        workload_metadata.insert("cache_state".into(), "flushed_before_each_sweep".into());
-        workload_metadata.insert("cache_flush_method".into(), cold_cache_method().into());
+        workload_metadata.insert(
+            "cache_state".into(),
+            if preparation == CachePreparation::Hot {
+                "preloaded_cache_sized_custom_allocation"
+            } else {
+                "flushed_before_each_sweep"
+            }
+            .into(),
+        );
+        workload_metadata.insert(
+            "cache_flush_method".into(),
+            if preparation == CachePreparation::Hot {
+                "not_flushed"
+            } else {
+                cold_cache_method()
+            }
+            .into(),
+        );
         workload_metadata.insert("access_order".into(), "sequential_rotated_per_sweep".into());
         workload_metadata.insert("preparation_timed".into(), "false".into());
         workload_metadata.insert(
@@ -563,6 +753,7 @@ impl CpuBandwidthProvider {
             (config.target_duration_ms / config.samples as u64).to_string(),
         );
         workload_metadata.insert("buffer_ownership".into(), "pinned_core_first_touch".into());
+        workload_metadata.insert("result_validation".into(), "sampled source integrity and write/copy boundary/interior checks outside timed batches".into());
         workload_metadata.insert("simd_path".into(), simd_path().into());
         workload_metadata.insert("thread_count".into(), locations.len().to_string());
         workload_metadata.insert(
@@ -580,6 +771,35 @@ impl CpuBandwidthProvider {
             "physical_cores".into(),
             topology.physical_cores.len().to_string(),
         );
+        workload_metadata.extend(gluj_bench_core::AccessPolicy::from_config(config)?.metadata());
+        if gluj_bench_core::AccessPolicy::from_config(config)?.pattern
+            != gluj_bench_core::AccessPattern::Sequential
+        {
+            workload_metadata.insert(
+                "access_order".into(),
+                gluj_bench_core::AccessPolicy::from_config(config)?
+                    .name()
+                    .into(),
+            );
+        }
+        workload_metadata.insert(
+            "bandwidth_kernel_revision".into(),
+            "cpu-bandwidth-3-access-payload".into(),
+        );
+        workload_metadata.insert(
+            "copy_accounting_revision".into(),
+            "useful-payload-plus-logical-traffic-v1".into(),
+        );
+        if let Some(copy) = metrics.iter().find(|m| m.name == "copy").cloned() {
+            let mut traffic = copy;
+            traffic.name = "copy_accounted_read_write".into();
+            traffic.value *= 2.0;
+            traffic.statistics.minimum *= 2.0;
+            traffic.statistics.median *= 2.0;
+            traffic.statistics.maximum *= 2.0;
+            traffic.statistics.standard_deviation *= 2.0;
+            metrics.push(traffic);
+        }
         Ok(BenchmarkResult {
             benchmark_id: "cpu.bandwidth.memory".into(),
             device_id: self.memory_device.id.clone(),
@@ -598,6 +818,51 @@ impl Default for CpuBandwidthProvider {
 }
 
 impl BenchmarkProvider for CpuBandwidthProvider {
+    fn conditions(&self) -> Vec<gluj_bench_core::ConditionDescriptor> {
+        self.benchmarks()
+            .iter()
+            .map(|descriptor| {
+                let mut condition = gluj_bench_core::legacy_condition(descriptor);
+                if let Ok(topology) = &self.topology {
+                    for option in &mut condition.options {
+                        if option.key == "cpu_core_limit" {
+                            option.domain = gluj_bench_core::OptionDomain::Integer {
+                                minimum: 0,
+                                maximum: topology.physical_cores.len() as u64,
+                            };
+                        }
+                        if option.key.ends_with("_preset")
+                            && let gluj_bench_core::OptionDomain::Choice { values } = &option.domain
+                        {
+                            for level in 1..=3 {
+                                let preset = format!("l{level}");
+                                if values.contains(&preset) {
+                                    condition
+                                        .capabilities
+                                        .push(gluj_bench_core::ModeCapability {
+                                            when: BTreeMap::from([(option.key.clone(), preset)]),
+                                            supported_device_ids: if topology
+                                                .caches
+                                                .iter()
+                                                .any(|cache| cache.level == level)
+                                            {
+                                                vec![self.cpu_device.id.clone()]
+                                            } else {
+                                                vec![]
+                                            },
+                                            unavailable_reason: format!(
+                                                "L{level} cache topology is unavailable."
+                                            ),
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+                condition
+            })
+            .collect()
+    }
     fn devices(&self) -> Vec<DeviceDescriptor> {
         vec![self.cpu_device.clone(), self.memory_device.clone()]
     }
@@ -649,6 +914,33 @@ impl BenchmarkProvider for CpuBandwidthProvider {
             compute_scaling::cache_previews(&mut integer, topology);
         }
         items.push(integer);
+        for descriptor in &mut items {
+            if gluj_bench_core::cpu_data_mode(&descriptor.id) {
+                if let Ok(topology) = &self.topology {
+                    compute_scaling::cache_previews(descriptor, topology);
+                }
+                descriptor.workload =
+                    "Verified register or configurable buffered CPU workload".into();
+                descriptor
+                    .metadata
+                    .insert("fixed_work_core_experiment".into(), "buffered_only".into());
+            }
+            if gluj_bench_core::cpu_codec(&descriptor.id) {
+                descriptor.unit = "bytes/s".into();
+                descriptor.workload =
+                    "Independent DEFLATE blocks with selected corpus, level and block size".into();
+                descriptor.metadata.insert(
+                    "kernel_revision".into(),
+                    "deflate-independent-blocks-1".into(),
+                );
+            }
+            if descriptor.id == "cpu.performance.prime.sieve" {
+                descriptor.data_type = "integers 2..=selected limit".into();
+                descriptor
+                    .metadata
+                    .insert("kernel_revision".into(), "sieve-configurable-2".into());
+            }
+        }
         items
     }
     fn run(
@@ -658,6 +950,31 @@ impl BenchmarkProvider for CpuBandwidthProvider {
         cancellation: &CancellationToken,
         progress: &mut ProgressCallback<'_>,
     ) -> Result<BenchmarkResult, BenchmarkError> {
+        if benchmark_id == "cpu.performance.single_thread.integer.i64" {
+            let mut canonical = config.clone();
+            canonical
+                .options
+                .insert("cpu_core_limit".into(), "1".into());
+            canonical
+                .options
+                .insert("thread_mode".into(), "physical_cores".into());
+            canonical
+                .options
+                .insert("int64_preset".into(), "register".into());
+            canonical
+                .options
+                .insert("dataset_mode".into(), "register".into());
+            return self.run(
+                "cpu.performance.integer.i64",
+                &canonical,
+                cancellation,
+                progress,
+            );
+        }
+        let measured_config = gluj_bench_core::resolve_measurement_config(config)?;
+        let config = &measured_config;
+        let _measurement_scope = gluj_bench_core::MeasurementScope::enter(config, benchmark_id);
+
         Self::validate(config)?;
         if let Some(level) = cache_latency::level(benchmark_id) {
             return cache_latency::run(
@@ -676,6 +993,16 @@ impl BenchmarkProvider for CpuBandwidthProvider {
                 cancellation,
                 progress,
                 &self.memory_device,
+                self.topology.as_ref().map_err(Clone::clone)?,
+            );
+        }
+        if cpu_workloads::handles(benchmark_id, config) {
+            return cpu_workloads::run(
+                benchmark_id,
+                config,
+                cancellation,
+                progress,
+                &self.cpu_device,
                 self.topology.as_ref().map_err(Clone::clone)?,
             );
         }
@@ -708,7 +1035,6 @@ impl BenchmarkProvider for CpuBandwidthProvider {
                 config,
                 cancellation,
                 progress,
-                topology.representative,
                 &self.cpu_device,
                 topology,
             );
@@ -826,9 +1152,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unstable_sample_counts() {
+    fn rejects_out_of_budget_sample_counts() {
         let config = BenchmarkConfig {
-            samples: 1,
+            samples: 65,
             ..Default::default()
         };
         assert_eq!(
@@ -839,19 +1165,17 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    #[ignore = "runs a short RAM bandwidth benchmark to verify retired size options are ignored"]
-    fn ram_bandwidth_default_payload_smoke() {
+    #[ignore = "runs a short RAM bandwidth custom-size benchmark"]
+    fn ram_bandwidth_custom_payload_smoke() {
         let mut provider = CpuBandwidthProvider::discover();
-        let expected = provider
-            .ram_payload(provider.topology.as_ref().unwrap())
-            .unwrap();
+        let expected = 1024 * 1024;
         let config = BenchmarkConfig {
             target_duration_ms: 150,
             samples: 3,
             options: BTreeMap::from([
                 ("cpu_core_limit".into(), "1".into()),
-                ("ram_bandwidth_mode".into(), "custom".into()),
-                ("ram_bandwidth_bytes".into(), "1".into()),
+                ("dataset_mode".into(), "single".into()),
+                ("dataset_bytes".into(), expected.to_string()),
             ]),
         };
         let result = provider
@@ -878,7 +1202,7 @@ mod tests {
                 .iter()
                 .map(|metric| metric.name.as_str())
                 .collect::<Vec<_>>(),
-            ["read", "write", "copy"]
+            ["read", "write", "copy", "copy_accounted_read_write"]
         );
         assert!(
             result

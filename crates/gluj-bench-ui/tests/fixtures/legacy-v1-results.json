@@ -1,0 +1,1588 @@
+{
+  "version": 1,
+  "results": [
+    {
+      "benchmark_id": "cpu.performance.float.f32",
+      "device_id": "cpu:system",
+      "elapsed_ns": 2000031800,
+      "metrics": [
+        {
+          "name": "throughput",
+          "value": 235551083038.21292,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 233022182653.9862,
+            "median": 235551083038.21292,
+            "maximum": 236264031243.4845,
+            "standard_deviation": 1227641038.4837303
+          }
+        }
+      ],
+      "workload_metadata": {
+        "affinity": "one_worker_per_logical_processor",
+        "aggregate_working_set_bytes": "0",
+        "bound_classification": "compute_bound",
+        "buffer_ownership": "pinned_thread_first_touch",
+        "checksum": "22913176570",
+        "classification_is_inference": "true",
+        "classification_method": "register/compute workload with no streamed working set",
+        "comparison_basis": "lane-level multiply and add operations",
+        "comparison_group": "arithmetic_multiply_add",
+        "cpu_activity_interpretation": "aggregate OS-scheduled thread time; memory stalls still count as running",
+        "cpu_runnable_percent": "99.64",
+        "cpu_worker_percent": "75",
+        "gpu_activity_percent": "75",
+        "harness_revision": "2",
+        "instruction_path": "scalar_f32",
+        "kernel_revision": "4",
+        "large_data_slowdown_percent": "0.00",
+        "memory_sensitivity_ratio": "1.0000",
+        "operation_definition": "scalar multiply and add",
+        "per_thread_working_set_bytes": "0",
+        "probe_duration_ms_per_sample": "250",
+        "probe_samples": "3",
+        "scope": "aggregate_logical_processors",
+        "thread_count": "24",
+        "thread_mode": "logical_processors",
+        "warmup_ms": "200"
+      },
+      "device_metadata": {
+        "saved_component_name": "Legacy fixture CPU",
+        "saved_setup": "legacy-fixture",
+        "saved_at": "1700000000"
+      }
+    },
+    {
+      "benchmark_id": "cpu.performance.avx2.f64_fma",
+      "device_id": "cpu:system",
+      "elapsed_ns": 2000035700,
+      "metrics": [
+        {
+          "name": "throughput",
+          "value": 826751940321.119,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 826235732878.9418,
+            "median": 826751940321.119,
+            "maximum": 826928022127.5796,
+            "standard_deviation": 246563717.675669
+          }
+        }
+      ],
+      "workload_metadata": {
+        "affinity": "one_worker_per_logical_processor",
+        "aggregate_working_set_bytes": "0",
+        "bound_classification": "compute_bound",
+        "buffer_ownership": "pinned_thread_first_touch",
+        "checksum": "9164825241698959360",
+        "classification_is_inference": "true",
+        "classification_method": "register/compute workload with no streamed working set",
+        "comparison_basis": "lane-level multiply and add operations",
+        "comparison_group": "arithmetic_multiply_add",
+        "cpu_activity_interpretation": "aggregate OS-scheduled thread time; memory stalls still count as running",
+        "cpu_runnable_percent": "99.84",
+        "cpu_worker_percent": "75",
+        "gpu_activity_percent": "75",
+        "harness_revision": "2",
+        "instruction_path": "x86_avx2_fma_f64",
+        "kernel_revision": "4",
+        "large_data_slowdown_percent": "0.00",
+        "memory_sensitivity_ratio": "1.0000",
+        "operation_definition": "one floating-point add or multiply (FMA counts as two)",
+        "per_thread_working_set_bytes": "0",
+        "probe_duration_ms_per_sample": "250",
+        "probe_samples": "3",
+        "scope": "aggregate_logical_processors",
+        "thread_count": "24",
+        "thread_mode": "logical_processors",
+        "warmup_ms": "200"
+      },
+      "device_metadata": {
+        "saved_component_name": "Legacy fixture CPU",
+        "saved_setup": "legacy-fixture",
+        "saved_at": "1700000000"
+      }
+    },
+    {
+      "benchmark_id": "cpu.performance.single_thread.integer.i64",
+      "device_id": "cpu:system",
+      "elapsed_ns": 2000012600,
+      "metrics": [
+        {
+          "name": "throughput",
+          "value": 8953102155.876286,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 8847397764.581854,
+            "median": 8953102155.876286,
+            "maximum": 8964822073.972408,
+            "standard_deviation": 44615247.25049615
+          }
+        }
+      ],
+      "workload_metadata": {
+        "bound_classification": "compute_bound",
+        "checksum": "9554465574955670935",
+        "classification_is_inference": "true",
+        "classification_method": "register/compute workload with no streamed working set",
+        "comparison_basis": "lane-level multiply and add operations",
+        "comparison_group": "arithmetic_multiply_add",
+        "cpu_activity_interpretation": "OS-scheduled thread time; memory stalls still count as running",
+        "cpu_runnable_percent": "81.25",
+        "cpu_worker_percent": "75",
+        "gpu_activity_percent": "75",
+        "harness_revision": "2",
+        "instruction_path": "scalar_i64",
+        "kernel_revision": "4",
+        "large_data_slowdown_percent": "0.00",
+        "memory_sensitivity_ratio": "1.0000",
+        "operation_definition": "one 64-bit integer multiply or add",
+        "scope": "single_pinned_thread",
+        "thread_count": "1",
+        "working_set_bytes": "0"
+      },
+      "device_metadata": {
+        "saved_component_name": "Legacy fixture CPU",
+        "saved_setup": "legacy-fixture",
+        "saved_at": "1700000000"
+      }
+    },
+    {
+      "benchmark_id": "cpu.latency.memory",
+      "device_id": "cpu:system",
+      "elapsed_ns": 2313335400,
+      "metrics": [
+        {
+          "name": "read_latency",
+          "value": 111.1198902130127,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 106.7519187927246,
+            "median": 111.1198902130127,
+            "maximum": 114.46764469146729,
+            "standard_deviation": 2.838298399667805
+          }
+        }
+      ],
+      "workload_metadata": {
+        "access_order": "sattolo_random_single_cycle",
+        "cache_state": "full_cycle_warmup_no_flush",
+        "cpu_core_limit": "12",
+        "cpu_worker_percent": "75",
+        "dependent_load_count": "20971520",
+        "detected_aggregate_llc_bytes": "67108864",
+        "gpu_activity_percent": "75",
+        "latency_pattern": "random_objects",
+        "latency_profile_revision": "1",
+        "measurement_scope": "CPU-observed dependent read latency including address translation, loop/timer overhead and OS interference; not DRAM CAS timing or guaranteed isolated NUMA latency",
+        "metric_direction": "lower_is_better",
+        "node_count": "4194304",
+        "node_stride_bytes": "64",
+        "page_policy": "ordinary_allocator_pages",
+        "preparation_timed": "false",
+        "processor_group": "0",
+        "processor_index": "0",
+        "random_seed": "7640891576956012809",
+        "target_duration_ms": "2000",
+        "thread_count": "1",
+        "thread_mode": "single_pinned_core",
+        "working_set_bytes": "268435456"
+      },
+      "device_metadata": {
+        "saved_component_name": "Legacy fixture CPU",
+        "saved_setup": "legacy-fixture",
+        "saved_at": "1700000000"
+      }
+    },
+    {
+      "benchmark_id": "cpu.latency.cache.l1",
+      "device_id": "cpu:system",
+      "elapsed_ns": 2000582800,
+      "metrics": [
+        {
+          "name": "read_latency",
+          "value": 0.9577263621500534,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 0.954765168844642,
+            "median": 0.9577263621500534,
+            "maximum": 0.9620650842621222,
+            "standard_deviation": 0.002333034447586251
+          }
+        }
+      ],
+      "workload_metadata": {
+        "access_order": "sattolo_random_single_cycle",
+        "batch_loads": "65664",
+        "cache_capacity_fraction": "0.750000",
+        "cache_level": "1",
+        "cache_processor_group": "0",
+        "cache_processor_mask": "3",
+        "cache_sharing_logical_processors": "2",
+        "cache_state": "two_full_cycle_warmups_no_flush",
+        "cpu_core_limit": "12",
+        "cpu_worker_percent": "75",
+        "dependent_load_count": "2088180864",
+        "gpu_activity_percent": "75",
+        "latency_profile_revision": "1",
+        "measurement_scope": "Observed cache-sized dependent-read latency; level residency is inferred from topology and working set, not confirmed by hardware counters. Includes translation, prefetch/cache effects, timing/loop overhead and system interference.",
+        "metric_direction": "lower_is_better",
+        "node_count": "384",
+        "node_stride_bytes": "64",
+        "page_policy": "ordinary_allocator_pages",
+        "preceding_cache_bytes": "0",
+        "preparation_timed": "false",
+        "processor_group": "0",
+        "processor_index": "0",
+        "random_seed": "7640891576956012809",
+        "target_cache_bytes": "32768",
+        "target_duration_ms": "2000",
+        "thread_count": "1",
+        "thread_mode": "single_pinned_core",
+        "working_set_bytes": "24576"
+      },
+      "device_metadata": {
+        "saved_component_name": "Legacy fixture CPU",
+        "saved_setup": "legacy-fixture",
+        "saved_at": "1700000000"
+      }
+    },
+    {
+      "benchmark_id": "gpu.performance.fp32.offload.scaling",
+      "device_id": "gpu:legacy-fixture",
+      "elapsed_ns": 17598542600,
+      "metrics": [
+        {
+          "name": "measured_compute_ceiling",
+          "value": 38177224011135.15,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 31834205027045.1,
+            "median": 38177224011135.15,
+            "maximum": 43053000160384.92,
+            "standard_deviation": 4044679580009.219
+          }
+        },
+        {
+          "name": "small_set_compute",
+          "value": 18081885369110.445,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 15200072375745.451,
+            "median": 18081885369110.445,
+            "maximum": 21026900585190.664,
+            "standard_deviation": 2173442471753.1553
+          }
+        },
+        {
+          "name": "working_set_245760.compute",
+          "value": 3879766353112.86,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3869388769790.539,
+            "median": 3879766353112.86,
+            "maximum": 3889411455373.073,
+            "standard_deviation": 6419476237.970584
+          }
+        },
+        {
+          "name": "working_set_245760.bandwidth",
+          "value": 45466011950.54133,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 45344399645.98289,
+            "median": 45466011950.54133,
+            "maximum": 45579040492.653206,
+            "standard_deviation": 75228237.16371863
+          }
+        },
+        {
+          "name": "working_set_491520.compute",
+          "value": 7744649605152.526,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 7477509120814.983,
+            "median": 7744649605152.526,
+            "maximum": 8255149745776.611,
+            "standard_deviation": 276598602019.4714
+          }
+        },
+        {
+          "name": "working_set_491520.bandwidth",
+          "value": 90757612560.38116,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 87627060009.5506,
+            "median": 90757612560.38116,
+            "maximum": 96740036083.31966,
+            "standard_deviation": 3241389867.415676
+          }
+        },
+        {
+          "name": "working_set_1032192.compute",
+          "value": 18081885369110.445,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 15200072375745.451,
+            "median": 18081885369110.445,
+            "maximum": 21026900585190.664,
+            "standard_deviation": 2173442471753.1553
+          }
+        },
+        {
+          "name": "working_set_1032192.bandwidth",
+          "value": 211897094169.26303,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 178125848153.26703,
+            "median": 211897094169.26303,
+            "maximum": 246408991232.7031,
+            "standard_deviation": 25470028965.85728
+          }
+        },
+        {
+          "name": "working_set_2064384.compute",
+          "value": 24570726406591.992,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 24446401332223.15,
+            "median": 24570726406591.992,
+            "maximum": 24639725250960.266,
+            "standard_deviation": 62999176622.05208
+          }
+        },
+        {
+          "name": "working_set_2064384.bandwidth",
+          "value": 287938200077.24994,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 286481265611.99,
+            "median": 287938200077.24994,
+            "maximum": 288746780284.6906,
+            "standard_deviation": 738271601.0396837
+          }
+        },
+        {
+          "name": "working_set_4177920.compute",
+          "value": 17105278298988.645,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 16569601626342.469,
+            "median": 17105278298988.645,
+            "maximum": 17180473634214.158,
+            "standard_deviation": 219437307266.8151
+          }
+        },
+        {
+          "name": "working_set_4177920.bandwidth",
+          "value": 200452480066.27316,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 194175019058.7008,
+            "median": 200452480066.27316,
+            "maximum": 201333675400.94717,
+            "standard_deviation": 2571530944.5329895
+          }
+        },
+        {
+          "name": "working_set_8355840.compute",
+          "value": 3486164320743.215,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3032490024626.063,
+            "median": 3486164320743.215,
+            "maximum": 3726830894428.512,
+            "standard_deviation": 267366462501.88205
+          }
+        },
+        {
+          "name": "working_set_8355840.bandwidth",
+          "value": 40853488133.70955,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 35536992476.08668,
+            "median": 40853488133.70955,
+            "maximum": 43673799544.08412,
+            "standard_deviation": 3133200732.4439287
+          }
+        },
+        {
+          "name": "working_set_16760832.compute",
+          "value": 3311361396608.16,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3201718380942.768,
+            "median": 3311361396608.16,
+            "maximum": 3359695171452.391,
+            "standard_deviation": 58680519120.87525
+          }
+        },
+        {
+          "name": "working_set_16760832.bandwidth",
+          "value": 38805016366.50188,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 37520137276.673065,
+            "median": 38805016366.50188,
+            "maximum": 39371427790.45771,
+            "standard_deviation": 687662333.4477568
+          }
+        },
+        {
+          "name": "working_set_33521664.compute",
+          "value": 3234210993292.6997,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2629856668505.396,
+            "median": 3234210993292.6997,
+            "maximum": 3260252362248.906,
+            "standard_deviation": 291612478715.822
+          }
+        },
+        {
+          "name": "working_set_33521664.bandwidth",
+          "value": 37900910077.64883,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 30818632834.047607,
+            "median": 37900910077.64883,
+            "maximum": 38206082370.10436,
+            "standard_deviation": 3417333734.9510393
+          }
+        },
+        {
+          "name": "working_set_67092480.compute",
+          "value": 3184253973904.048,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2657654188948.3066,
+            "median": 3184253973904.048,
+            "maximum": 3250351561080.6885,
+            "standard_deviation": 262952823728.92957
+          }
+        },
+        {
+          "name": "working_set_67092480.bandwidth",
+          "value": 37315476256.68806,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 31144385026.73797,
+            "median": 37315476256.68806,
+            "maximum": 38090057356.414314,
+            "standard_deviation": 3081478403.073394
+          }
+        },
+        {
+          "name": "working_set_134184960.compute",
+          "value": 3206192666407.461,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2620284798564.7354,
+            "median": 3206192666407.461,
+            "maximum": 3244058100153.4746,
+            "standard_deviation": 240088489443.68677
+          }
+        },
+        {
+          "name": "working_set_134184960.bandwidth",
+          "value": 37572570309.46243,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 30706462483.180492,
+            "median": 37572570309.46243,
+            "maximum": 38016305861.17353,
+            "standard_deviation": 2813536985.668205
+          }
+        },
+        {
+          "name": "working_set_268419072.compute",
+          "value": 3199839924003.241,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2685815848417.656,
+            "median": 3199839924003.241,
+            "maximum": 3236485611298.3335,
+            "standard_deviation": 234893407318.7789
+          }
+        },
+        {
+          "name": "working_set_268419072.bandwidth",
+          "value": 37498124109.41298,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 31474404473.644405,
+            "median": 37498124109.41298,
+            "maximum": 37927565757.40234,
+            "standard_deviation": 2752657117.0169387
+          }
+        },
+        {
+          "name": "working_set_536838144.compute",
+          "value": 2803753273663.801,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2741168476632.248,
+            "median": 2803753273663.801,
+            "maximum": 3237812367954.2,
+            "standard_deviation": 215310711528.1466
+          }
+        },
+        {
+          "name": "working_set_536838144.bandwidth",
+          "value": 32856483675.747665,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 32123068085.534153,
+            "median": 32856483675.747665,
+            "maximum": 37943113686.96328,
+            "standard_deviation": 2523172400.7204685
+          }
+        },
+        {
+          "name": "working_set_1073725440.compute",
+          "value": 3222373129520.1357,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2706820388590.444,
+            "median": 3222373129520.1357,
+            "maximum": 3257479915697.9805,
+            "standard_deviation": 210916031179.94867
+          }
+        },
+        {
+          "name": "working_set_1073725440.bandwidth",
+          "value": 37762185111.56409,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 31720551428.794266,
+            "median": 37762185111.56409,
+            "maximum": 38173592762.08571,
+            "standard_deviation": 2471672240.390024
+          }
+        },
+        {
+          "name": "working_set_2147450880.compute",
+          "value": 3235244071133.684,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2767443383204.4316,
+            "median": 3235244071133.684,
+            "maximum": 3257352528072.911,
+            "standard_deviation": 188726883442.0099
+          }
+        },
+        {
+          "name": "working_set_2147450880.bandwidth",
+          "value": 37913016458.59786,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 32430977146.926937,
+            "median": 37913016458.59786,
+            "maximum": 38172099938.35442,
+            "standard_deviation": 2211643165.336052
+          }
+        },
+        {
+          "name": "working_set_4294950912.compute",
+          "value": 3243806167243.674,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3217884307823.2783,
+            "median": 3243806167243.674,
+            "maximum": 3264826289468.4985,
+            "standard_deviation": 15276539722.47287
+          }
+        },
+        {
+          "name": "working_set_4294950912.bandwidth",
+          "value": 38013353522.3868,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 37709581732.30404,
+            "median": 38013353522.3868,
+            "maximum": 38259683079.70897,
+            "standard_deviation": 179021949.8727308
+          }
+        },
+        {
+          "name": "working_set_8589901824.compute",
+          "value": 3221423771995.4077,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3201676267763.505,
+            "median": 3221423771995.4077,
+            "maximum": 3233194759666.305,
+            "standard_deviation": 11630009866.398342
+          }
+        },
+        {
+          "name": "working_set_8589901824.bandwidth",
+          "value": 37751059828.07118,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 37519643762.85358,
+            "median": 37751059828.07118,
+            "maximum": 37889001089.83951,
+            "standard_deviation": 136289178.1218538
+          }
+        },
+        {
+          "name": "working_set_12884852736.compute",
+          "value": 3155962548785.771,
+          "unit": "operations/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3140021907386.344,
+            "median": 3155962548785.771,
+            "maximum": 3165185809607.8906,
+            "standard_deviation": 8240617056.790083
+          }
+        },
+        {
+          "name": "working_set_12884852736.bandwidth",
+          "value": 36983936118.58325,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 36797131727.18371,
+            "median": 36983936118.58325,
+            "maximum": 37092021206.34247,
+            "standard_deviation": 96569731.13425854
+          }
+        },
+        {
+          "name": "working_set_245760.gpu_execution_time",
+          "value": 5405.356429047301,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 5391.952031978681,
+            "median": 5405.356429047301,
+            "maximum": 5419.853431045969,
+            "standard_deviation": 8.945168673799982
+          }
+        },
+        {
+          "name": "working_set_245760.end_to_end_time",
+          "value": 7672.285143237841,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 7617.321785476349,
+            "median": 7672.285143237841,
+            "maximum": 7867.8214523650895,
+            "standard_deviation": 88.41327969387923
+          }
+        },
+        {
+          "name": "working_set_491520.gpu_execution_time",
+          "value": 5415.744047619048,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 5080.833333333333,
+            "median": 5415.744047619048,
+            "maximum": 5609.226190476191,
+            "standard_deviation": 187.72781266191072
+          }
+        },
+        {
+          "name": "working_set_491520.end_to_end_time",
+          "value": 7768.898809523809,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 7299.330357142857,
+            "median": 7768.898809523809,
+            "maximum": 7843.601190476191,
+            "standard_deviation": 217.52374143888113
+          }
+        },
+        {
+          "name": "working_set_1032192.gpu_execution_time",
+          "value": 4871.194690265486,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 4188.938053097345,
+            "median": 4871.194690265486,
+            "maximum": 5794.734513274337,
+            "standard_deviation": 602.8172072227462
+          }
+        },
+        {
+          "name": "working_set_1032192.end_to_end_time",
+          "value": 7213.6061946902655,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 6143.694690265486,
+            "median": 7213.6061946902655,
+            "maximum": 8346.79203539823,
+            "standard_deviation": 904.0161260938676
+          }
+        },
+        {
+          "name": "working_set_2064384.gpu_execution_time",
+          "value": 7169.538461538462,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 7149.461538461538,
+            "median": 7169.538461538462,
+            "maximum": 7206.0,
+            "standard_deviation": 18.432965067601945
+          }
+        },
+        {
+          "name": "working_set_2064384.end_to_end_time",
+          "value": 10608.846153846154,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 10594.03846153846,
+            "median": 10608.846153846154,
+            "maximum": 10645.192307692309,
+            "standard_deviation": 21.399413806051133
+          }
+        },
+        {
+          "name": "working_set_4177920.gpu_execution_time",
+          "value": 20842.446043165462,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 20751.223021582733,
+            "median": 20842.446043165462,
+            "maximum": 21516.258992805757,
+            "standard_deviation": 275.45288566449966
+          }
+        },
+        {
+          "name": "working_set_4177920.end_to_end_time",
+          "value": 30651.79856115108,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 30611.510791366905,
+            "median": 30651.79856115108,
+            "maximum": 30683.812949640287,
+            "standard_deviation": 23.319786278367644
+          }
+        },
+        {
+          "name": "working_set_8355840.gpu_execution_time",
+          "value": 204531.8620689655,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 191323.8620689655,
+            "median": 204531.8620689655,
+            "maximum": 235130.75862068965,
+            "standard_deviation": 16724.665350153515
+          }
+        },
+        {
+          "name": "working_set_8355840.end_to_end_time",
+          "value": 276655.8620689655,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 259308.27586206896,
+            "median": 276655.8620689655,
+            "maximum": 324230.3448275862,
+            "standard_deviation": 24446.564525873917
+          }
+        },
+        {
+          "name": "working_set_16760832.gpu_execution_time",
+          "value": 431924.3636363637,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 425710.5454545454,
+            "median": 431924.3636363637,
+            "maximum": 446715.6363636363,
+            "standard_deviation": 7798.783293449159
+          }
+        },
+        {
+          "name": "working_set_16760832.end_to_end_time",
+          "value": 585200.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 580676.3636363636,
+            "median": 585200.0,
+            "maximum": 606309.0909090909,
+            "standard_deviation": 9678.103058446806
+          }
+        },
+        {
+          "name": "working_set_33521664.gpu_execution_time",
+          "value": 884455.3846153846,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 877390.7692307692,
+            "median": 884455.3846153846,
+            "maximum": 1087707.6923076925,
+            "standard_deviation": 96691.84559169917
+          }
+        },
+        {
+          "name": "working_set_33521664.end_to_end_time",
+          "value": 1199215.3846153845,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 1192361.5384615385,
+            "median": 1199215.3846153845,
+            "maximum": 1481019.2307692308,
+            "standard_deviation": 132041.00553241724
+          }
+        },
+        {
+          "name": "working_set_67092480.gpu_execution_time",
+          "value": 1797980.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 1761417.142857143,
+            "median": 1797980.0,
+            "maximum": 2154240.0,
+            "standard_deviation": 173594.2832689875
+          }
+        },
+        {
+          "name": "working_set_67092480.end_to_end_time",
+          "value": 2436664.285714286,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 2370171.4285714286,
+            "median": 2436664.285714286,
+            "maximum": 2933900.0,
+            "standard_deviation": 239603.60118754648
+          }
+        },
+        {
+          "name": "working_set_134184960.gpu_execution_time",
+          "value": 3571354.285714286,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 3529668.5714285714,
+            "median": 3571354.285714286,
+            "maximum": 4369925.714285715,
+            "standard_deviation": 325647.3489635997
+          }
+        },
+        {
+          "name": "working_set_134184960.end_to_end_time",
+          "value": 4818471.428571428,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 4795442.857142857,
+            "median": 4818471.428571428,
+            "maximum": 5884028.571428572,
+            "standard_deviation": 423051.0555380248
+          }
+        },
+        {
+          "name": "working_set_268419072.gpu_execution_time",
+          "value": 7158200.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 7077150.0,
+            "median": 7158200.0,
+            "maximum": 8528170.0,
+            "standard_deviation": 614747.9082485763
+          }
+        },
+        {
+          "name": "working_set_268419072.end_to_end_time",
+          "value": 9712250.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 9576000.0,
+            "median": 9712250.0,
+            "maximum": 11464575.0,
+            "standard_deviation": 789438.0269533512
+          }
+        },
+        {
+          "name": "working_set_536838144.gpu_execution_time",
+          "value": 16338880.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 14148500.0,
+            "median": 16338880.0,
+            "maximum": 16711920.0,
+            "standard_deviation": 1105466.2427772274
+          }
+        },
+        {
+          "name": "working_set_536838144.end_to_end_time",
+          "value": 22123650.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 19093250.0,
+            "median": 22123650.0,
+            "maximum": 22569800.0,
+            "standard_deviation": 1492766.0897139914
+          }
+        },
+        {
+          "name": "working_set_1073725440.gpu_execution_time",
+          "value": 28433880.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 28127440.0,
+            "median": 28433880.0,
+            "maximum": 33849520.0,
+            "standard_deviation": 2204410.8642954924
+          }
+        },
+        {
+          "name": "working_set_1073725440.end_to_end_time",
+          "value": 38568300.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 37887700.0,
+            "median": 38568300.0,
+            "maximum": 45629600.0,
+            "standard_deviation": 2927307.873388107
+          }
+        },
+        {
+          "name": "working_set_2147450880.gpu_execution_time",
+          "value": 56641520.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 56257080.0,
+            "median": 56641520.0,
+            "maximum": 66216040.0,
+            "standard_deviation": 3856607.315045699
+          }
+        },
+        {
+          "name": "working_set_2147450880.end_to_end_time",
+          "value": 76242900.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 75454700.0,
+            "median": 76242900.0,
+            "maximum": 88941000.0,
+            "standard_deviation": 5132131.28265441
+          }
+        },
+        {
+          "name": "working_set_4294950912.gpu_execution_time",
+          "value": 112985320.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 112257880.0,
+            "median": 112985320.0,
+            "maximum": 113895480.0,
+            "standard_deviation": 533013.3689280223
+          }
+        },
+        {
+          "name": "working_set_4294950912.end_to_end_time",
+          "value": 151522400.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 150623600.0,
+            "median": 151522400.0,
+            "maximum": 152676600.0,
+            "standard_deviation": 697390.6635451897
+          }
+        },
+        {
+          "name": "working_set_8589901824.gpu_execution_time",
+          "value": 227540680.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 226712280.0,
+            "median": 227540680.0,
+            "maximum": 228944120.0,
+            "standard_deviation": 823655.9873733694
+          }
+        },
+        {
+          "name": "working_set_8589901824.end_to_end_time",
+          "value": 304622500.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 303253900.0,
+            "median": 304622500.0,
+            "maximum": 306248800.0,
+            "standard_deviation": 1086405.2897514813
+          }
+        },
+        {
+          "name": "working_set_12884852736.gpu_execution_time",
+          "value": 348390520.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 347375320.0,
+            "median": 348390520.0,
+            "maximum": 350159160.0,
+            "standard_deviation": 912188.938183313
+          }
+        },
+        {
+          "name": "working_set_12884852736.end_to_end_time",
+          "value": 466002100.0,
+          "unit": "ns",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 464452500.0,
+            "median": 466002100.0,
+            "maximum": 468025700.0,
+            "standard_deviation": 1186847.9370163644
+          }
+        },
+        {
+          "name": "bandwidth_transition_working_set",
+          "value": 8355840.0,
+          "unit": "bytes",
+          "statistics": {
+            "sample_count": 1,
+            "minimum": 8355840.0,
+            "median": 8355840.0,
+            "maximum": 8355840.0,
+            "standard_deviation": 0.0
+          }
+        },
+        {
+          "name": "working_set_245760.host_bandwidth",
+          "value": 34099508962.906,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 34008299734.487167,
+            "median": 34099508962.906,
+            "maximum": 34184280369.489902,
+            "standard_deviation": 56421177.872788966
+          }
+        },
+        {
+          "name": "working_set_491520.host_bandwidth",
+          "value": 68068209420.28587,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 65720295007.16295,
+            "median": 68068209420.28587,
+            "maximum": 72555027062.48975,
+            "standard_deviation": 2431042400.561757
+          }
+        },
+        {
+          "name": "working_set_1032192.host_bandwidth",
+          "value": 158922820626.9473,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 133594386114.95029,
+            "median": 158922820626.9473,
+            "maximum": 184806743424.5273,
+            "standard_deviation": 19102521724.39296
+          }
+        },
+        {
+          "name": "working_set_2064384.host_bandwidth",
+          "value": 215953650057.93744,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 214860949208.9925,
+            "median": 215953650057.93744,
+            "maximum": 216560085213.5179,
+            "standard_deviation": 553703700.7797627
+          }
+        },
+        {
+          "name": "working_set_4177920.host_bandwidth",
+          "value": 150339360049.70486,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 145631264294.0256,
+            "median": 150339360049.70486,
+            "maximum": 151000256550.7104,
+            "standard_deviation": 1928648208.399742
+          }
+        },
+        {
+          "name": "working_set_8355840.host_bandwidth",
+          "value": 30640116100.28216,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 26652744357.06501,
+            "median": 30640116100.28216,
+            "maximum": 32755349658.06309,
+            "standard_deviation": 2349900549.332947
+          }
+        },
+        {
+          "name": "working_set_16760832.host_bandwidth",
+          "value": 29103762274.876408,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 28140102957.5048,
+            "median": 29103762274.876408,
+            "maximum": 29528570842.843285,
+            "standard_deviation": 515746750.0858176
+          }
+        },
+        {
+          "name": "working_set_33521664.host_bandwidth",
+          "value": 28425682558.236614,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 23113974625.535706,
+            "median": 28425682558.236614,
+            "maximum": 28654561777.57827,
+            "standard_deviation": 2563000301.2132797
+          }
+        },
+        {
+          "name": "working_set_67092480.host_bandwidth",
+          "value": 27986607192.516045,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 23358288770.05347,
+            "median": 27986607192.516045,
+            "maximum": 28567543017.310738,
+            "standard_deviation": 2311108802.305045
+          }
+        },
+        {
+          "name": "working_set_134184960.host_bandwidth",
+          "value": 28179427732.096825,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 23029846862.38537,
+            "median": 28179427732.096825,
+            "maximum": 28512229395.88015,
+            "standard_deviation": 2110152739.2511537
+          }
+        },
+        {
+          "name": "working_set_268419072.host_bandwidth",
+          "value": 28123593082.059734,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 23605803355.233303,
+            "median": 28123593082.059734,
+            "maximum": 28445674318.05176,
+            "standard_deviation": 2064492837.762704
+          }
+        },
+        {
+          "name": "working_set_536838144.host_bandwidth",
+          "value": 24642362756.81075,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 24092301064.150616,
+            "median": 24642362756.81075,
+            "maximum": 28457335265.222458,
+            "standard_deviation": 1892379300.5403512
+          }
+        },
+        {
+          "name": "working_set_1073725440.host_bandwidth",
+          "value": 28321638833.673065,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 23790413571.595695,
+            "median": 28321638833.673065,
+            "maximum": 28630194571.56428,
+            "standard_deviation": 1853754180.292518
+          }
+        },
+        {
+          "name": "working_set_2147450880.host_bandwidth",
+          "value": 28434762343.948395,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 24323232860.1952,
+            "median": 28434762343.948395,
+            "maximum": 28629074953.765816,
+            "standard_deviation": 1658732374.002039
+          }
+        },
+        {
+          "name": "working_set_4294950912.host_bandwidth",
+          "value": 28510015141.7901,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 28282186299.228027,
+            "median": 28510015141.7901,
+            "maximum": 28694762309.781727,
+            "standard_deviation": 134266462.4045481
+          }
+        },
+        {
+          "name": "working_set_8589901824.host_bandwidth",
+          "value": 28313294871.053387,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 28139732822.140182,
+            "median": 28313294871.053387,
+            "maximum": 28416750817.37963,
+            "standard_deviation": 102216883.59139034
+          }
+        },
+        {
+          "name": "working_set_12884852736.host_bandwidth",
+          "value": 27737952088.93744,
+          "unit": "bytes/s",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": 27597848795.387787,
+            "median": 27737952088.93744,
+            "maximum": 27819015904.75685,
+            "standard_deviation": 72427298.35069391
+          }
+        },
+        {
+          "name": "working_set_245760.reference_delta",
+          "value": -89.8374843807888,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -89.86466703639333,
+            "median": -89.8374843807888,
+            "maximum": -89.81222035882271,
+            "standard_deviation": 0.016814937188985284
+          }
+        },
+        {
+          "name": "working_set_491520.reference_delta",
+          "value": -79.71395300272842,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -80.41369084710293,
+            "median": -79.71395300272842,
+            "maximum": -78.37676793009143,
+            "standard_deviation": 0.7245120858939242
+          }
+        },
+        {
+          "name": "working_set_1032192.reference_delta",
+          "value": -52.63698229123075,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -60.185496013769765,
+            "median": -52.63698229123075,
+            "maximum": -44.922919018266626,
+            "standard_deviation": 5.6930343367009275
+          }
+        },
+        {
+          "name": "working_set_2064384.reference_delta",
+          "value": -35.64035352747111,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -35.966006001135995,
+            "median": -35.64035352747111,
+            "maximum": -35.45962052198034,
+            "standard_deviation": 0.16501769904400884
+          }
+        },
+        {
+          "name": "working_set_4177920.reference_delta",
+          "value": -55.195070511152025,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -56.59820205494874,
+            "median": -55.195070511152025,
+            "maximum": -54.99810664808125,
+            "standard_deviation": 0.5747859173909864
+          }
+        },
+        {
+          "name": "working_set_8355840.reference_delta",
+          "value": -90.86847089844352,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -92.05680846846911,
+            "median": -90.86847089844352,
+            "maximum": -90.23807783053712,
+            "standard_deviation": 0.7003297631695257
+          }
+        },
+        {
+          "name": "working_set_16760832.reference_delta",
+          "value": -91.32634317350488,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -91.61353800892144,
+            "median": -91.32634317350488,
+            "maximum": -91.199739482178,
+            "standard_deviation": 0.1537055682827015
+          }
+        },
+        {
+          "name": "working_set_33521664.reference_delta",
+          "value": -91.52842806918235,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -93.11145129950164,
+            "median": -91.52842806918235,
+            "maximum": -91.46021627633796,
+            "standard_deviation": 0.7638388758458903
+          }
+        },
+        {
+          "name": "working_set_67092480.reference_delta",
+          "value": -91.65928362686796,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -93.03863950879942,
+            "median": -91.65928362686796,
+            "maximum": -91.48615006650913,
+            "standard_deviation": 0.6887688419991829
+          }
+        },
+        {
+          "name": "working_set_134184960.reference_delta",
+          "value": -91.6018182320634,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -93.13652349945488,
+            "median": -91.6018182320634,
+            "maximum": -91.50263492388216,
+            "standard_deviation": 0.6288788555544536
+          }
+        },
+        {
+          "name": "working_set_268419072.reference_delta",
+          "value": -91.61845836913145,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -92.96487390588094,
+            "median": -91.61845836913145,
+            "maximum": -91.52247001941694,
+            "standard_deviation": 0.6152710507455114
+          }
+        },
+        {
+          "name": "working_set_536838144.reference_delta",
+          "value": -92.6559530026436,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -92.81988529120731,
+            "median": -92.6559530026436,
+            "maximum": -91.5189947624012,
+            "standard_deviation": 0.5639768660637738
+          }
+        },
+        {
+          "name": "working_set_1073725440.reference_delta",
+          "value": -91.5594357290612,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -92.9098553949314,
+            "median": -91.5594357290612,
+            "maximum": -91.46747831967072,
+            "standard_deviation": 0.5524656038857901
+          }
+        },
+        {
+          "name": "working_set_2147450880.reference_delta",
+          "value": -91.52572206352652,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -92.7510617786216,
+            "median": -91.52572206352652,
+            "maximum": -91.46781199407572,
+            "standard_deviation": 0.4943441759593729
+          }
+        },
+        {
+          "name": "working_set_4294950912.reference_delta",
+          "value": -91.50329482757164,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -91.57119358158488,
+            "median": -91.50329482757164,
+            "maximum": -91.44823550157484,
+            "standard_deviation": 0.04001479970889754
+          }
+        },
+        {
+          "name": "working_set_8589901824.reference_delta",
+          "value": -91.56192244083589,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -91.61364831861616,
+            "median": -91.56192244083589,
+            "maximum": -91.53108995372928,
+            "standard_deviation": 0.030463215091296892
+          }
+        },
+        {
+          "name": "working_set_12884852736.reference_delta",
+          "value": -91.73338913309864,
+          "unit": "%",
+          "statistics": {
+            "sample_count": 5,
+            "minimum": -91.77514345602891,
+            "median": -91.73338913309864,
+            "maximum": -91.70923006689878,
+            "standard_deviation": 0.021585165685138717
+          }
+        }
+      ],
+      "workload_metadata": {
+        "adapter_name": "AMD Radeon RX 7900 XTX",
+        "allocated_test_buffer_bytes": "12884852736",
+        "allocation_budget_bytes": "22819670112",
+        "allocation_limit_note": "RAM budget is limited by the host heap and 80% of available RAM, leaving at least 2 GiB and reserving 16 MiB for overhead. Any VRAM region also respects the VRAM budget. Driver storage-buffer limits and alignment cap the total.",
+        "arithmetic_intensity_operations_per_byte": "85.3333",
+        "arithmetic_iterations": "64",
+        "backend": "Vulkan",
+        "bandwidth_transition_retained_ratio": "0.1928",
+        "bandwidth_transition_status": "observed",
+        "bandwidth_transition_working_set_bytes": "8355840",
+        "baseline_operations_per_second": "18081885369110",
+        "byte_definition": "two_16_byte_input_reads_plus_one_16_byte_output_write",
+        "bytes_per_element": "48",
+        "clock_analysis_limit": "Estimate for this workload only. Core and memory clocks were not changed; frequency response, temperatures, power limits, and overclock stability were not measured.",
+        "clock_analysis_revision": "empirical-reference-1",
+        "clock_policy": "vendor_neutral_sustained_preconditioning",
+        "compute_profile_revision": "working-set-sweep-2",
+        "compute_reference_benchmark": "gpu.performance.fp32",
+        "compute_reference_drift_percent": "8.87",
+        "compute_reference_kind": "measured_register_resident; not_theoretical_peak",
+        "compute_reference_selection": "latest_post_sweep",
+        "compute_scaling_points": "245760:3879766353113:45466011951:0.2146,491520:7744649605153:90757612560:0.4283,1032192:18081885369110:211897094169:1.0000,2064384:24570726406592:287938200077:1.3589,4177920:17105278298989:200452480066:0.9460,8355840:3486164320743:40853488134:0.1928,16760832:3311361396608:38805016367:0.1831,33521664:3234210993293:37900910078:0.1789,67092480:3184253973904:37315476257:0.1761,134184960:3206192666407:37572570309:0.1773,268419072:3199839924003:37498124109:0.1770,536838144:2803753273664:32856483676:0.1551,1073725440:3222373129520:37762185112:0.1782,2147450880:3235244071134:37913016459:0.1789,4294950912:3243806167244:38013353522:0.1794,8589901824:3221423771995:37751059828:0.1782,12884852736:3155962548786:36983936119:0.1745",
+        "cpu_worker_percent": "75",
+        "data_type": "fp32",
+        "dataset_mode": "automatic",
+        "device_allocated_test_buffer_bytes": "3221213184",
+        "device_type": "DiscreteGpu",
+        "driver_clock_lock": "false",
+        "execution_backend": "raw-vulkan",
+        "execution_domain": "direct_host_memory_vector_compute",
+        "gpu_activity_percent": "75",
+        "gpu_precondition_ms": "750",
+        "gpu_timing_batch_passes": "245760:1501,491520:1344,1032192:904,2064384:520,4177920:278,8355840:145,16760832:55,33521664:26,67092480:14,134184960:7,268419072:4,536838144:2,1073725440:1,2147450880:1,4294950912:1,8589901824:1,12884852736:1",
+        "gpu_timing_definition": "Lower time is faster for the same dataset and settings. Larger datasets contain more work; use the throughput graph to compare processing rates. GPU execution measures the GPU timestamp interval, including computation and memory stalls. End-to-end measures the full sample on the host, including command recording, submission, completion, result retrieval and intentional GPU activity pauses. Setup, warmup and compute-reference runs are excluded. Both times are divided by the number of full dataset passes in each sample batch. Batch lengths can vary across sizes; inspect the selected dataset for the recorded batch size. These timings do not separate memory stalls from computation.",
+        "gpu_timing_method": "gpu_timestamp_and_host_elapsed_per_pass_v1",
+        "gpu_timing_samples_paired": "true",
+        "host_allocated_test_buffer_bytes": "9663639552",
+        "host_allocation_budget_bytes": "17114752584",
+        "host_memory_placement": "HOST_VISIBLE on a non-DEVICE_LOCAL heap; BAR-mapped VRAM excluded",
+        "host_traffic_definition": "nominal two input reads plus one output write for the RAM region; GPU caches can serve repeated accesses; not measured PCIe bus counters",
+        "largest_compute_delta_percent": "-91.73",
+        "largest_vs_compute_reference_percent": "8.27",
+        "offload_profile_revision": "explicit-host-regions-1",
+        "offload_tier_bytes": "245760:184320:61440,491520:368640:122880,1032192:774144:258048,2064384:1548288:516096,4177920:3133440:1044480,8355840:6266880:2088960,16760832:12570624:4190208,33521664:25141248:8380416,67092480:50319360:16773120,134184960:100638720:33546240,268419072:201314304:67104768,536838144:402628608:134209536,1073725440:805294080:268431360,2147450880:1610588160:536862720,4294950912:3221213184:1073737728,8589901824:6442426368:2147475456,12884852736:9663639552:3221213184",
+        "profile_sample_count_per_tier": "5",
+        "ram_budget_percent": "40",
+        "ram_offload_percent": "75",
+        "result_validation": "first_and_last_output_of_each_region_match_scalar_fp32_fma",
+        "shader_access_width_bytes": "16",
+        "shader_format": "embedded_spirv",
+        "shader_source_language": "GLSL",
+        "tested_tier_count": "17",
+        "timing_domain": "vulkan_gpu_timestamp",
+        "transition_threshold": "two consecutive low-noise tiers below 90 percent of the small-set baseline with no later two-tier recovery",
+        "tuning_guidance": "Suggested tuning: reduce GPU demand by lowering the GPU core-frequency limit in small steps, or by sending smaller batches or fewer concurrent GPU jobs in your application. Change one setting at a time. Keep the dataset, RAM offload share and arithmetic settings fixed when checking a frequency-limit change; aim to retain at least 95% of the original throughput, and restore the previous limit if the loss is larger. Judge smaller batches or reduced concurrency using the application's end-to-end throughput and responsiveness. In this benchmark, a lower GPU activity setting adds idle time between submissions; TOPS excludes those pauses, so an unchanged TOPS value does not prove unchanged completion time. These are exploratory trials: this run does not measure performance after a frequency change, power savings or temperature changes.",
+        "vram_budget_percent": "40",
+        "vulkan_device_uuid": "000000000a0000000000000000000000",
+        "workgroup_size": "256"
+      },
+      "device_metadata": {
+        "saved_component_name": "Legacy fixture GPU",
+        "saved_setup": "legacy-fixture",
+        "saved_at": "1700000000"
+      }
+    }
+  ]
+}

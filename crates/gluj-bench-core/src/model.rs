@@ -69,6 +69,7 @@ pub struct BenchmarkDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BenchmarkConfig {
     pub target_duration_ms: u64,
     pub samples: u32,
@@ -79,8 +80,8 @@ pub struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            target_duration_ms: 2_000,
-            samples: 5,
+            target_duration_ms: 1_500,
+            samples: 6,
             options: BTreeMap::new(),
         }
     }
@@ -123,7 +124,7 @@ pub struct BenchmarkResult {
     pub device_metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[error("{message}")]
 pub struct BenchmarkError {
     pub code: String,

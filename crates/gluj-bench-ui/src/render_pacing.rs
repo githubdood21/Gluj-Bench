@@ -1,5 +1,6 @@
 //! Limit native UI redraws without changing the benchmark worker or its clocks.
 use super::MainWindow;
+use slint::private_unstable_api::re_exports::WindowInner;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
 use slint::{ComponentHandle, Timer, TimerMode};
 use std::{
@@ -58,9 +59,13 @@ pub(super) fn install(window: &MainWindow, worker_busy: impl Fn() -> bool + 'sta
     let timer = Rc::new(Timer::default());
     let origin = Instant::now();
     let weak_window = window.as_weak();
-    window.window().on_winit_window_event(move |_, event| {
+    window.window().on_winit_window_event(move |window, event| {
         match event {
             WindowEvent::RedrawRequested => {
+                // Slint's Fluent widgets derive their accents from this app-local context.
+                // Reapply after native theme notifications can restore the system accent.
+                let context = WindowInner::from_pub(window).context();
+                context.set_accent_color(slint::Color::from_rgb_u8(220, 198, 107));
                 let interval = if worker_busy() {
                     WORKER_BUSY_INTERVAL
                 } else {

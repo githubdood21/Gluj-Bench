@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/githubdood21/Gluj-Bench"
@@ -28,6 +28,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
 
 [profile.dev.package.gluj-bench-cpu]
 opt-level = 3

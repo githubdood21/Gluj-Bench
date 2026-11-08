@@ -1,0 +1,40 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+
+layout(local_size_x_id = 0) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputA { dvec4 values[]; } input_a;
+layout(set = 0, binding = 1, std430) readonly buffer InputB { dvec4 values[]; } input_b;
+layout(set = 0, binding = 2, std430) writeonly buffer Output { dvec4 values[]; } output_data;
+layout(push_constant) uniform Parameters {
+    uint loop_count;
+    uint element_count;
+    uint seed;
+    uint access_mode;
+    uint block_multiplier;
+    uint block_offset;
+    uint lane_multiplier;
+    uint lane_offset;
+} params;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.element_count) return;
+    uint block=index/256u; uint lane=index%256u; uint blocks=params.element_count/256u;
+    if(params.access_mode==1u || params.access_mode==3u) block=(block*params.block_multiplier+params.block_offset)%blocks;
+    if(params.access_mode==2u) block=(block+params.block_offset)%blocks;
+    if(params.access_mode==3u) lane=(lane*params.lane_multiplier+params.lane_offset)&255u;
+    index=block*256u+lane;
+    dvec4 x = input_a.values[index];
+    dvec4 y = input_b.values[index];
+    double perturbation = double((index ^ params.seed) & 255u) * 0.000001lf;
+    dvec4 a0=x+dvec4(perturbation); dvec4 a1=x+dvec4(0.01lf); dvec4 a2=x+dvec4(0.02lf); dvec4 a3=x+dvec4(0.03lf);
+    dvec4 a4=x+dvec4(0.04lf); dvec4 a5=x+dvec4(0.05lf); dvec4 a6=x+dvec4(0.06lf); dvec4 a7=x+dvec4(0.07lf);
+    dvec4 multiplier = y * dvec4(0.000002lf) + dvec4(0.999999lf);
+    for (uint iteration = 0; iteration < params.loop_count; ++iteration) {
+        a0=fma(a0,multiplier,dvec4(0.000001lf)); a1=fma(a1,multiplier,dvec4(0.000002lf));
+        a2=fma(a2,multiplier,dvec4(0.000003lf)); a3=fma(a3,multiplier,dvec4(0.000004lf));
+        a4=fma(a4,multiplier,dvec4(0.000005lf)); a5=fma(a5,multiplier,dvec4(0.000006lf));
+        a6=fma(a6,multiplier,dvec4(0.000007lf)); a7=fma(a7,multiplier,dvec4(0.000008lf));
+    }
+    output_data.values[index] = a0+a1+a2+a3+a4+a5+a6+a7;
+}
