@@ -26,7 +26,7 @@ Repeated observations contribute to a median and an observed range. Variation st
 ## Build your own test plan
 
 <p align="center">
-  <img src="Benchmarks.png" alt="Benchmark families and the checklist of tests in a selected plan" width="1000">
+  <img src="Benchmarks.png" alt="Custom GPU workload settings for shuffled access, a reproducible seed, and a dataset sweep" width="1000">
 </p>
 
 - **Curated** gives you standard coverage across the selected family’s supported variants. The **Tests to run** checklist lets you leave out any test.
