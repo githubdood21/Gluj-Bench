@@ -78,7 +78,7 @@ try {
     Copy-Item -LiteralPath 'assets\branding\loop-chip-g-preview.png' -Destination $LogoDirectory
     Copy-Item -LiteralPath 'LICENSE', 'NOTICE', 'BRANDING.md' -Destination $StageDirectory
     New-Item -ItemType Directory -Path (Join-Path $StageDirectory 'docs') | Out-Null
-    Copy-Item -LiteralPath 'docs\protocol.md', 'docs\implementation-plan.md', 'docs\benchmark-coverage-ledger.md', 'docs\backlog.md', 'docs\release-1.0.md' -Destination (Join-Path $StageDirectory 'docs')
+    Copy-Item -LiteralPath 'docs\protocol.md', 'docs\implementation-plan.md', 'docs\benchmark-coverage-ledger.md', 'docs\backlog.md', 'docs\release-1.0.md', 'docs\user-guide.md' -Destination (Join-Path $StageDirectory 'docs')
     Get-ChildItem -LiteralPath 'docs' -Filter 'phase-*.md' | Copy-Item -Destination (Join-Path $StageDirectory 'docs')
     $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText(

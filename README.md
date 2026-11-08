@@ -54,6 +54,8 @@ TOPS counts the operations defined by the workload. An FMA counts as one multipl
 3. Open **Benchmarks**, choose a family and plan, then review the test checklist and buffer estimate before running.
 4. Open **Benchmark Results** for charts, timestamps, and comparisons. Use **Run history** to inspect saved runs, add notes, or pin a baseline.
 
+The [user guide](docs/user-guide.md) walks through a first run, a custom sweep, and exporting results.
+
 <p align="center">
   <img src="SysInfo.png" alt="System Information showing detected processor, memory capacity, memory data bus, and GPU" width="1000">
 </p>
