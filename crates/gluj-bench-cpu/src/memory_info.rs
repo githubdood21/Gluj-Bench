@@ -122,7 +122,7 @@ fn parse(mut data: &[u8]) -> BTreeMap<String, String> {
                     complete = false;
                     break;
                 };
-                for device in devices.chunks_exact(3) {
+                for device in devices.as_chunks::<3>().0 {
                     if topology
                         .insert(word(device, 1).unwrap(), word(channel, 2).unwrap())
                         .is_some()

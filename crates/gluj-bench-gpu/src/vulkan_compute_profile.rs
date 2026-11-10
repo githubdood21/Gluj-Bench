@@ -1219,8 +1219,8 @@ fn access_parameters(
         (seed >> 32) as u32,
     ];
     let mut bytes = [0; 32];
-    for (word, out) in words.iter().zip(bytes.chunks_exact_mut(4)) {
-        out.copy_from_slice(&word.to_le_bytes());
+    for (word, out) in words.iter().zip(bytes.as_chunks_mut::<4>().0) {
+        *out = word.to_le_bytes();
     }
     bytes
 }
