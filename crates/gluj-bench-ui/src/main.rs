@@ -24,6 +24,7 @@ slint::include_modules!();
 
 const HARDWARE_METADATA_CACHE_VERSION: u32 = 34;
 
+mod benchmark_setup;
 mod chart_hover;
 #[cfg(test)]
 mod configuration_tests;
@@ -53,6 +54,7 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     App::wire(&window, &app);
     App::wire_presentation(&window, &app);
+    App::wire_benchmark_setup(&window, &app);
     app.borrow_mut().request_startup_check();
     App::refresh(&window, &app.borrow());
     app.borrow_mut().ui_dirty = false;
@@ -385,7 +387,7 @@ impl Default for BenchmarkPreferences {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct QueuedRun {
     benchmark_id: String,
     settings: AppSettings,
@@ -1346,7 +1348,7 @@ impl App {
             active_plan: None,
             history: phase_eight::HistoryState::default(),
             result_observations: presentation::observations::ResultObservations::default(),
-            presentation: presentation::State::default(),
+            presentation: presentation::State::builder(),
             primary_selection: 0,
             continue_after_cancel: false,
             run_overrides: BTreeMap::new(),
@@ -1640,6 +1642,9 @@ impl App {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.select_suite(suite.as_str());
+                app.presentation.scope = 1;
+                app.presentation.single_test = true;
+                app.presentation.clear_test_selection();
                 if let Some(window) = navigation_window.upgrade() {
                     App::refresh_benchmark_panel(&window, &app);
                 }
@@ -1651,6 +1656,13 @@ impl App {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.select_gpu(index);
+                let selected_gpu = app.selected_gpu_id.clone();
+                for run in &mut app.custom_plan {
+                    if run.benchmark_id.starts_with("gpu.") {
+                        run.gpu_id = selected_gpu.clone();
+                    }
+                }
+                app.presentation.clear_test_selection();
                 if let Some(window) = navigation_window.upgrade() {
                     App::refresh_benchmark_panel(&window, &app);
                 }
@@ -1752,6 +1764,7 @@ impl App {
         window.on_select_supported_preset(move |index| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
+                app.begin_custom_edit();
                 if let Some(id) = app.selected.clone() {
                     let settings = app
                         .run_overrides
@@ -1771,6 +1784,7 @@ impl App {
         window.on_edit_access_text(move |field, text| {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
+                app.begin_custom_edit();
                 if app.active_request.is_none()
                     && let Some(id) = app.selected.clone()
                     && let Some(local) = app.run_overrides.get_mut(&id)
@@ -2044,12 +2058,42 @@ impl App {
             return;
         }
         let id = self.selected.as_deref().unwrap_or(CPU_VECTOR_ID).to_owned();
-        if !configurable_compute(&id) {
-            return;
-        }
         self.run_overrides.remove(&id);
         self.vector_choices.remove(&id);
         self.persist_benchmark_preferences();
+    }
+    fn begin_custom_edit(&mut self) {
+        if self.active_request.is_some() {
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let compute = configurable_compute(&id);
+        if !self.run_overrides.contains_key(&id) || (compute && self.compute_choice(&id) == 0) {
+            // Start with the settings currently displayed, including computed dataset limits.
+            let settings = self.effective_settings(&id).unwrap_or_else(|_| {
+                self.run_overrides
+                    .get(&id)
+                    .map(|config| config.settings.clone())
+                    .unwrap_or_else(|| self.settings.clone())
+            });
+            let dataset_text = self
+                .run_overrides
+                .get(&id)
+                .map(|config| config.dataset_text.clone())
+                .unwrap_or_else(|| self.dataset_text.clone());
+            self.run_overrides.insert(
+                id.clone(),
+                TestOverride {
+                    settings,
+                    dataset_text,
+                },
+            );
+        }
+        if compute && self.vector_choices.get(&id) == Some(&0) {
+            self.vector_choices.insert(id, 1);
+        }
     }
     #[cfg(test)]
     fn vector_choice(&self) -> usize {
@@ -2351,6 +2395,7 @@ impl App {
         if self.active_request.is_some() || !position.is_finite() {
             return;
         }
+        self.begin_custom_edit();
         let Some(id) = self.selected.clone() else {
             return;
         };
@@ -2374,6 +2419,9 @@ impl App {
     fn edit_configuration(&mut self, local: bool, field: &str, index: i32) {
         if self.active_request.is_some() || index < 0 {
             return;
+        }
+        if local {
+            self.begin_custom_edit();
         }
         let cores = self.physical_core_count();
         let selected_tile = self
@@ -2467,6 +2515,9 @@ impl App {
     fn edit_dataset(&mut self, local: bool, text: String) {
         if self.active_request.is_some() {
             return;
+        }
+        if local {
+            self.begin_custom_edit();
         }
         let valid = text
             .trim()
@@ -2665,7 +2716,11 @@ impl App {
             }
         };
         let options = config.options;
-        match self.worker.send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": "run", "arguments": {"benchmark_id": benchmark_id, "target_duration_ms": config.target_duration_ms, "samples": config.samples, "options": options}})) { Ok(()) => { self.active_request = Some(id); self.progress = 0.; self.progress_message = format!("Starting {benchmark_id}: {} samples per condition", config.samples); self.status = "Benchmark running…".into(); }, Err(problem) => { self.abort_plan_start(problem); } }
+        let template_id = self
+            .active_plan
+            .as_ref()
+            .and_then(|plan| plan.id.strip_prefix("template:"));
+        match self.worker.send(json!({"protocol": PROTOCOL_VERSION, "id": id, "command": "run", "arguments": {"benchmark_id": benchmark_id, "target_duration_ms": config.target_duration_ms, "samples": config.samples, "options": options, "template_id": template_id}})) { Ok(()) => { self.active_request = Some(id); self.progress = 0.; self.progress_message = format!("Starting {benchmark_id}: {} samples per condition", config.samples); self.status = "Benchmark running…".into(); }, Err(problem) => { self.abort_plan_start(problem); } }
         self.persist_plan_status();
     }
     fn run_selected(&mut self) {
@@ -2926,6 +2981,7 @@ impl App {
         Self::refresh_benchmark_list(window, app);
         Self::refresh_benchmark_details(window, app);
         Self::refresh_results(window, app);
+        Self::refresh_benchmark_setup(window, app);
     }
     fn refresh_benchmark_panel(window: &MainWindow, app: &Self) {
         Self::refresh_configuration(window, app);
@@ -2933,6 +2989,7 @@ impl App {
         Self::refresh_gpu_selector(window, app);
         Self::refresh_benchmark_list(window, app);
         Self::refresh_benchmark_details(window, app);
+        Self::refresh_benchmark_setup(window, app);
     }
     fn cached_result_row(&self, result: &BenchmarkResult) -> ResultRow {
         let index = self
@@ -2979,10 +3036,14 @@ impl App {
                 .into(),
         );
         let selected_id = app.selected.as_deref().unwrap_or("");
+        window.set_large_template_available(
+            configurable_compute(selected_id)
+                || gluj_bench_core::gpu_memory(selected_id)
+                || gluj_bench_core::gpu_transfer(selected_id)
+                || selected_id == CPU_RAM_BANDWIDTH_ID,
+        );
         let local = app.run_overrides.get(selected_id);
-        if window.get_configuration_test_id().as_str() != selected_id
-            || window.get_test_override_enabled() != local.is_some()
-        {
+        if window.get_configuration_test_id().as_str() != selected_id {
             window.set_configuration_scroll_offset(0.0);
         }
         window.set_configuration_test_id(selected_id.into());
@@ -3110,7 +3171,8 @@ impl App {
             .set_test_is_cpu(selected_id.starts_with("cpu.") || selected_id.starts_with("memory."));
         window.set_test_is_gpu(selected_id.starts_with("gpu."));
         window.set_test_is_scaling(
-            selected_id.ends_with(".scaling")
+            configurable_compute(selected_id)
+                || selected_id.ends_with(".scaling")
                 || matches!(
                     selected_id,
                     CPU_ASCII_ID | CPU_INT64_ID | CPU_RAM_BANDWIDTH_ID
@@ -3126,12 +3188,14 @@ impl App {
         window.set_test_is_int64(selected_id == CPU_INT64_ID);
         window.set_test_vector_choice_index(app.compute_choice(selected_id) as i32);
         window.set_test_vector_can_reset(
-            app.compute_choice(selected_id) != compute_default_choice(selected_id)
+            (configurable_compute(selected_id)
+                && app.compute_choice(selected_id) != compute_default_choice(selected_id))
                 || app.run_overrides.contains_key(selected_id),
         );
         window.set_test_vector_legacy(settings.vector_preset == 0);
         window.set_test_vector_register(
-            register_arithmetic(selected_id) && settings.vector_preset == 1,
+            (register_arithmetic(selected_id) || configurable_gpu_compute(selected_id))
+                && settings.vector_preset == 1,
         );
         window.set_test_vector_custom(settings.vector_preset == 6);
         if app.active_request.is_none() {
@@ -3320,6 +3384,72 @@ impl App {
         );
         let effective = app.queued_run(selected_id).map(|run| run.settings);
         window.set_test_configuration_valid(effective.is_ok());
+        let mut defaults = app.settings.clone();
+        if configurable_compute(selected_id) {
+            defaults.access_fresh = false;
+            defaults.access_ensemble = false;
+            defaults.access_seed = gluj_bench_core::DEFAULT_ACCESS_SEED.to_string();
+            defaults.gpu_matrix_traversal = 0;
+            if gpu_offload(selected_id) {
+                defaults.offload_traffic_mode = Some(2);
+                defaults.offload_passes_per_second = 100;
+            }
+        }
+        let advanced_changes = [
+            window.get_test_is_cpu() && settings.cpu_intensity != defaults.cpu_intensity,
+            window.get_test_is_gpu() && settings.gpu_intensity != defaults.gpu_intensity,
+            window.get_test_has_ram() && settings.ram_budget_percent != defaults.ram_budget_percent,
+            window.get_test_is_gpu()
+                && window.get_test_is_scaling()
+                && !window.get_test_vector_register()
+                && (!window.get_test_is_offload() || settings.ram_offload_percent != 100)
+                && settings.vram_budget_percent != defaults.vram_budget_percent,
+            (window.get_test_is_cpu()
+                || window.get_test_is_gpu_vector()
+                || window.get_test_is_gpu_memory()
+                || window.get_test_is_transfer()
+                || window.get_test_is_gpu_matrix())
+                && settings.sustained_mode != defaults.sustained_mode,
+            window.get_has_seed_control() && settings.access_fresh != defaults.access_fresh,
+            window.get_has_seed_control()
+                && !settings.access_fresh
+                && settings.access_seed != defaults.access_seed,
+            window.get_has_seed_control() && settings.access_ensemble != defaults.access_ensemble,
+            window.get_has_block_control() && settings.access_block != defaults.access_block,
+            window.get_test_is_codec() && settings.codec_block != defaults.codec_block,
+            window.get_test_is_matrix()
+                && settings.matrix_shape != 0
+                && settings.matrix_reuse != defaults.matrix_reuse,
+            window.get_test_is_matrix()
+                && settings.matrix_shape != 0
+                && settings.matrix_block != defaults.matrix_block,
+            window.get_test_is_gpu_memory()
+                && (settings.memory_operation == 0 || settings.memory_operation == 3)
+                && settings.memory_copy_path != defaults.memory_copy_path,
+            window.get_test_is_transfer() && settings.staging_buffers != defaults.staging_buffers,
+            window.get_test_is_transfer()
+                && settings.transfer_submission != defaults.transfer_submission,
+            window.get_test_is_transfer()
+                && settings.transfer_submission == 0
+                && settings.transfer_batch != defaults.transfer_batch,
+            window.get_test_is_gpu_matrix()
+                && !window.get_test_vector_register()
+                && settings.gpu_matrix_reuse != defaults.gpu_matrix_reuse,
+            window.get_test_is_gpu_matrix()
+                && !window.get_test_vector_register()
+                && settings.gpu_matrix_traversal != defaults.gpu_matrix_traversal,
+            window.get_test_is_offload() && settings.traffic_mode() != defaults.traffic_mode(),
+            window.get_test_is_offload()
+                && settings.traffic_mode() == 1
+                && settings.offload_dynamic_mib_per_second
+                    != defaults.offload_dynamic_mib_per_second,
+            window.get_test_is_offload()
+                && settings.traffic_mode() == 2
+                && settings.offload_passes_per_second != defaults.offload_passes_per_second,
+        ];
+        window.set_custom_advanced_count(
+            advanced_changes.iter().filter(|changed| **changed).count() as i32,
+        );
         window.set_test_configuration_summary(
             match effective {
                 Ok(settings) if configurable_compute(selected_id) && app.compute_choice(selected_id) == 0 => {
@@ -4863,8 +4993,8 @@ fn overview_device(device: &DeviceDescriptor) -> (String, Vec<DeviceFact>, Vec<S
                 badges.push("Cache topology detected".into());
             }
             ("Your system's calculation engine. Explore compute throughput and the path from cache to RAM.".into(),
-                vec![fact("PHYSICAL CORES", property("physical_cores")), fact("LOGICAL THREADS", property("logical_processors")),
-                    fact("TOTAL L3 CACHE", if l3 > 0 { format_binary_size(l3 as f64) } else { "Not reported".into() })], badges)
+                vec![fact("Physical cores", property("physical_cores")), fact("Logical threads", property("logical_processors")),
+                    fact("Total L3 cache", if l3 > 0 { format_binary_size(l3 as f64) } else { "Not reported".into() })], badges)
         }
         DeviceCategory::Memory => {
             let installed = device
@@ -4874,11 +5004,11 @@ fn overview_device(device: &DeviceDescriptor) -> (String, Vec<DeviceFact>, Vec<S
                 .is_some_and(|value| value > 0);
             let mut facts = vec![
                 if installed {
-                    fact("INSTALLED MEMORY", bytes("installed_bytes"))
+                    fact("Installed memory", bytes("installed_bytes"))
                 } else {
-                    fact("OS-VISIBLE MEMORY", bytes("total_bytes"))
+                    fact("OS-visible memory", bytes("total_bytes"))
                 },
-                fact("AVAILABLE AT SCAN", bytes("available_bytes_at_discovery")),
+                fact("Available at scan", bytes("available_bytes_at_discovery")),
             ];
             let channel_count = device
                 .properties
@@ -4893,7 +5023,7 @@ fn overview_device(device: &DeviceDescriptor) -> (String, Vec<DeviceFact>, Vec<S
             if let Some((count, width)) = channel_count.zip(channel_width) {
                 let bits = u32::from(count) * u32::from(width);
                 facts.push(fact(
-                    "MEMORY DATA BUS",
+                    "Memory data bus",
                     format!("{bits}-bit ({count} × {width}-bit)"),
                 ));
             }
@@ -4925,7 +5055,7 @@ fn overview_device(device: &DeviceDescriptor) -> (String, Vec<DeviceFact>, Vec<S
                 badges.push("See capability details".into());
             }
             ("Parallel compute and memory throughput for graphics and AI workloads. Badges show detected hardware support; individual tests check runner availability.".into(),
-                vec![fact(if device.properties.get("device_type").is_some_and(|s| s == "IntegratedGpu") { "SHARED GPU MEMORY" } else { "GRAPHICS MEMORY" }, bytes("device_local_memory_bytes")), fact("DEVICE TYPE", kind), fact("COMPUTE API", property("backend"))], badges)
+                vec![fact(if device.properties.get("device_type").is_some_and(|s| s == "IntegratedGpu") { "Shared GPU memory" } else { "Graphics memory" }, bytes("device_local_memory_bytes")), fact("Device type", kind), fact("Compute API", property("backend"))], badges)
         }
     }
 }
@@ -6567,7 +6697,7 @@ fn scaling_chart_interactive(
     let height = if include_bandwidth { 420 } else { 200 };
     let axis_bottom = if include_bandwidth { 352.0 } else { 146.0 };
     let mut svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="{height}" viewBox="0 0 900 {height}"><rect width="900" height="{height}" rx="10" fill="#222129"/>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="{height}" viewBox="0 0 900 {height}"><rect width="900" height="{height}" rx="10" fill="#1c1b21"/>"##,
     );
     let mut labels = Vec::new();
     let mut hover_points = Vec::new();
@@ -6786,7 +6916,7 @@ fn scaling_chart_interactive(
             }
         }
         if let Some(reference) = reference.filter(|_| !bandwidth) {
-            writeln!(svg, r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#d99aab" stroke-width="1.5" stroke-dasharray="6 5"/>"##, y(reference.value)).unwrap();
+            writeln!(svg, r##"<line x1="110" x2="870" y1="{0:.2}" y2="{0:.2}" stroke="#aca5e3" stroke-width="1.5" stroke-dasharray="6 5"/>"##, y(reference.value)).unwrap();
             labels.push(label(
                 650.0,
                 (y(reference.value) - 22.0) as f32,
@@ -6807,7 +6937,7 @@ fn scaling_chart_interactive(
                     "Compute reference".into()
                 },
                 13.0,
-                "#d99aab",
+                "#aca5e3",
                 2,
             ));
         }

@@ -202,6 +202,44 @@ pub(super) fn fixture() -> App {
 }
 
 #[test]
+fn first_custom_edit_preserves_displayed_settings_and_reset_restores_defaults() {
+    let mut app = fixture();
+    app.selected = Some(CPU_VECTOR_ID.into());
+    let globals = app.settings.clone();
+    let before = app.effective_settings(CPU_VECTOR_ID).unwrap();
+    assert!(!app.run_overrides.contains_key(CPU_VECTOR_ID));
+    app.edit_configuration(true, "cpu", 0);
+    let mut expected = before;
+    expected.cpu_intensity = 0;
+    assert_eq!(app.effective_settings(CPU_VECTOR_ID).unwrap(), expected);
+    assert_eq!(app.settings, globals);
+    let queued = app.queued_run(CPU_VECTOR_ID).unwrap();
+    app.edit_configuration(true, "cpu", 2);
+    assert_eq!(queued.settings.cpu_intensity, 0);
+    let mut restored = fixture();
+    restored.restore_benchmark_preferences(app.snapshot_benchmark_preferences());
+    assert_eq!(
+        restored.effective_settings(CPU_VECTOR_ID).unwrap(),
+        app.effective_settings(CPU_VECTOR_ID).unwrap()
+    );
+    app.reset_vector_configuration();
+    assert!(!app.run_overrides.contains_key(CPU_VECTOR_ID));
+    assert_eq!(app.compute_choice(CPU_VECTOR_ID), 0);
+
+    app.selected = Some("cpu.bandwidth.memory".into());
+    app.edit_configuration(true, "access", 1);
+    assert_eq!(
+        app.run_overrides["cpu.bandwidth.memory"]
+            .settings
+            .access_pattern,
+        1
+    );
+    assert_eq!(app.settings, globals);
+    app.reset_vector_configuration();
+    assert!(!app.run_overrides.contains_key("cpu.bandwidth.memory"));
+}
+
+#[test]
 fn saved_scaling_configurations_restore_all_distinct_rows() {
     let path = std::env::temp_dir().join(format!(
         "scaling-results-{}.json",
@@ -3167,11 +3205,11 @@ fn memory_overview_distinguishes_firmware_installed_from_os_visible_capacity() {
         .properties
         .insert("installed_bytes".into(), (40_u64 << 30).to_string());
     let (_, facts, _) = overview_device(&device);
-    assert_eq!(facts[0].label, "INSTALLED MEMORY");
+    assert_eq!(facts[0].label, "Installed memory");
     assert_eq!(facts[0].value, format_binary_size((40_u64 << 30) as f64));
     device.properties.remove("installed_bytes");
     let (_, facts, _) = overview_device(&device);
-    assert_eq!(facts[0].label, "OS-VISIBLE MEMORY");
+    assert_eq!(facts[0].label, "OS-visible memory");
     assert_eq!(facts[0].value, format_binary_size((39_u64 << 30) as f64));
     assert_eq!(facts.len(), 2);
     let mut before = BenchmarkResult {

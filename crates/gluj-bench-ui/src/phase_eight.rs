@@ -1009,15 +1009,20 @@ impl App {
         self.persist_plan_status();
         self.ui_dirty = true;
     }
-    fn run_task(&mut self, task: &str) {
+    pub(super) fn run_task(&mut self, task: &str) {
         if self.active_request.is_some() {
             return;
         }
         let plan = match task {
             "compare" => self.prepare_plan(self.custom_plan.clone(), "configuration-comparison"),
-            "cpu" => {
+            "cpu" | "compute" => {
                 let old = self.selected_suite.clone();
-                self.selected_suite = "cpu.performance".into();
+                self.selected_suite = if task == "compute" && old.starts_with("gpu.") {
+                    "gpu.performance"
+                } else {
+                    "cpu.performance"
+                }
+                .into();
                 let p = self.curated_plan(None);
                 self.selected_suite = old;
                 p

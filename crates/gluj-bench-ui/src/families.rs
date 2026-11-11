@@ -332,10 +332,7 @@ impl App {
     pub(super) fn capability_details(&self) -> String {
         self.benchmarks
             .iter()
-            .filter(|b| {
-                b.suite_id == self.selected_suite
-                    && (implementation_detail(&b.id) || !self.benchmark_available(b))
-            })
+            .filter(|b| b.suite_id == self.selected_suite && !self.benchmark_available(b))
             .map(|b| {
                 format!(
                     "{}: {}",
@@ -420,10 +417,18 @@ impl App {
         candidates: Vec<QueuedRun>,
         label: &str,
     ) -> Result<PreparedPlan, String> {
+        self.prepare_plan_with_measurement(candidates, label, self.settings.shorter_run)
+    }
+    pub(super) fn prepare_plan_with_measurement(
+        &self,
+        candidates: Vec<QueuedRun>,
+        label: &str,
+        shorter_run: bool,
+    ) -> Result<PreparedPlan, String> {
         let mut runs = VecDeque::new();
         let mut conditions: Vec<SuiteCondition> = Vec::new();
         for mut run in candidates {
-            run.settings.shorter_run = self.settings.shorter_run;
+            run.settings.shorter_run = shorter_run;
             let b = self
                 .benchmarks
                 .iter()
@@ -577,6 +582,13 @@ impl App {
         None
     }
     pub(super) fn curated_plan(&self, family: Option<&str>) -> Result<PreparedPlan, String> {
+        self.curated_plan_with_settings(family, &self.settings)
+    }
+    pub(super) fn curated_plan_with_settings(
+        &self,
+        family: Option<&str>,
+        defaults: &AppSettings,
+    ) -> Result<PreparedPlan, String> {
         let mut candidates = Vec::new();
         let mut descriptors: Vec<_> = self
             .benchmarks
@@ -606,7 +618,7 @@ impl App {
                 _ => false,
             });
             for cores in counts {
-                let mut settings = self.settings.clone();
+                let mut settings = defaults.clone();
                 settings.cpu_core_limit = cores;
                 settings.codec_corpus = 1;
                 settings.codec_size = 1;
@@ -713,7 +725,11 @@ impl App {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        self.prepare_plan(supported, family.unwrap_or(&self.selected_suite))
+        self.prepare_plan_with_measurement(
+            supported,
+            family.unwrap_or(&self.selected_suite),
+            defaults.shorter_run,
+        )
     }
     pub(super) fn begin_plan(&mut self, plan: Result<PreparedPlan, String>) {
         if !self.worker.online() {
@@ -766,4 +782,4 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -52,6 +52,34 @@ fn recorded_response(request_id: &str, record: &RunRecord) -> Value {
     response
 }
 
+fn tag_template(record: &mut RunRecord, template: Option<&str>) {
+    let Some((id, version)) = template
+        .filter(|value| value.len() <= 128)
+        .and_then(|value| value.rsplit_once('@'))
+    else {
+        return;
+    };
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || version
+            .parse::<u32>()
+            .ok()
+            .is_none_or(|version| version == 0)
+    {
+        return;
+    }
+    if let Some(result) = &mut record.result {
+        result
+            .workload_metadata
+            .insert("template_id".into(), id.into());
+        result
+            .workload_metadata
+            .insert("template_version".into(), version.into());
+    }
+}
+
 #[derive(Clone)]
 struct ActiveRun {
     request_id: String,
@@ -174,6 +202,9 @@ fn stdio_host() -> io::Result<()> {
                 benchmark_id,
                 config,
             } => {
+                let template_id = value["arguments"]["template_id"]
+                    .as_str()
+                    .map(str::to_owned);
                 let mut current = active.lock().expect("active lock");
                 if current.is_some() {
                     let _ = output.send(error_response(
@@ -201,11 +232,12 @@ fn stdio_host() -> io::Result<()> {
                     let mut progress = |update| {
                         let _ = output.send(progress_response(&request_id, &update));
                     };
-                    let result = registry
+                    let mut result = registry
                         .lock()
                         .expect("registry lock")
                         .get_or_insert_with(build_registry)
                         .run_recorded(&benchmark_id, &config, &cancellation, &mut progress);
+                    tag_template(&mut result, template_id.as_deref());
                     let response = recorded_response(&request_id, &result);
                     let mut current = active.lock().expect("active lock");
                     if current
@@ -452,6 +484,34 @@ fn cli_config(arguments: &[String]) -> Result<BenchmarkConfig, String> {
 mod tests {
     use super::*;
     use gluj_bench_core::BenchmarkProvider;
+
+    #[test]
+    fn template_identity_is_attached_before_native_record_storage() {
+        let mut record = RunRecord::start("test", &BenchmarkConfig::default(), vec![]);
+        record.result = Some(gluj_bench_core::BenchmarkResult {
+            benchmark_id: "test".into(),
+            device_id: "device".into(),
+            elapsed_ns: 1,
+            metrics: vec![],
+            workload_metadata: Default::default(),
+            device_metadata: Default::default(),
+        });
+        tag_template(&mut record, Some("gpu.vector.peak@1"));
+        let metadata = &record.result.as_ref().unwrap().workload_metadata;
+        assert_eq!(metadata["template_id"], "gpu.vector.peak");
+        assert_eq!(metadata["template_version"], "1");
+        let saved = metadata.clone();
+        for invalid in [
+            None,
+            Some("no-version"),
+            Some("test@0"),
+            Some("test@bad"),
+            Some("test/injected@1"),
+        ] {
+            tag_template(&mut record, invalid);
+            assert_eq!(record.result.as_ref().unwrap().workload_metadata, saved);
+        }
+    }
 
     #[test]
     fn operation_rates_use_millions_instead_of_giga_prefixes() {

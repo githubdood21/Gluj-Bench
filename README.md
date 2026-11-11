@@ -29,9 +29,9 @@ Repeated observations contribute to a median and an observed range. Variation st
   <img src="Benchmarks.png" alt="Custom GPU workload settings for shuffled access, a reproducible seed, and a dataset sweep" width="1000">
 </p>
 
-- **Curated** gives you standard coverage across the selected family’s supported variants. The **Tests to run** checklist lets you leave out any test.
-- **Custom** lets you tune the supported controls for each workload and queue configurations together. Choose precision, CPU core count, GPU adapter, dataset size, access pattern, and memory placement where available.
-- **Scaling** can use an automatic allocation budget, sweep up to a chosen size, or measure one size. Optional seeded access patterns vary locality and cache turnover. Curated runs use standard access.
+- **Ready-to-run templates** provide complete, versioned experiments for the selected hardware. Run an experiment directly or copy its settings into the custom builder.
+- **Custom tests** let you choose workload, precision, data placement, CPU core count, dataset size, and access pattern where supported. The shared GPU adapter selector applies to templates and custom tests. **Build a batch** combines saved configurations.
+- **Scaling** can use an automatic allocation budget, sweep up to a chosen size, or measure one size. Optional seeded access patterns vary locality and cache turnover. Templates use standard access.
 - **Shorter run** reduces the sampling budget. The default takes at least six observations per measured condition. Setup, reference measurements, sweeps, and validation add to the displayed minimum time.
 
 While a queue is active, **Cancel test** stops the current test and **Stop all tests** clears the rest of the queue.
@@ -51,7 +51,7 @@ TOPS counts the operations defined by the workload. An FMA counts as one multipl
 
 1. Download the Windows x64 ZIP from [GitHub Releases](https://github.com/githubdood21/Gluj-Bench/releases).
 2. Extract the ZIP into a writable folder and launch `gluj-bench-ui.exe`. Keep `gluj-bench-worker.exe` in the same folder.
-3. Open **Benchmarks**, choose a family and plan, then review the test checklist and buffer estimate before running.
+3. Open **Benchmarks**, choose a category and hardware, then click **Run** on an experiment row or configure a test in the **Custom test** panel.
 4. Open **Benchmark Results** for charts, timestamps, and comparisons. Use **Run history** to inspect saved runs, add notes, or pin a baseline.
 
 The [user guide](docs/user-guide.md) walks through a first run, a custom sweep, and exporting results.

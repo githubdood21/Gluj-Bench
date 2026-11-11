@@ -8,6 +8,7 @@ pub(super) mod observations;
 #[derive(Default)]
 pub(super) struct State {
     pub scope: usize,
+    pub single_test: bool,
     latest_batch: Option<String>,
     batch_sequence: u64,
     query: String,
@@ -18,6 +19,18 @@ pub(super) struct State {
     pub hardware_query: String,
 }
 impl State {
+    pub(super) fn builder() -> Self {
+        Self {
+            scope: 1,
+            single_test: true,
+            ..Default::default()
+        }
+    }
+    pub(super) fn clear_test_selection(&mut self) {
+        self.query.clear();
+        self.excluded_tests.clear();
+        self.expanded_tests.clear();
+    }
     pub(super) fn begin_result_batch(&mut self) {
         self.batch_sequence = self.batch_sequence.wrapping_add(1);
         self.latest_batch = Some(format!(
@@ -326,7 +339,7 @@ impl App {
             self.selected_family()
                 .ok_or_else(|| "Select a test.".into())
                 .and_then(|family| self.curated_plan(Some(family)))
-        } else if !self.custom_plan.is_empty() {
+        } else if !self.presentation.single_test && !self.custom_plan.is_empty() {
             self.prepare_plan(self.custom_plan.clone(), "custom")
         } else {
             self.selected
@@ -460,6 +473,7 @@ impl App {
         });
     }
     pub(super) fn refresh_presentation(window: &MainWindow, app: &Self) {
+        window.set_batch_builder(!app.presentation.single_test);
         window.set_plan_scope(app.presentation.scope as i32);
         window.set_queue_filter_index(app.presentation.queue_filter as i32);
         if app.active_request.is_none() {
@@ -471,6 +485,7 @@ impl App {
             window.set_plan_valid(plan.as_ref().is_ok_and(|p| !p.runs.is_empty()));
             window.set_plan_error(plan.as_ref().err().cloned().unwrap_or_default().into());
             let total = base.as_ref().map(|p| p.runs.len()).unwrap_or(0);
+            window.set_plan_filter_visible(total > 6 || !app.presentation.query.is_empty());
             let selected = plan.as_ref().map(|p| p.runs.len()).unwrap_or(0);
             let mut facts = plan.as_ref().map(plan_facts).unwrap_or_else(|_| {
                 vec![

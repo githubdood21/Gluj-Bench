@@ -4,20 +4,31 @@
 
 1. Extract the Windows x64 ZIP into a writable folder. Open `gluj-bench-ui.exe` with `gluj-bench-worker.exe` alongside it.
 2. Wait for **Engine ready**. **System Information** shows the hardware and capabilities the app detected.
-3. Open **Benchmarks**, choose a category and family, then select **Curated**. Review **Tests to run** and uncheck any tests you want to skip.
-4. Click **Run curated**. The plan shows minimum measurement time and estimated test buffers. Preparation, calibration, and dataset sweeps can add time.
+3. Open **Benchmarks**, choose a category, and select the GPU adapter where applicable. The adapter selector applies to both templates and custom tests.
+4. Choose a row in **Experiments** and click **Run**. Each template supplies its own workload, precision coverage, dataset policy, and extensive measurement settings. Rows show the minimum measurement time. Preparation, calibration, and sweeps can add time.
 5. Open **Benchmark Results** and click a result row. Use the component picker to switch between CPU and GPU results.
 
 During a run, **Cancel test** stops the active test and leaves the remaining queue in place. **Stop all tests** also clears the pending queue. Available observations from a cancelled test can be inspected in Run History.
 
-## Configure a custom sweep
+## Configure a custom test
 
-1. Choose **Custom** and pick the workload variant you want to measure. For GPU workloads, select the adapter under **Target hardware**.
-2. Enable **Customize settings** or the per-test override where offered. Controls depend on the workload and can include CPU cores, precision, access order, memory placement, and activity target.
-3. For a supported compute workload, choose a buffered preset and **Sweep to target** to measure a range of dataset sizes. Use **One dataset** to focus on a single size. The plan summary helps you check buffer requirements.
-4. Click **Add to list** to queue that configuration with others. Review the checklist, then click **Run custom**. An empty custom list runs the currently configured test.
+1. Choose the category and hardware at the top of **Benchmarks**. Use the **Custom test** panel on the right.
+2. Select a **Workload**. For GPU performance, choose **Vector** or **Matrix**, then choose a supported **Precision** and **Data placement**. Registers measure compute throughput. GPU memory and supported system-RAM paths expose dataset controls.
+3. Choose **One dataset** or **Sweep to target**, then set the size. Workload-specific options, such as matrix tiles, appear where applicable.
+4. Open **Advanced** for measurement duration, seeds, activity targets, allocation budgets, and execution settings. Its count shows fields that differ from defaults. **Back** returns to setup, and **Reset** restores the selected test's defaults.
+5. Review the buffer estimate and click **Run custom test**. **Shorter run** reduces observations for custom tests.
 
-Sequential access is the standard choice. Custom workloads can use randomized access where supported. A fixed seed lets you reproduce the same access order. **Shorter run** reduces the number and duration of observations.
+An experiment's **Customize** action copies its settings into the builder. Templates covering several configurations populate a batch. Template **Run** uses the template's fixed definition, independently of the custom form and its **Shorter run** setting. Saved template results include a template ID and version.
+
+## Build a batch
+
+Enable **Build a batch**, configure a test, and click **Add current test**. Change the workload, precision, or settings and add the next test. Each added entry keeps its own configuration while you edit. Review **Planned tests**, uncheck entries to skip, and click **Run batch**.
+
+**List actions** contains comparison and clearing. Turning off **Build a batch** returns to a single test and retains the list for later. Selecting another GPU adapter applies that adapter to GPU entries in the batch, with compatibility checked before running.
+
+**Unsupported operations** lists unavailable modes for the selected category and device. For supported CPU workloads, **Compare CPU core counts** opens the fixed-work comparison.
+
+Sequential access is the standard choice. Custom workloads offer randomized access where supported. A fixed seed in **Advanced** reproduces the access order.
 
 ## Read the results
 
@@ -30,7 +41,7 @@ Sequential access is the standard choice. Custom workloads can use randomized ac
 
 On a compute sweep, the horizontal axis shows dataset size. Hover a point to see its exact value and click it to copy the value. A dashed line marks the compute reference when available. A percentage beside the graph shows the measured drop at the largest dataset when that comparison applies.
 
-Compare matching workloads, precision, sizes, and settings. Use **Compare with** to choose a saved baseline. For per-dataset data and individual observations, open **Benchmark details & measurements**.
+Compare matching workloads, precision, sizes, and settings. Use **Compare with** to choose a saved baseline. For per-dataset data and individual observations, open **Details & measurements**.
 
 ## Keep and share measurements
 

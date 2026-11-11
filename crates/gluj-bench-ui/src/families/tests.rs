@@ -1,7 +1,7 @@
 use super::*;
 use crate::configuration_tests::fixture;
 
-fn catalogue() -> App {
+pub(crate) fn catalogue() -> App {
     let mut app = fixture();
     let cpu = DeviceDescriptor {
         id: "cpu:system".into(),
@@ -88,6 +88,57 @@ fn catalogue() -> App {
         .collect();
     app
 }
+#[test]
+fn compute_templates_follow_the_selected_cpu_or_gpu_category() {
+    let mut app = catalogue();
+    for (suite, prefix) in [
+        ("gpu.performance", "gpu."),
+        ("gpu.bandwidth", "gpu."),
+        ("cpu.performance", "cpu."),
+        ("cpu.bandwidth", "cpu."),
+    ] {
+        app.selected_suite = suite.into();
+        app.run_task("compute");
+        assert!(!app.custom_plan.is_empty(), "{}", app.status);
+        assert!(
+            app.custom_plan
+                .iter()
+                .all(|run| run.benchmark_id.starts_with(prefix)),
+            "{suite} prepared a template for another processor"
+        );
+        assert_eq!(app.selected_suite, suite);
+        assert_eq!(app.presentation.scope, 1);
+    }
+}
+
+#[test]
+fn unsupported_operations_exclude_supported_modes_and_other_categories() {
+    let mut app = catalogue();
+    app.selected_suite = "gpu.performance".into();
+    let fp8 = app
+        .benchmarks
+        .iter_mut()
+        .find(|benchmark| benchmark.id == "gpu.performance.matrix.fp8")
+        .unwrap();
+    fp8.available = true;
+    fp8.unavailable_reason.clear();
+    let details = app.capability_details();
+    assert!(
+        !details
+            .lines()
+            .any(|line| line.starts_with("gpu.performance.matrix.fp8:"))
+    );
+    assert!(details.contains("runner pending"));
+    assert!(!details.contains("cpu."));
+    app.selected_gpu_id = Some("gpu:unsupported".into());
+    assert!(
+        app.capability_details()
+            .contains("unsupported on selected device")
+    );
+    app.selected_suite = "cpu.performance".into();
+    assert!(app.capability_details().is_empty());
+}
+
 #[test]
 fn fifteen_family_cards_preserve_all_implemented_catalogue_destinations() {
     let mut app = catalogue();
