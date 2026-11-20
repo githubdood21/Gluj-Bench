@@ -9,6 +9,15 @@ pub(super) mod observations;
 pub(super) struct State {
     pub scope: usize,
     pub single_test: bool,
+    pub editing_saved_test: Option<String>,
+    pub editor_test_name: Option<String>,
+    pub editor_shorter_run: Option<bool>,
+    pub saved_test_status: String,
+    pub set_selected: bool,
+    pub curated_set: Option<String>,
+    pub test_editor: bool,
+    pub editing_test: Option<usize>,
+    pub inspecting_test: Option<usize>,
     latest_batch: Option<String>,
     batch_sequence: u64,
     query: String,
@@ -132,14 +141,89 @@ pub(super) fn fact(label: &str, value: impl Into<String>) -> DeviceFact {
 pub(super) fn friendly(value: &str) -> String {
     value.replace('_', " ")
 }
+pub(super) fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.is_ascii() {
+        let nb = needle.as_bytes();
+        haystack
+            .as_bytes()
+            .windows(nb.len())
+            .any(|window| window.eq_ignore_ascii_case(nb))
+    } else {
+        haystack.to_lowercase().contains(&needle.to_lowercase())
+    }
+}
+
+pub(super) fn matches_pair_query(key: &str, value: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    if contains_ignore_ascii_case(key, query) || contains_ignore_ascii_case(value, query) {
+        return true;
+    }
+    query.split_whitespace().all(|term| {
+        contains_ignore_ascii_case(key, term) || contains_ignore_ascii_case(value, term)
+    })
+}
+
+pub(super) fn clamp_display_text(value: &str, max_chars: usize, max_lines: usize) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let max_chars = max_chars.max(1);
+    let max_lines = max_lines.max(1);
+    if value.len() <= max_chars && value.bytes().filter(|b| *b == b'\n').count() < max_lines {
+        return value.to_owned();
+    }
+    let mut lines = 1usize;
+    let mut cutoff = None;
+    for (chars, (idx, ch)) in value.char_indices().enumerate() {
+        if chars >= max_chars {
+            cutoff = Some(idx);
+            break;
+        }
+        if ch == '\n' {
+            if lines >= max_lines {
+                cutoff = Some(idx);
+                break;
+            }
+            lines += 1;
+        }
+    }
+    let Some(end) = cutoff else {
+        return value.to_owned();
+    };
+    let prefix = value[..end].trim_end();
+    if max_lines <= 1 {
+        format!("{prefix} … (truncated; {} bytes)", value.len())
+    } else {
+        format!("{prefix}\n… (truncated; {} bytes)", value.len())
+    }
+}
+
+pub(super) fn bounded_fact(label: &str, value: &str) -> DeviceFact {
+    fact(label, clamp_display_text(value, 240, 4))
+}
+
 pub(super) fn technical_fact(label: &str, value: &str) -> DeviceFact {
     fact(
         label,
         if value.len() > 180 {
-            format!(
-                "Recorded payload · {} characters · Native JSON",
-                value.chars().count()
-            )
+            if value.len() > 65_536 {
+                format!(
+                    "Recorded payload · {} KiB · Native JSON",
+                    value.len().div_ceil(1024)
+                )
+            } else {
+                format!(
+                    "Recorded payload · {} characters · Native JSON",
+                    value.chars().count()
+                )
+            }
         } else {
             value.to_owned()
         },
@@ -177,7 +261,7 @@ fn test_details(c: &SuiteCondition, row: &ConditionRow) -> Vec<DeviceFact> {
         fact("Observations", c.condition.policy.samples.to_string()),
     ]
 }
-fn condition_row(c: &SuiteCondition, index: usize, app: &App) -> ConditionRow {
+pub(super) fn condition_row(c: &SuiteCondition, index: usize, app: &App) -> ConditionRow {
     let descriptor = app
         .benchmarks
         .iter()
@@ -335,6 +419,19 @@ pub(super) fn plan_facts(plan: &families::PreparedPlan) -> Vec<DeviceFact> {
 }
 impl App {
     fn presentation_base_plan(&self) -> Result<families::PreparedPlan, String> {
+        if self.presentation.set_selected {
+            if self.presentation.curated_set.is_some() {
+                return self.selected_curated_plan();
+            }
+            if !self.presentation.test_editor {
+                return self.prepare_set_plan(self.custom_plan.clone(), "custom");
+            }
+            return self
+                .selected
+                .as_deref()
+                .ok_or("Choose a workload".into())
+                .and_then(|id| self.configured_plan(id));
+        }
         if self.presentation.scope == 0 {
             self.selected_family()
                 .ok_or_else(|| "Select a test.".into())
@@ -375,7 +472,7 @@ impl App {
         plan.suite.conditions = tests;
         Ok(plan)
     }
-    fn presentation_plan(&self) -> Result<families::PreparedPlan, String> {
+    pub(super) fn presentation_plan(&self) -> Result<families::PreparedPlan, String> {
         self.select_presentation_tests(self.presentation_base_plan()?)
     }
     fn set_presentation_test_enabled(&mut self, index: usize, enabled: bool) {
@@ -416,7 +513,7 @@ impl App {
             if let Some(a) = weak.upgrade() {
                 let mut a = a.borrow_mut();
                 a.presentation.scope = index.clamp(0, 1) as usize;
-                a.ui_dirty = true;
+                a.dirty.presentation = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -424,7 +521,7 @@ impl App {
             if let Some(a) = weak.upgrade() {
                 let mut a = a.borrow_mut();
                 a.presentation.query = query.to_string();
-                a.ui_dirty = true;
+                a.dirty.presentation = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -435,20 +532,31 @@ impl App {
                     "run" => {
                         let plan = a.presentation_plan();
                         a.begin_plan(plan);
+                        a.ui_dirty = true;
                     }
-                    "include" => a.set_presentation_test_enabled(index.max(0) as usize, true),
-                    "exclude" => a.set_presentation_test_enabled(index.max(0) as usize, false),
-                    "details" => a.toggle_presentation_details(index.max(0) as usize),
+                    "include" => {
+                        a.set_presentation_test_enabled(index.max(0) as usize, true);
+                        a.dirty.presentation = true;
+                    }
+                    "exclude" => {
+                        a.set_presentation_test_enabled(index.max(0) as usize, false);
+                        a.dirty.presentation = true;
+                    }
+                    "details" => {
+                        a.toggle_presentation_details(index.max(0) as usize);
+                        a.dirty.presentation = true;
+                    }
                     "remove"
                         if a.presentation.scope == 1
                             && !a.custom_plan.is_empty()
                             && a.active_request.is_none() =>
                     {
                         a.custom_plan.remove(index.max(0) as usize);
+                        a.dirty.presentation = true;
+                        a.dirty.setup = true;
                     }
                     _ => {}
                 }
-                a.ui_dirty = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -457,10 +565,11 @@ impl App {
                 let mut a = a.borrow_mut();
                 if kind == "hardware" {
                     a.presentation.hardware_query = text.to_string();
+                    a.dirty.devices = true;
                 } else {
                     a.presentation.technical_query = text.to_string();
+                    a.dirty.result_technical = true;
                 }
-                a.ui_dirty = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -468,7 +577,7 @@ impl App {
             if let Some(a) = weak.upgrade() {
                 let mut a = a.borrow_mut();
                 a.presentation.queue_filter = index.max(0) as usize;
-                a.ui_dirty = true;
+                a.dirty.presentation = true;
             }
         });
     }
@@ -483,7 +592,13 @@ impl App {
                 .map_err(Clone::clone)
                 .and_then(|base| app.select_presentation_tests(base.clone()));
             window.set_plan_valid(plan.as_ref().is_ok_and(|p| !p.runs.is_empty()));
-            window.set_plan_error(plan.as_ref().err().cloned().unwrap_or_default().into());
+            window.set_plan_error(
+                plan.as_ref()
+                    .err()
+                    .map(|error| clamp_display_text(error, 1200, 12))
+                    .unwrap_or_default()
+                    .into(),
+            );
             let total = base.as_ref().map(|p| p.runs.len()).unwrap_or(0);
             window.set_plan_filter_visible(total > 6 || !app.presentation.query.is_empty());
             let selected = plan.as_ref().map(|p| p.runs.len()).unwrap_or(0);
@@ -516,15 +631,20 @@ impl App {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let query = app.presentation.query.to_lowercase();
-            rows.retain(|r| {
-                format!(
-                    "{} {} {} {} {}",
-                    r.group, r.title, r.mode, r.dataset, r.target
-                )
-                .to_lowercase()
-                .contains(&query)
-            });
+            let query = app.presentation.query.trim();
+            if !query.is_empty() {
+                rows.retain(|r| {
+                    [
+                        r.group.as_str(),
+                        r.title.as_str(),
+                        r.mode.as_str(),
+                        r.dataset.as_str(),
+                        r.target.as_str(),
+                    ]
+                    .iter()
+                    .any(|field| contains_ignore_ascii_case(field, query))
+                });
+            }
             rows.sort_by(|a, b| {
                 a.group
                     .cmp(&b.group)
@@ -837,5 +957,113 @@ mod tests {
         let mut current = plan.suite.conditions[0].clone();
         current.status = CompletionStatus::Running;
         assert_eq!(condition_row(&current, 51, &app).action, "Cancel test");
+    }
+
+    #[test]
+    fn clamp_display_text_caps_characters_and_lines() {
+        assert_eq!(clamp_display_text("short text", 20, 2), "short text");
+        let long_single = "a".repeat(50);
+        let clipped_line = clamp_display_text(&long_single, 10, 1);
+        assert!(clipped_line.starts_with("aaaaaaaaaa … (truncated; 50 bytes)"));
+        let multiline = "line 1\nline 2\nline 3\nline 4";
+        let clipped_lines = clamp_display_text(multiline, 200, 2);
+        assert_eq!(clipped_lines, "line 1\nline 2\n… (truncated; 27 bytes)");
+        let fact_row = bounded_fact("Error", &long_single);
+        assert_eq!(fact_row.label.as_str(), "Error");
+        assert_eq!(fact_row.value.as_str(), long_single);
+        let huge_fact = bounded_fact("Error", &"x".repeat(400));
+        assert!(huge_fact.value.as_str().contains("truncated; 400 bytes"));
+    }
+
+    #[test]
+    fn technical_fact_summarizes_medium_and_huge_payloads() {
+        let short = technical_fact("Driver", "24.10.1");
+        assert_eq!(short.value.as_str(), "24.10.1");
+
+        let medium = "é".repeat(100);
+        assert_eq!(medium.len(), 200);
+        let medium_fact = technical_fact("Blob", &medium);
+        assert_eq!(
+            medium_fact.value.as_str(),
+            "Recorded payload · 100 characters · Native JSON"
+        );
+
+        let huge = "x".repeat(65_537);
+        let huge_fact = technical_fact("Large blob", &huge);
+        assert_eq!(
+            huge_fact.value.as_str(),
+            "Recorded payload · 65 KiB · Native JSON"
+        );
+    }
+
+    #[test]
+    fn ascii_case_insensitive_search_matches_keys_and_values() {
+        assert!(contains_ignore_ascii_case("Vulkan PCIe 4.0 x16", ""));
+        assert!(contains_ignore_ascii_case(
+            "Vulkan PCIe 4.0 x16",
+            "pcie 4.0"
+        ));
+        assert!(!contains_ignore_ascii_case("short", "longer needle"));
+        assert!(matches_pair_query("Adapter link", "Gen4 x16", "GEN4"));
+        assert!(matches_pair_query("Adapter link", "Gen4 x16", "link"));
+        assert!(!matches_pair_query("Adapter link", "Gen4 x16", "Gen5"));
+    }
+
+    #[test]
+    #[ignore = "headless scoped-dirty and cache-preservation check, run separately"]
+    fn headless_detail_and_history_search_preserve_result_presentations() {
+        use slint::Model;
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        struct Headless(Rc<MinimalSoftwareWindow>);
+        impl slint::platform::Platform for Headless {
+            fn create_window_adapter(
+                &self,
+            ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+        let adapter = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(Headless(adapter))).unwrap();
+        let window = MainWindow::new().unwrap();
+        let mut state = fixture();
+        state.results.push(BenchmarkResult {
+            benchmark_id: "cpu.performance.float.f32".into(),
+            device_id: "cpu:fixture".into(),
+            elapsed_ns: 100,
+            metrics: vec![Metric {
+                name: "throughput".into(),
+                value: 1.0,
+                unit: "operations/s".into(),
+                statistics: Default::default(),
+            }],
+            workload_metadata: BTreeMap::from([("access_pattern".into(), "sequential".into())]),
+            device_metadata: BTreeMap::from([("driver_version".into(), "24.12.1".into())]),
+        });
+        let app = Rc::new(RefCell::new(state));
+        App::wire(&window, &app);
+        App::wire_presentation(&window, &app);
+        App::wire_phase_eight(&window, &app);
+        App::refresh(&window, &app.borrow());
+        assert_eq!(app.borrow().result_presentations.borrow().len(), 1);
+        {
+            let mut app = app.borrow_mut();
+            app.ui_dirty = false;
+            app.dirty = Default::default();
+        }
+
+        window.invoke_detail_search("hardware".into(), "missing".into());
+        window.invoke_detail_search("result".into(), "24.12".into());
+        window.invoke_search_history("cpu".into());
+        {
+            let app = app.borrow();
+            assert!(!app.ui_dirty);
+            assert!(app.dirty.devices);
+            assert!(app.dirty.result_technical);
+            assert!(app.dirty.history);
+        }
+
+        App::flush_dirty(&window, &app);
+        assert_eq!(app.borrow().result_presentations.borrow().len(), 1);
+        assert_eq!(window.get_result_technical().row_count(), 1);
     }
 }

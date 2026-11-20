@@ -16,6 +16,10 @@ const MIB: u64 = 1024 * 1024;
 pub(super) const SEED: u64 = 0x6a09_e667_f3bc_c909;
 const CHUNK: usize = 8192;
 
+pub(crate) fn sample_progress_fraction(sample: u32, total_samples: u32) -> f64 {
+    0.1 + 0.9 * f64::from(sample) / f64::from(total_samples.max(1))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pattern {
     RandomObjects,
@@ -357,11 +361,7 @@ pub fn run(
         (system.available_memory() / 16).min(1024 * MIB),
     )?;
     let access = gluj_bench_core::AccessPolicy::from_config(config)?;
-    let locality = config
-        .options
-        .get("locality_block_bytes")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(LOCAL_BYTES);
+    let locality = locality_block_bytes(config)?;
     let location = topology.representative;
     let _affinity = AffinityGuard::pin(location)?;
     progress(ProgressUpdate {
@@ -391,7 +391,8 @@ pub fn run(
     let mut elapsed_total = 0u64;
     let mut loads_total = 0u64;
     let mut pacer = crate::pacing::CpuPacer::current(cancellation);
-    for sample in 0..config.samples * access.realizations {
+    let total_samples = config.samples * access.realizations;
+    for sample in 0..total_samples {
         let realization = sample / config.samples;
         if sample > 0 && sample.is_multiple_of(config.samples) {
             chain = Chain::new_seeded(
@@ -407,13 +408,13 @@ pub fn run(
         }
         let observation_started = Instant::now();
         progress(ProgressUpdate {
-            fraction: 0.1 + 0.9 * f64::from(sample) / f64::from(config.samples),
+            fraction: sample_progress_fraction(sample, total_samples),
             phase: "sample".into(),
             message: format!(
                 "{}: sample {} of {}",
                 pattern.name(),
                 sample + 1,
-                config.samples
+                total_samples
             ),
         });
         let mut elapsed = 0u64;
@@ -657,6 +658,25 @@ mod tests {
     }
 }
 
+pub(super) fn locality_block_bytes(config: &BenchmarkConfig) -> Result<usize, BenchmarkError> {
+    let bytes = config
+        .options
+        .get("locality_block_bytes")
+        .map(|s| s.parse::<usize>())
+        .transpose()
+        .map_err(|_| {
+            BenchmarkError::new("invalid_config", "Invalid latency locality_block_bytes.")
+        })?
+        .unwrap_or(LOCAL_BYTES);
+    if !(64..=1_048_576).contains(&bytes) {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Latency locality_block_bytes must be between 64 and 1048576.",
+        ));
+    }
+    Ok(bytes)
+}
+
 pub(super) fn latency_bytes(
     config: &BenchmarkConfig,
     default: usize,
@@ -709,5 +729,27 @@ mod seed_regressions {
             ..Default::default()
         };
         assert!(latency_bytes(&config, 4096, 64, 8192).is_err());
+
+        let invalid_locality = BenchmarkConfig {
+            options: BTreeMap::from([("locality_block_bytes".into(), "not_a_number".into())]),
+            ..Default::default()
+        };
+        assert!(locality_block_bytes(&invalid_locality).is_err());
+
+        let out_of_range_locality = BenchmarkConfig {
+            options: BTreeMap::from([("locality_block_bytes".into(), "32".into())]),
+            ..Default::default()
+        };
+        assert!(locality_block_bytes(&out_of_range_locality).is_err());
+
+        let valid_locality = BenchmarkConfig {
+            options: BTreeMap::from([("locality_block_bytes".into(), "4096".into())]),
+            ..Default::default()
+        };
+        assert_eq!(locality_block_bytes(&valid_locality).unwrap(), 4096);
+
+        let total_samples = 6 * 3;
+        assert!((sample_progress_fraction(0, total_samples) - 0.1).abs() < 1e-12);
+        assert!(sample_progress_fraction(total_samples - 1, total_samples) < 1.0);
     }
 }

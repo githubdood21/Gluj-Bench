@@ -14,3 +14,4 @@ gluj-bench-core = { path = "../gluj-bench-core" }
 sysinfo.workspace = true
 half = "2"
 serde_json.workspace = true
+windows-sys.workspace = true

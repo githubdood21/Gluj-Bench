@@ -1,5 +1,19 @@
 # Ideas for later
 
+## Real application workloads
+
+All currently available benchmarks are synthetic. Future application benchmarks should include rendering, inference with real LLM models, and other workloads with directly measured throughput.
+
+- Report completed work in relevant units, such as frames or tokens per second, with elapsed time and the workload definition attached.
+- Record application or model version, input data, precision, and quality settings so comparisons have a clear scope.
+- Keep application results distinct from synthetic kernels. These workloads are planned, without committed release dates.
+
+## Storage and other components
+
+- Add storage throughput and latency measurements with explicit dataset size, read/write mix, access pattern, and queue settings.
+- Record caching and buffering policies so users can understand what each result measures.
+- Extend coverage to other components where useful work can be defined and measured clearly. This work is planned and is not part of 1.0.0.
+
 ## Multi-GPU and multi-socket CPU measurements
 
 - Start with independent workloads on each selected GPU or CPU socket. Report per-device or per-socket throughput and aggregate completed work over the same wall-clock interval.

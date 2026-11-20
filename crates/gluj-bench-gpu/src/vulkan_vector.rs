@@ -331,19 +331,21 @@ impl VulkanVectorHarness {
                 0,
                 &params,
             );
-            for _ in 0..iterations {
-                let writes = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
-                self.device.cmd_pipeline_barrier(
-                    self.command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &writes,
-                    &[],
-                    &[],
-                );
+            for iteration in 0..iterations {
+                if iteration > 0 {
+                    let writes = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
+                    self.device.cmd_pipeline_barrier(
+                        self.command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &writes,
+                        &[],
+                        &[],
+                    );
+                }
 
                 self.device
                     .cmd_dispatch(self.command_buffer, self.workgroups, 1, 1);

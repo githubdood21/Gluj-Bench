@@ -191,6 +191,22 @@ struct WorkerResult {
     compressed_bytes: u64,
     allocated_bytes: u64,
 }
+
+fn aggregate_worker_sample<'a>(
+    samples: impl IntoIterator<Item = &'a WorkerSample>,
+) -> (f64, f64, u64) {
+    let mut work_rate = 0.0;
+    let mut traffic_rate = 0.0;
+    let mut slowest_active = 1u64;
+    for sample in samples {
+        let active = sample.active_ns.max(1) as f64;
+        work_rate += sample.work as f64 * 1e9 / active;
+        traffic_rate += sample.traffic as f64 * 1e9 / active;
+        slowest_active = slowest_active.max(sample.active_ns);
+    }
+    (work_rate, traffic_rate, slowest_active)
+}
+
 struct WorkerContext<'a> {
     spec: Spec,
     config: &'a BenchmarkConfig,
@@ -458,21 +474,10 @@ fn point(
     let mut traffic = Vec::new();
     let mut elapsed = 0;
     for sample in 0..config.samples * ensembles {
-        let active = workers
-            .iter()
-            .map(|w| w.samples[sample as usize].active_ns)
-            .max()
-            .unwrap_or(1);
-        let work = workers
-            .iter()
-            .map(|w| w.samples[sample as usize].work)
-            .sum::<u64>();
-        let bytes = workers
-            .iter()
-            .map(|w| w.samples[sample as usize].traffic)
-            .sum::<u64>();
-        rates.push(work as f64 * 1e9 / active as f64);
-        traffic.push(bytes as f64 * 1e9 / active as f64);
+        let (work_rate, traffic_rate, active) =
+            aggregate_worker_sample(workers.iter().map(|w| &w.samples[sample as usize]));
+        rates.push(work_rate);
+        traffic.push(traffic_rate);
         elapsed += active;
     }
     Ok(Point {
@@ -776,9 +781,14 @@ pub(super) fn run(
     ]);
     if matches!(spec, Spec::Float(_) | Spec::Pop) {
         metadata.extend(gluj_bench_core::AccessPolicy::from_config(config)?.metadata());
+        let preset_key = gluj_bench_core::cpu_data_preset_key(id);
         metadata.insert(
-            gluj_bench_core::cpu_data_preset_key(id).into(),
-            config.options[gluj_bench_core::cpu_data_preset_key(id)].clone(),
+            preset_key.into(),
+            config
+                .options
+                .get(preset_key)
+                .cloned()
+                .unwrap_or_else(|| "register".into()),
         );
         metadata.insert(
             "data_type".into(),
@@ -828,8 +838,19 @@ pub(super) fn run(
         for (key, value) in [("matrix_m", m), ("matrix_n", n), ("matrix_k", k)] {
             metadata.insert(key.into(), value.to_string());
         }
-        for key in ["matrix_shape", "matrix_reuse", "matrix_k_block"] {
-            metadata.insert(key.into(), config.options[key].clone());
+        for (key, default) in [
+            ("matrix_shape", "legacy"),
+            ("matrix_reuse", "1"),
+            ("matrix_k_block", "128"),
+        ] {
+            metadata.insert(
+                key.into(),
+                config
+                    .options
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| default.into()),
+            );
         }
         metadata.insert("matrix_shared_b_bytes".into(), (n * k * 4).to_string());
         metadata.insert("matrix_shape_definition".into(),"global M,N,K fixed across worker counts; disjoint 8-row output shards, shared immutable B; each reuse overwrites a full product".into());
@@ -854,7 +875,7 @@ pub(super) fn run(
         serde_json::to_string(&worker_layout).expect("worker layout"),
     );
     metadata.insert("input_generator_revision".into(), spec.revision().into());
-    metadata.insert("aggregate_rate_definition".into(),"sum of completed worker work / slowest worker active duration for each synchronized observation; preparation, warmup and barrier waits excluded".into());
+    metadata.insert("aggregate_rate_definition".into(),"sum of worker active throughput rates (worker work / worker active duration) for each synchronized observation; preparation, warmup and barrier waits excluded".into());
     metadata.insert("allocation_reserve_bytes".into(), planned.to_string());
     if matches!(spec, Spec::Codec(_)) {
         metadata.insert("codec_internal_allocation".into(),"library-managed state excluded from enumerated test-buffer bytes; budget reserves 10 MiB per worker".into());
@@ -914,5 +935,68 @@ mod tests {
         let cancelled = CancellationToken::default();
         cancelled.cancel();
         assert!(reference_primes(12345, &cancelled).is_err());
+    }
+
+    #[test]
+    fn matrix_run_succeeds_without_optional_reuse_or_k_block_options() {
+        let topology = crate::topology::discover().unwrap();
+        let mut device = gluj_bench_core::DeviceDescriptor {
+            id: "cpu:primary".into(),
+            name: "CPU".into(),
+            category: gluj_bench_core::DeviceCategory::Cpu,
+            available: !topology.physical_cores.is_empty(),
+            status: String::new(),
+            properties: BTreeMap::new(),
+            caches: Vec::new(),
+        };
+        if !device.available {
+            return;
+        }
+        device.available = true;
+        let config = BenchmarkConfig {
+            samples: 1,
+            target_duration_ms: 10,
+            options: BTreeMap::from([
+                ("matrix_shape".into(), "square".into()),
+                ("cpu_core_limit".into(), "1".into()),
+            ]),
+        };
+        let result = run(
+            "cpu.performance.matrix.fp32.scaling",
+            &config,
+            &CancellationToken::default(),
+            &mut |_| {},
+            &device,
+            &topology,
+        );
+        match result {
+            Ok(res) => {
+                assert_eq!(res.workload_metadata["matrix_shape"], "square");
+                assert_eq!(res.workload_metadata["matrix_reuse"], "1");
+                assert_eq!(res.workload_metadata["matrix_k_block"], "128");
+            }
+            Err(err) if err.code == "benchmark_unavailable" => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_sample_aggregation_sums_active_rates_without_straggler_penalty() {
+        let samples = [
+            WorkerSample {
+                work: 1_000,
+                active_ns: 1_000_000, // 1_000_000 /s
+                traffic: 8_000,       // 8_000_000 B/s
+            },
+            WorkerSample {
+                work: 500,
+                active_ns: 2_000_000, // 250_000 /s (slow straggler)
+                traffic: 4_000,       // 2_000_000 B/s
+            },
+        ];
+        let (work_rate, traffic_rate, slowest_ns) = aggregate_worker_sample(&samples);
+        assert!((work_rate - 1_250_000.0).abs() < 1e-6);
+        assert!((traffic_rate - 10_000_000.0).abs() < 1e-6);
+        assert_eq!(slowest_ns, 2_000_000);
     }
 }

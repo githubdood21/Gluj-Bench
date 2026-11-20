@@ -577,11 +577,14 @@ pub fn capture_measurement_with_progress<F>(
 where
     F: FnOnce() -> Result<BenchmarkResult, BenchmarkError>,
 {
+    let minimum_samples = config
+        .samples
+        .max(measurement_budget(config).minimum_samples);
     let recorder = Recorder {
         inner: Arc::new(Mutex::new(Capture::default())),
         origin: Instant::now(),
         progress,
-        minimum_samples: config.samples,
+        minimum_samples,
     };
     let previous = CONTEXT.with(|context| {
         context.replace(Some(Context {
@@ -998,6 +1001,36 @@ mod qualification_diagnostics {
             println!(
                 "recorder_diagnostic progress={progress_enabled} observations=20000 nanoseconds_per_observation={:.0}",
                 elapsed.as_nanos() as f64 / 20000.
+            );
+        }
+    }
+
+    #[test]
+    fn capture_measurement_progress_uses_clamped_minimum_samples() {
+        for (policy, expected_min) in [("extensive", 6), ("shorter", 3)] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let config = BenchmarkConfig {
+                samples: 1,
+                options: BTreeMap::from([("measurement_policy".into(), policy.into())]),
+                ..Default::default()
+            };
+            let _ = capture_measurement_with_progress(
+                "cpu.latency.memory",
+                &config,
+                Some(sender),
+                || {
+                    record_observation("c", "latency", 10.0, "ns", 1, "loads", 10, 10);
+                    Err(BenchmarkError::new("done", "done"))
+                },
+            );
+            let updates: Vec<_> = receiver.try_iter().collect();
+            assert!(!updates.is_empty());
+            assert!(
+                updates[0]
+                    .message
+                    .contains(&format!("(minimum {expected_min})")),
+                "unexpected progress message for {policy}: {}",
+                updates[0].message
             );
         }
     }

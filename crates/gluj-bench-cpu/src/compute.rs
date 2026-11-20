@@ -755,11 +755,14 @@ fn measure_parallel(
             .map(|samples| samples[sample_index].elapsed_ns)
             .max()
             .unwrap_or(1);
-        let operations = thread_results
+        let rate = thread_results
             .iter()
-            .map(|samples| samples[sample_index].operations)
-            .sum::<u64>();
-        values.push(operations as f64 * 1e9 / elapsed as f64);
+            .map(|samples| {
+                let sample = &samples[sample_index];
+                sample.operations as f64 * 1e9 / sample.elapsed_ns.max(1) as f64
+            })
+            .sum::<f64>();
+        values.push(rate);
         elapsed_total = elapsed_total.saturating_add(elapsed);
         cpu_total = cpu_total.saturating_add(
             thread_results

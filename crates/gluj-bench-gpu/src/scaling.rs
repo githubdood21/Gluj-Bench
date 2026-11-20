@@ -142,13 +142,16 @@ pub(super) fn add_reference_analysis(
         && trial_gap > 0.15
         && trial_gap > 2.0 * trial_noise
         && memory_transition_observed;
-    let guidance = if eligible {
+    let candidates = if eligible {
+        // Candidate clock limits explore efficiency; the gap does not predict clock response.
+        gluj_bench_core::gpu_efficiency_trials(largest.value / trial_anchor.value)
+    } else {
+        Vec::new()
+    };
+    let guidance = if let Some(&reduction) = candidates.first() {
         let headroom = (1.0 - ratio) * 100.0;
         let trial_headroom = trial_gap * 100.0;
         let bandwidth_gap = (1.0 / ratio - 1.0) * 100.0;
-        // Candidate clock limits explore efficiency; the gap does not predict clock response.
-        let candidates = gluj_bench_core::gpu_efficiency_trials(largest.value / trial_anchor.value);
-        let reduction = candidates[0];
         let limits = candidates
             .iter()
             .map(|reduction| format!("{}%", 100 - reduction))

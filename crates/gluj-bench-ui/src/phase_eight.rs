@@ -99,7 +99,7 @@ fn history_title(benchmark_id: &str, benchmarks: &[BenchmarkDescriptor]) -> Stri
 
 impl HistoryState {
     fn visible(&self, benchmarks: &[BenchmarkDescriptor]) -> Vec<&RunIndexEntry> {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.trim();
         self.entries
             .iter()
             .rev()
@@ -118,10 +118,11 @@ impl HistoryState {
                     && (query.is_empty()
                         || [&e.benchmark_id, &e.run_id, &a.name, &a.notes]
                             .iter()
-                            .any(|value| value.to_lowercase().contains(&query))
-                        || history_title(&e.benchmark_id, benchmarks)
-                            .to_lowercase()
-                            .contains(&query))
+                            .any(|value| presentation::contains_ignore_ascii_case(value, query))
+                        || presentation::contains_ignore_ascii_case(
+                            &history_title(&e.benchmark_id, benchmarks),
+                            query,
+                        ))
             })
             .collect()
     }
@@ -473,6 +474,13 @@ impl App {
             });
         }
     }
+    pub(super) fn close_history_panel(&mut self) {
+        if self.history.open {
+            self.history.open = false;
+            self.history.pending_delete = None;
+            self.ui_dirty = true;
+        }
+    }
     fn history_action(&mut self, action: &str, name: String, notes: String) {
         if self.history.io.is_some() && action != "close" {
             self.history.status = "Wait for the current history operation.".into();
@@ -481,6 +489,9 @@ impl App {
         }
         match action {
             "open" => {
+                if self.snapshot.open {
+                    self.close_snapshot();
+                }
                 self.history.open = true;
                 self.reload_history();
             }
@@ -613,7 +624,49 @@ impl App {
             _ => {}
         }
         self.history.clear_hidden_selection(&self.benchmarks);
-        self.ui_dirty = true;
+        if matches!(
+            action,
+            "open" | "close" | "next" | "previous" | "keep" | "delete" | "save" | "archive"
+        ) {
+            self.dirty.history = true;
+        } else {
+            self.ui_dirty = true;
+        }
+    }
+    pub(super) fn filtered_result_technical(&self, result: &BenchmarkResult) -> Vec<DeviceFact> {
+        let query = self.presentation.technical_query.trim();
+        let mut technical =
+            Vec::with_capacity(1 + result.workload_metadata.len() + result.device_metadata.len());
+        let validation = result
+            .workload_metadata
+            .get("result_validation")
+            .map(String::as_str)
+            .unwrap_or("Not recorded");
+        if presentation::matches_pair_query("Validation scope", validation, query) {
+            technical.push(presentation::bounded_fact("Validation scope", validation));
+        }
+        for (k, v) in &result.workload_metadata {
+            let label = presentation::friendly(k);
+            let fact = presentation::technical_fact(&label, v);
+            if presentation::matches_pair_query(&fact.label, &fact.value, query) {
+                technical.push(fact);
+            }
+        }
+        for (k, v) in &result.device_metadata {
+            let label = presentation::friendly(k);
+            let fact = presentation::technical_fact(&label, v);
+            if presentation::matches_pair_query(&fact.label, &fact.value, query) {
+                technical.push(fact);
+            }
+        }
+        technical
+    }
+    pub(super) fn refresh_selected_result_technical(window: &MainWindow, app: &Self) {
+        let technical = app
+            .selected_result_entry()
+            .map(|result| app.filtered_result_technical(result))
+            .unwrap_or_default();
+        window.set_result_technical(ModelRc::new(VecModel::from(technical)));
     }
     pub(super) fn present_selected_measurement(
         &self,
@@ -664,6 +717,16 @@ impl App {
                 .map(|m| presentation::datasets::core_counts(result, m, &self.results))
                 .unwrap_or_default(),
         )));
+        window.set_selected_metric_help(
+            metric.map(|metric| match metric.unit.as_str() {
+                "operations/s" => "Shows how much calculation work finishes each second. Higher means more work done in this test.",
+                "bytes/s" | "MB/s" => "Shows how much data moves each second. Higher means faster transfer for this operation.",
+                "ns" => "Shows how long the hardware waits for each memory read. Lower means a shorter wait.",
+                "strings/s" => "Shows how many text records are scanned each second. Higher means more work done.",
+                "primes/s" => "Shows how many prime numbers are found each second in this test. Higher means more work done.",
+                _ => "",
+            }).unwrap_or("").into(),
+        );
         window.set_selected_metric_label(
             if metric.is_some_and(|m| m.statistics.sample_count > 0) {
                 "Median"
@@ -712,37 +775,7 @@ impl App {
             )
             .into();
         }
-        let validation = if result.workload_metadata.contains_key("result_validation") {
-            "Runner checks recorded"
-        } else {
-            "Scope not recorded"
-        };
-        let mut technical = vec![presentation::fact(
-            "Validation scope",
-            result
-                .workload_metadata
-                .get("result_validation")
-                .map(String::as_str)
-                .unwrap_or("Not recorded"),
-        )];
-        technical.extend(
-            result
-                .workload_metadata
-                .iter()
-                .map(|(k, v)| presentation::technical_fact(&presentation::friendly(k), v)),
-        );
-        technical.extend(
-            result
-                .device_metadata
-                .iter()
-                .map(|(k, v)| presentation::technical_fact(&presentation::friendly(k), v)),
-        );
-        let query = self.presentation.technical_query.to_lowercase();
-        technical.retain(|f| {
-            format!("{} {}", f.label, f.value)
-                .to_lowercase()
-                .contains(&query)
-        });
+        let technical = self.filtered_result_technical(result);
         window.set_result_technical(ModelRc::new(VecModel::from(technical)));
         let drift = result
             .workload_metadata
@@ -764,6 +797,11 @@ impl App {
         } else {
             ""
         };
+        let validation = result
+            .workload_metadata
+            .get("result_validation")
+            .map(String::as_str)
+            .unwrap_or("Not recorded");
         window.set_measurement_context(
             format!("Validation: {validation}{drift}{calibration}").into(),
         );
@@ -1125,7 +1163,7 @@ impl App {
             if let Some(a) = weak.upgrade() {
                 let mut a = a.borrow_mut();
                 a.select_history(id.as_str());
-                a.ui_dirty = true;
+                a.dirty.history = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -1143,7 +1181,7 @@ impl App {
                         a.history.checked.remove(id.as_str());
                     }
                 }
-                a.ui_dirty = true;
+                a.dirty.history = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -1154,7 +1192,7 @@ impl App {
                 a.history.page = 0;
                 let app = &mut *a;
                 app.history.clear_hidden_selection(&app.benchmarks);
-                a.ui_dirty = true;
+                a.dirty.history = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -1162,7 +1200,7 @@ impl App {
             if let Some(a) = weak.upgrade() {
                 let mut a = a.borrow_mut();
                 a.primary_selection = index.max(0) as usize;
-                a.ui_dirty = true;
+                a.dirty.results = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -1176,7 +1214,7 @@ impl App {
             if let Some(a) = weak.upgrade() {
                 let mut a = a.borrow_mut();
                 a.history.observations.change(action.as_str(), index);
-                a.ui_dirty = true;
+                a.dirty.history = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -1187,7 +1225,7 @@ impl App {
                 a.history.page = 0;
                 let app = &mut *a;
                 app.history.clear_hidden_selection(&app.benchmarks);
-                a.ui_dirty = true;
+                a.dirty.history = true;
             }
         });
         let weak = Rc::downgrade(app);
@@ -1256,8 +1294,12 @@ impl App {
                 .is_some_and(gluj_bench_core::gpu_memory),
         );
         window.set_history_open(app.history.open);
-        window.set_history_status(app.history.status.clone().into());
-        window.set_history_import_error(app.history.import_error.as_str().into());
+        window.set_history_status(
+            presentation::clamp_display_text(&app.history.status, 1200, 12).into(),
+        );
+        window.set_history_import_error(
+            presentation::clamp_display_text(&app.history.import_error, 2000, 24).into(),
+        );
         window.set_history_delete_pending(app.history.pending_delete.is_some());
         window.set_history_busy(app.history.io.is_some());
         window.set_history_can_export(
@@ -1273,10 +1315,12 @@ impl App {
         window.set_history_active_id(active_id.into());
         window.set_history_pinned(annotation.pinned);
         window.set_history_archived(annotation.archived);
-        let rows: Vec<HistoryRow> = app
-            .history
-            .page_entries(&app.benchmarks)
-            .iter()
+        let visible = app.history.visible(&app.benchmarks);
+        let total = visible.len();
+        let rows: Vec<HistoryRow> = visible
+            .into_iter()
+            .skip(app.history.page * PAGE_SIZE)
+            .take(PAGE_SIZE)
             .map(|e| {
                 let annotation = app
                     .history
@@ -1321,7 +1365,6 @@ impl App {
                 .unwrap_or_default(),
         );
         window.set_history_rows(ModelRc::new(VecModel::from(rows)));
-        let total = app.history.visible(&app.benchmarks).len();
         let mut counts = format!("{total} {}", if total == 1 { "run" } else { "runs" });
         if !app.history.checked.is_empty() {
             counts.push_str(&format!(
@@ -1368,17 +1411,17 @@ impl App {
                             r.build_revision.as_deref().unwrap_or("Not recorded"),
                         ),
                         fact("Source", format!("{:?}", r.source)),
-                        fact(
+                        presentation::bounded_fact(
                             "Source reference",
                             r.source_reference.as_deref().unwrap_or("Local"),
                         ),
-                        fact("Validation scope", &r.validation.scope),
-                        fact(
+                        presentation::bounded_fact("Validation scope", &r.validation.scope),
+                        presentation::bounded_fact(
                             "Error",
                             r.error
                                 .as_ref()
-                                .map(|e| e.message.clone())
-                                .unwrap_or_else(|| "None".into()),
+                                .map(|e| e.message.as_str())
+                                .unwrap_or("None"),
                         ),
                     ],
                 )
@@ -1665,5 +1708,44 @@ mod tests {
         assert_eq!(history.visible(&[]).len(), 1);
         history.query = "missing".into();
         assert!(history.visible(&[]).is_empty());
+    }
+
+    #[test]
+    fn filtered_result_technical_and_history_actions_use_scoped_dirty_flags() {
+        let mut app = crate::configuration_tests::fixture();
+        app.ui_dirty = false;
+        app.dirty = Default::default();
+
+        let mut result = measured(25.0);
+        result
+            .workload_metadata
+            .insert("result_validation".into(), "Validated single run".into());
+        result
+            .workload_metadata
+            .insert("huge_blob".into(), "z".repeat(70_000));
+        result
+            .device_metadata
+            .insert("driver_version".into(), "24.12.1".into());
+
+        let all_facts = app.filtered_result_technical(&result);
+        assert!(
+            all_facts
+                .iter()
+                .any(|f| f.value.as_str() == "Recorded payload · 69 KiB · Native JSON")
+        );
+
+        app.presentation.technical_query = "24.12".into();
+        let filtered = app.filtered_result_technical(&result);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].value.as_str(), "24.12.1");
+
+        app.history_action("open", "".into(), "".into());
+        assert!(!app.ui_dirty);
+        assert!(app.dirty.history);
+
+        app.dirty.history = false;
+        app.history_action("close", "".into(), "".into());
+        assert!(!app.ui_dirty);
+        assert!(app.dirty.history);
     }
 }

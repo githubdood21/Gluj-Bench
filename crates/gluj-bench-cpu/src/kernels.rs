@@ -118,6 +118,18 @@ pub fn cold_cache_method() -> &'static str {
     }
 }
 
+#[inline]
+fn flush_streaming_stores(streaming: bool, operation: Operation) {
+    #[cfg(target_arch = "x86_64")]
+    if streaming && !matches!(operation, Operation::Read) {
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (streaming, operation);
+}
+
 #[inline(never)]
 pub fn execute(
     operation: Operation,
@@ -129,13 +141,33 @@ pub fn execute(
     execute_rotated(operation, source, destination, passes, streaming, 0);
 }
 
-#[inline(never)]
 fn execute_rotated(
     operation: Operation,
     source: &mut AlignedBuffer,
     destination: &mut AlignedBuffer,
     passes: usize,
     streaming: bool,
+    start_offset: usize,
+) {
+    execute_rotated_with_fence(
+        operation,
+        source,
+        destination,
+        passes,
+        streaming,
+        true,
+        start_offset,
+    );
+}
+
+#[inline]
+fn execute_rotated_with_fence(
+    operation: Operation,
+    source: &mut AlignedBuffer,
+    destination: &mut AlignedBuffer,
+    passes: usize,
+    streaming: bool,
+    sfence: bool,
     start_offset: usize,
 ) {
     #[cfg(target_arch = "x86_64")]
@@ -147,6 +179,7 @@ fn execute_rotated(
                 destination,
                 passes,
                 streaming,
+                sfence,
                 start_offset,
             );
         }
@@ -156,11 +189,15 @@ fn execute_rotated(
             destination,
             passes,
             streaming,
+            sfence,
             start_offset,
         )
     }
     #[cfg(not(target_arch = "x86_64"))]
-    scalar(operation, source, destination, passes, start_offset);
+    {
+        let _ = (streaming, sfence);
+        scalar(operation, source, destination, passes, start_offset);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -171,6 +208,7 @@ unsafe fn avx2(
     destination: &mut AlignedBuffer,
     passes: usize,
     streaming: bool,
+    sfence: bool,
     start_offset: usize,
 ) {
     use std::arch::x86_64::*;
@@ -317,7 +355,7 @@ unsafe fn avx2(
             }
         }
     }
-    if streaming && !matches!(operation, Operation::Read) {
+    if sfence && streaming && !matches!(operation, Operation::Read) {
         _mm_sfence();
     }
     black_box(checksum);
@@ -331,6 +369,7 @@ unsafe fn sse2(
     destination: &mut AlignedBuffer,
     passes: usize,
     streaming: bool,
+    sfence: bool,
     start_offset: usize,
 ) {
     use std::arch::x86_64::*;
@@ -474,7 +513,7 @@ unsafe fn sse2(
             }
         }
     }
-    if streaming && !matches!(operation, Operation::Read) {
+    if sfence && streaming && !matches!(operation, Operation::Read) {
         _mm_sfence();
     }
     black_box(checksum);
@@ -623,28 +662,23 @@ pub fn measure_parallel_sizes(
         let mut completed_passes = 0usize;
         while window.needs_batch() {
             let wall_ns = if options.preparation == CachePreparation::Cold {
-                let mut elapsed = 0u64;
-                for pass in 0..sample_passes {
-                    let active_ns = parallel_once(
-                        operation,
-                        locations,
-                        &mut buffers,
-                        SweepOptions {
-                            access: options.access,
-                            realization,
-                            rotation: completed_passes + pass,
-                            passes: 1,
-                            chunk_passes: 1,
-                            streaming: options.streaming,
-                            preparation: options.preparation,
-                            first_touch: false,
-                        },
-                        cancellation,
-                    )?;
-                    elapsed = elapsed.saturating_add(active_ns);
-                    cold_pacer.account(std::time::Duration::from_nanos(active_ns))?;
-                }
-                elapsed
+                parallel_cold_passes(
+                    operation,
+                    locations,
+                    &mut buffers,
+                    SweepOptions {
+                        access: options.access,
+                        realization,
+                        rotation: completed_passes,
+                        passes: sample_passes,
+                        chunk_passes: 1,
+                        streaming: options.streaming,
+                        preparation: options.preparation,
+                        first_touch: false,
+                    },
+                    &mut cold_pacer,
+                    cancellation,
+                )?
             } else {
                 parallel_once(
                     operation,
@@ -754,6 +788,227 @@ fn bandwidth_value(payload_bytes: usize, multiplier: u8, passes: usize, elapsed_
         / elapsed_ns.max(1) as f64
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep worker buffers, placement, synchronization, and cancellation explicit."
+)]
+fn prepare_worker(
+    location: ProcessorLocation,
+    source: &mut AlignedBuffer,
+    destination: &mut AlignedBuffer,
+    options: SweepOptions,
+    thread_index: usize,
+    barrier: &Barrier,
+    failed: &std::sync::atomic::AtomicBool,
+    recorder: &Option<gluj_bench_core::ObservationRecorder>,
+    cancellation: &CancellationToken,
+) -> Result<(AffinityGuard, gluj_bench_core::AccessSchedule), BenchmarkError> {
+    let prepared = (|| {
+        let _phase = recorder.as_ref().map(|r| r.phase_timer("preparation"));
+        let affinity = AffinityGuard::pin(location)?;
+        let schedule = options.access.schedule(
+            source.len().min(destination.len()),
+            64,
+            thread_index,
+            options.realization,
+            cancellation,
+        )?;
+        Ok::<_, BenchmarkError>((affinity, schedule))
+    })();
+    if prepared.is_err() {
+        failed.store(true, Ordering::SeqCst);
+    }
+    barrier.wait();
+    if failed.load(Ordering::SeqCst) {
+        return Err(prepared.err().unwrap_or_else(|| {
+            BenchmarkError::new(
+                "worker_prepare_failed",
+                "Another bandwidth worker could not set processor placement.",
+            )
+        }));
+    }
+    let (affinity, schedule) = prepared?;
+    let preparation_timer = recorder
+        .as_ref()
+        .map(|recorder| recorder.phase_timer("preparation"));
+    if options.first_touch {
+        source.initialize(options.access.derived_seed(thread_index, source.len(), 0) as u8 | 1);
+        destination.initialize(0);
+    }
+    drop(preparation_timer);
+    Ok((affinity, schedule))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the measured batch geometry and buffer access explicit."
+)]
+fn run_pass_batch(
+    operation: Operation,
+    source: &mut AlignedBuffer,
+    destination: &mut AlignedBuffer,
+    schedule: &mut gluj_bench_core::AccessSchedule,
+    pattern: gluj_bench_core::AccessPattern,
+    pass_count: usize,
+    start_offset: usize,
+    streaming: bool,
+    cancellation: &CancellationToken,
+) -> Result<(), BenchmarkError> {
+    if pattern == gluj_bench_core::AccessPattern::Sequential {
+        execute_rotated_with_fence(
+            operation,
+            source,
+            destination,
+            pass_count,
+            streaming,
+            true,
+            start_offset,
+        );
+        return Ok(());
+    }
+    for _ in 0..pass_count {
+        if !schedule.visit(cancellation, |range| {
+            execute_range(operation, source, destination, range, streaming)
+        }) {
+            return Err(BenchmarkError::new(
+                "cancelled",
+                "Bandwidth traversal cancelled.",
+            ));
+        }
+        flush_streaming_stores(streaming, operation);
+    }
+    Ok(())
+}
+
+fn parallel_cold_passes(
+    operation: Operation,
+    locations: &[ProcessorLocation],
+    buffers: &mut [(AlignedBuffer, AlignedBuffer)],
+    options: SweepOptions,
+    cold_pacer: &mut crate::pacing::CpuPacer,
+    cancellation: &CancellationToken,
+) -> Result<u64, BenchmarkError> {
+    let barrier = Arc::new(Barrier::new(locations.len()));
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pass_max_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pacer_lock = std::sync::Mutex::new(cold_pacer);
+    let recorder = gluj_bench_core::observation_recorder();
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(locations.len());
+        for (thread_index, ((source, destination), location)) in buffers
+            .iter_mut()
+            .zip(locations.iter().copied())
+            .enumerate()
+        {
+            let recorder = recorder.clone();
+            let barrier = barrier.clone();
+            let failed = failed.clone();
+            let pass_max_ns = pass_max_ns.clone();
+            let total_ns = total_ns.clone();
+            let pacer_lock = &pacer_lock;
+            handles.push(scope.spawn(move || -> Result<(), BenchmarkError> {
+                let (_affinity, mut schedule) = prepare_worker(
+                    location,
+                    source,
+                    destination,
+                    options,
+                    thread_index,
+                    &barrier,
+                    &failed,
+                    &recorder,
+                    cancellation,
+                )?;
+                let mut local_error: Option<BenchmarkError> = None;
+                for pass in 0..options.passes {
+                    let rotation = options.rotation + pass;
+                    schedule.reset_pass(rotation);
+                    let cache_timer = recorder
+                        .as_ref()
+                        .map(|recorder| recorder.phase_timer("preparation"));
+                    prepare(
+                        operation,
+                        source,
+                        destination,
+                        options.preparation,
+                        cancellation,
+                    );
+                    let start_offset = rotated_offset(
+                        options.access.derived_seed(
+                            thread_index,
+                            source.len(),
+                            options.realization,
+                        ) ^ rotation as u64,
+                        source.len().min(destination.len()),
+                    );
+                    drop(cache_timer);
+                    if cancellation.is_cancelled() {
+                        failed.store(true, Ordering::SeqCst);
+                        local_error.get_or_insert_with(|| {
+                            BenchmarkError::new("cancelled", "The benchmark was cancelled.")
+                        });
+                    }
+                    barrier.wait();
+                    if failed.load(Ordering::SeqCst) {
+                        return Err(local_error.unwrap_or_else(|| {
+                            BenchmarkError::new("cancelled", "The benchmark was cancelled.")
+                        }));
+                    }
+
+                    let start = Instant::now();
+                    if let Err(err) = run_pass_batch(
+                        operation,
+                        source,
+                        destination,
+                        &mut schedule,
+                        options.access.pattern,
+                        1,
+                        start_offset,
+                        options.streaming,
+                        cancellation,
+                    ) {
+                        failed.store(true, Ordering::SeqCst);
+                        local_error.get_or_insert(err);
+                    } else {
+                        let pass_ns = start.elapsed().as_nanos().max(1) as u64;
+                        pass_max_ns.fetch_max(pass_ns, Ordering::AcqRel);
+                    }
+                    barrier.wait();
+
+                    if thread_index == 0 {
+                        let max_ns = pass_max_ns.swap(0, Ordering::AcqRel);
+                        if !failed.load(Ordering::SeqCst) {
+                            total_ns.fetch_add(max_ns, Ordering::Relaxed);
+                            if let Err(err) = pacer_lock
+                                .lock()
+                                .expect("cold pacer mutex poisoned")
+                                .account(std::time::Duration::from_nanos(max_ns))
+                            {
+                                failed.store(true, Ordering::SeqCst);
+                                local_error.get_or_insert(err);
+                            }
+                        }
+                    }
+                    barrier.wait();
+                    if failed.load(Ordering::SeqCst) {
+                        return Err(local_error.unwrap_or_else(|| {
+                            BenchmarkError::new("cancelled", "The benchmark was cancelled.")
+                        }));
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.join().map_err(|_| {
+                BenchmarkError::new("worker_failed", "A RAM benchmark thread panicked.")
+            })??;
+        }
+        Ok::<(), BenchmarkError>(())
+    })?;
+    Ok(total_ns.load(Ordering::Relaxed).max(1))
+}
+
 fn parallel_once(
     operation: Operation,
     locations: &[ProcessorLocation],
@@ -776,42 +1031,18 @@ fn parallel_once(
             let barrier = barrier.clone();
             let failed = failed.clone();
             handles.push(scope.spawn(move || -> Result<u64, BenchmarkError> {
-                let prepared = (|| {
-                    let _phase = recorder.as_ref().map(|r| r.phase_timer("preparation"));
-                    let affinity = AffinityGuard::pin(location)?;
-                    let schedule = options.access.schedule(
-                        source.len().min(destination.len()),
-                        64,
-                        thread_index,
-                        options.realization,
-                        cancellation,
-                    )?;
-                    Ok::<_, BenchmarkError>((affinity, schedule))
-                })();
-                if prepared.is_err() {
-                    failed.store(true, Ordering::SeqCst);
-                }
-                barrier.wait();
-                if failed.load(Ordering::SeqCst) {
-                    return Err(prepared.err().unwrap_or_else(|| {
-                        BenchmarkError::new(
-                            "worker_prepare_failed",
-                            "Another bandwidth worker could not set processor placement.",
-                        )
-                    }));
-                }
-                let (_affinity, mut schedule) = prepared?;
+                let (_affinity, mut schedule) = prepare_worker(
+                    location,
+                    source,
+                    destination,
+                    options,
+                    thread_index,
+                    &barrier,
+                    &failed,
+                    &recorder,
+                    cancellation,
+                )?;
                 schedule.reset_pass(options.rotation);
-                let preparation_timer = recorder
-                    .as_ref()
-                    .map(|recorder| recorder.phase_timer("preparation"));
-                if options.first_touch {
-                    source.initialize(
-                        options.access.derived_seed(thread_index, source.len(), 0) as u8 | 1,
-                    );
-                    destination.initialize(0);
-                }
-                drop(preparation_timer);
                 let cache_timer = recorder.as_ref().map(|recorder| {
                     recorder.phase_timer(if options.preparation == CachePreparation::Hot {
                         "warmup"
@@ -860,33 +1091,17 @@ fn parallel_once(
                     }
                     let current = remaining.min(options.chunk_passes);
                     let batch_start = Instant::now();
-                    if options.access.pattern == gluj_bench_core::AccessPattern::Sequential {
-                        execute_rotated(
-                            operation,
-                            source,
-                            destination,
-                            current,
-                            options.streaming,
-                            start_offset,
-                        );
-                    } else {
-                        for _ in 0..current {
-                            if !schedule.visit(cancellation, |range| {
-                                execute_range(
-                                    operation,
-                                    source,
-                                    destination,
-                                    range,
-                                    options.streaming,
-                                )
-                            }) {
-                                return Err(BenchmarkError::new(
-                                    "cancelled",
-                                    "Bandwidth traversal cancelled.",
-                                ));
-                            }
-                        }
-                    }
+                    run_pass_batch(
+                        operation,
+                        source,
+                        destination,
+                        &mut schedule,
+                        options.access.pattern,
+                        current,
+                        start_offset,
+                        options.streaming,
+                        cancellation,
+                    )?;
                     remaining -= current;
                     pacer.account(batch_start.elapsed())?;
                 }
@@ -1007,7 +1222,7 @@ fn execute_range(
         length: range.len(),
         layout: destination.layout,
     });
-    execute_rotated(operation, &mut a, &mut b, 1, streaming, 0);
+    execute_rotated_with_fence(operation, &mut a, &mut b, 1, streaming, false, 0);
 }
 
 #[cfg(test)]
@@ -1096,6 +1311,55 @@ mod access_regressions {
                     destination.as_ptr().add(i).read()
                 });
             }
+        }
+    }
+
+    #[test]
+    fn cold_passes_copy_with_streaming_and_shuffled_blocks() {
+        let Ok(topology) = crate::topology::discover() else {
+            return;
+        };
+        let Some(&core) = topology.physical_cores.first() else {
+            return;
+        };
+        let token = CancellationToken::default();
+        let config = gluj_bench_core::BenchmarkConfig {
+            options: std::collections::BTreeMap::from([
+                ("access_pattern".into(), "shuffled_blocks".into()),
+                ("access_block_bytes".into(), "128".into()),
+            ]),
+            ..Default::default()
+        };
+        let access = gluj_bench_core::AccessPolicy::from_config(&config).unwrap();
+        let mut source = AlignedBuffer::new(4096).unwrap();
+        let mut destination = AlignedBuffer::new(4096).unwrap();
+        source.initialize(0x5a);
+        destination.initialize(0);
+        let mut buffers = [(source, destination)];
+        let mut pacer = crate::pacing::CpuPacer::new(100, &token);
+        let elapsed_ns = parallel_cold_passes(
+            Operation::Copy,
+            &[core],
+            &mut buffers,
+            SweepOptions {
+                access,
+                realization: 0,
+                rotation: 0,
+                passes: 2,
+                chunk_passes: 1,
+                streaming: true,
+                preparation: CachePreparation::Cold,
+                first_touch: false,
+            },
+            &mut pacer,
+            &token,
+        )
+        .unwrap();
+        assert!(elapsed_ns > 0);
+        let (ref source, ref destination) = buffers[0];
+        for i in 0..source.len() {
+            assert_eq!(unsafe { source.as_ptr().add(i).read() }, 0x5a);
+            assert_eq!(unsafe { destination.as_ptr().add(i).read() }, 0x5a);
         }
     }
 }

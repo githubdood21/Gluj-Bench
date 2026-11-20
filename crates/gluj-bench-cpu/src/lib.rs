@@ -122,6 +122,10 @@ impl CpuBandwidthProvider {
                 cache.descriptor.level == level
                     && cache.group == location.group
                     && cache.mask & processor_mask != 0
+                    && matches!(
+                        cache.descriptor.kind,
+                        gluj_bench_core::CacheKind::Data | gluj_bench_core::CacheKind::Unified
+                    )
             })
             .max_by_key(|cache| cache.descriptor.size_bytes)
     }
@@ -374,7 +378,7 @@ impl CpuBandwidthProvider {
             Self::cache_layout(topology, level)
         }
         .map_err(|reason| BenchmarkError::new("benchmark_unavailable", reason))?;
-        let selected = topology::selected_workers(topology, config, false)?;
+        let selected = topology::selected_workers(topology, config, logical_mode)?;
         layout.retain(|(location, _)| selected.contains(location));
         let target = topology.representative_caches.get(&level).unwrap();
         let locations: Vec<_> = layout.iter().map(|(location, _)| *location).collect();

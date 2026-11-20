@@ -1,6 +1,6 @@
 use crate::{
     kernels::statistics,
-    latency::{Chain, LOCAL_BYTES, Pattern},
+    latency::{Chain, Pattern},
     topology::{AffinityGuard, CpuTopology},
 };
 use gluj_bench_core::{
@@ -183,11 +183,7 @@ pub fn run(
         (layout.bytes as u64).min(system.available_memory() / 16),
     )?;
     let access = gluj_bench_core::AccessPolicy::from_config(config)?;
-    let locality = config
-        .options
-        .get("locality_block_bytes")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(LOCAL_BYTES);
+    let locality = crate::latency::locality_block_bytes(config)?;
     let location = topology.representative;
     let _affinity = AffinityGuard::pin(location)?;
     progress(ProgressUpdate {
@@ -225,7 +221,8 @@ pub fn run(
     let mut elapsed_total = 0u64;
     let mut loads_total = 0u64;
     let mut pacer = crate::pacing::CpuPacer::current(cancellation);
-    for sample in 0..config.samples * access.realizations {
+    let total_samples = config.samples * access.realizations;
+    for sample in 0..total_samples {
         let realization = sample / config.samples;
         if sample > 0 && sample.is_multiple_of(config.samples) {
             chain = Chain::new_seeded(
@@ -241,12 +238,12 @@ pub fn run(
         }
         let observation_started = Instant::now();
         progress(ProgressUpdate {
-            fraction: 0.1 + 0.9 * f64::from(sample) / f64::from(config.samples),
+            fraction: crate::latency::sample_progress_fraction(sample, total_samples),
             phase: "sample".into(),
             message: format!(
                 "L{level} cache latency: sample {} of {}",
                 sample + 1,
-                config.samples
+                total_samples
             ),
         });
         let mut elapsed = 0u64;

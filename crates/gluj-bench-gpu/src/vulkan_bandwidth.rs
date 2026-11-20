@@ -1190,6 +1190,12 @@ fn create_staging_ring<'a>(
     count: usize,
     cancellation: &CancellationToken,
 ) -> Result<StagingRing<'a>, BenchmarkError> {
+    if count == 0 {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Staging ring requires at least one buffer.",
+        ));
+    }
     let mut ring = StagingRing {
         context,
         buffers: Vec::new(),

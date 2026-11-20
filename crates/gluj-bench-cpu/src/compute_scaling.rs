@@ -225,26 +225,21 @@ pub(crate) fn cache_dataset_aligned(
             "No selected CPU workers.",
         ));
     }
+    let mut matched = 0usize;
     let mut per_worker = u64::MAX;
     for worker in workers {
-        let target = topology
-            .cache_targets
-            .iter()
-            .find(|target| {
-                target.descriptor.level == level
-                    && target.group == worker.group
-                    && target.mask & (1usize << worker.index) != 0
-                    && matches!(
-                        target.descriptor.kind,
-                        gluj_bench_core::CacheKind::Data | gluj_bench_core::CacheKind::Unified
-                    )
-            })
-            .ok_or_else(|| {
-                BenchmarkError::new(
-                    "cache_unavailable",
-                    format!("L{level} data cache was not detected for every selected worker."),
+        let Some(target) = topology.cache_targets.iter().find(|target| {
+            target.descriptor.level == level
+                && target.group == worker.group
+                && target.mask & (1usize << worker.index) != 0
+                && matches!(
+                    target.descriptor.kind,
+                    gluj_bench_core::CacheKind::Data | gluj_bench_core::CacheKind::Unified
                 )
-            })?;
+        }) else {
+            continue;
+        };
+        matched += 1;
         let sharing = workers
             .iter()
             .filter(|other| {
@@ -252,6 +247,12 @@ pub(crate) fn cache_dataset_aligned(
             })
             .count() as u64;
         per_worker = per_worker.min(target.descriptor.size_bytes / 4 * 3 / sharing);
+    }
+    if matched == 0 {
+        return Err(BenchmarkError::new(
+            "cache_unavailable",
+            format!("L{level} data cache was not detected for any selected worker."),
+        ));
     }
     let bytes = per_worker / alignment * alignment * workers.len() as u64;
     if bytes == 0 {
@@ -559,6 +560,28 @@ unsafe fn vector_sweep(a: &[f32], b: &[f32], output: &mut [f32]) {
     }
 }
 
+fn profile_realization_count(
+    config: &BenchmarkConfig,
+    matrix: bool,
+) -> Result<u32, BenchmarkError> {
+    if matrix {
+        Ok(1)
+    } else {
+        Ok(gluj_bench_core::AccessPolicy::from_config(config)?.realizations)
+    }
+}
+
+fn efficiency_guidance_note(steps: &str, workers: usize, matrix: bool) -> String {
+    let shape_note = if matrix {
+        " Matrix dimensions and operations per pass may change with worker count, so inspect recorded shapes and validate application completion time."
+    } else {
+        " Validate application completion time."
+    };
+    format!(
+        "Efficiency goal: retain throughput while seeking lower power use and heat. Explore {steps} physical cores in that order, starting from {workers}. These are untested search candidates, not a measured optimum. Compare every step with the original baseline at the same aggregate dataset and arithmetic settings. Keep at least 95% of original throughput; otherwise restore the last passing allocation and refine between passing and failing counts.{shape_note} Power and temperatures are not measured. No process settings or clocks were changed."
+    )
+}
+
 pub(crate) fn measure(
     locations: &[ProcessorLocation],
     bytes: u64,
@@ -651,7 +674,7 @@ pub(crate) fn measure(
                         if let WorkBuffers::Ascii(ascii) = &mut buffers {
                             ascii.prepare_reference(&mut schedules[0], cancellation);
                         }
-                        Ok::<_, BenchmarkError>((affinity, buffers, schedules))
+                        Ok::<_, BenchmarkError>((affinity, buffers, schedules, policy))
                     })();
                     if prepared.is_err() {
                         failed.store(true, Ordering::SeqCst);
@@ -666,7 +689,7 @@ pub(crate) fn measure(
                             )
                         }));
                     }
-                    let (_affinity, mut buffers, mut schedules) = prepared?;
+                    let (_affinity, mut buffers, mut schedules, policy) = prepared?;
                     let mut pacer = crate::pacing::CpuPacer::new(intensity, cancellation);
                     let warmup_timer = recorder
                         .as_ref()
@@ -697,30 +720,16 @@ pub(crate) fn measure(
                             recorder.clone()
                         } else {
                             recorder.as_ref().map(|r| {
+                                let realization_seed =
+                                    policy.derived_seed(index, elements.max(64), realization);
                                 r.with_realization(
-                                    access.derived_seed(index, elements, realization),
+                                    realization_seed,
                                     std::collections::BTreeMap::from([
                                         ("root_seed".into(), access.seed.to_string()),
                                         ("worker".into(), index.to_string()),
                                         (
-                                            format!(
-                                                "block-{}-schedule-seed",
-                                                recorder
-                                                    .as_ref()
-                                                    .map(|r| r.block_index())
-                                                    .unwrap_or(0)
-                                            ),
-                                            gluj_bench_core::derive_seed(
-                                                access.seed,
-                                                0,
-                                                bytes,
-                                                recorder
-                                                    .as_ref()
-                                                    .map(|r| r.block_index())
-                                                    .unwrap_or(0)
-                                                    .into(),
-                                            )
-                                            .to_string(),
+                                            format!("block-{}-schedule-seed", r.block_index()),
+                                            policy.seed.to_string(),
                                         ),
                                         ("dataset_bytes".into(), bytes.to_string()),
                                         ("realization".into(), realization.to_string()),
@@ -856,13 +865,13 @@ pub(crate) fn measure(
     let mut total_elapsed = 0;
     let mut checksum = 0;
     for index in 0..(config.samples * realizations) as usize {
-        let sweeps = results.iter().map(|s| s[index].0).sum::<u64>();
-        let elapsed = results.iter().map(|s| s[index].1).max().unwrap().max(1);
-        compute.push(sweeps as f64 * 1e9 / elapsed as f64);
-        bandwidth.push(
-            sweeps as f64 * traffic_per_sweep as f64 / operations_per_sweep as f64 * 1e9
-                / elapsed as f64,
-        );
+        let elapsed = results.iter().map(|s| s[index].1).max().unwrap_or(1).max(1);
+        let compute_rate = results
+            .iter()
+            .map(|s| s[index].0 as f64 * 1e9 / s[index].1.max(1) as f64)
+            .sum::<f64>();
+        compute.push(compute_rate);
+        bandwidth.push(compute_rate * traffic_per_sweep as f64 / operations_per_sweep as f64);
         total_elapsed += elapsed;
         checksum ^= results
             .iter()
@@ -1147,6 +1156,7 @@ pub fn run(
         .fold(0.0_f64, f64::max);
     let transition = transition_index(&compute_tiers, baseline);
     let largest = compute_tiers.last().unwrap().value;
+    let realizations = profile_realization_count(config, matrix)?;
     let mut metadata = BTreeMap::from([
         ("result_validation".into(), "every visited dataset: each worker validates boundary/interior arithmetic or matrix outputs outside timing; register reference checked separately".into()),
         ("compute_reference_benchmark".into(), reference_id.into()),
@@ -1157,9 +1167,9 @@ pub fn run(
         ("arithmetic_iterations".into(), REUSE.to_string()),
         ("data_type".into(), "fp32".into()),
         ("operation_definition".into(), "one floating-point multiply or add per lane; each FMA counts as two".into()),
-        ("profile_sample_count_per_tier".into(), (config.samples * if matrix {1} else {gluj_bench_core::AccessPolicy::from_config(config)?.realizations}).to_string()),
+        ("profile_sample_count_per_tier".into(), (config.samples * realizations).to_string()),
         ("target_duration_ms_per_realization".into(), config.target_duration_ms.to_string()),
-        ("target_duration_ms_per_tier".into(), (config.target_duration_ms * gluj_bench_core::AccessPolicy::from_config(config)?.realizations as u64).to_string()),
+        ("target_duration_ms_per_tier".into(), (config.target_duration_ms * realizations as u64).to_string()),
         ("warmup_ms_per_tier".into(), (gluj_bench_core::measurement_budget(config).warmup_ns/1_000_000).to_string()),
         ("arithmetic_intensity_operations_per_byte".into(), format!("{:.4}", (2 * REUSE) as f64 / BYTES_PER_ELEMENT as f64)),
         ("thread_count".into(), locations.len().to_string()),
@@ -1204,7 +1214,7 @@ pub fn run(
             && m.statistics.standard_deviation.is_finite()
             && m.statistics.standard_deviation.abs() / m.value <= 0.10
     };
-    if transition.is_some()
+    let candidates = if transition.is_some()
         && largest < baseline * 0.85
         && stable(&reference)
         && compute_tiers
@@ -1219,9 +1229,11 @@ pub fn run(
         })
         && crate::topology::explicit_core_limit(config)
     {
-        let candidates =
-            gluj_bench_core::cpu_efficiency_trials(locations.len() as u32, largest / baseline);
-        let trial = candidates[0];
+        gluj_bench_core::cpu_efficiency_trials(locations.len() as u32, largest / baseline)
+    } else {
+        Vec::new()
+    };
+    if let Some(&trial) = candidates.first() {
         let steps = candidates
             .iter()
             .map(u32::to_string)
@@ -1237,7 +1249,10 @@ pub fn run(
             "cpu_core_trial_baseline_operations_per_second".into(),
             largest.to_string(),
         );
-        metadata.insert("tuning_guidance".into(), format!("Efficiency goal: retain throughput while seeking lower power use and heat. Explore {steps} physical cores in that order, starting from {}. These are untested search candidates, not a measured optimum. Compare every step with the original baseline at the same aggregate dataset and arithmetic settings. Keep at least 95% of original throughput; otherwise restore the last passing allocation and refine between passing and failing counts. Matrix dimensions and operations per pass may change with worker count, so inspect recorded shapes and validate application completion time. Power and temperatures are not measured. No process settings or clocks were changed.", locations.len()));
+        metadata.insert(
+            "tuning_guidance".into(),
+            efficiency_guidance_note(&steps, locations.len(), matrix),
+        );
     } else {
         metadata.insert("tuning_guidance".into(), "No measured optimal core count. Select an exact physical-core allocation and inspect results for the same aggregate dataset size. Fewer workers may reduce contention, power use or heat, but can also lower throughput. Power and temperatures are not measured; application benefits require testing that application's workload. No process affinity or clock setting was changed.".into());
     }
@@ -1288,9 +1303,6 @@ pub fn run(
             "working_set_definition".into(),
             "aggregate of one input array and one output array across selected workers".into(),
         );
-        if let Some(guidance) = metadata.get_mut("tuning_guidance") {
-            *guidance = guidance.replace("Matrix dimensions per worker change with the worker count, so inspect the recorded shapes when comparing. ", "");
-        }
     }
     if matrix {
         let n = crate::matrix_scaling::dimension_for_bytes(
@@ -1474,9 +1486,20 @@ mod tests {
             cache_dataset(&topology, workers, 1).unwrap_err().code,
             "cache_unavailable"
         );
-        let mut missing = topology.clone();
-        missing.cache_targets.pop();
-        assert!(cache_dataset(&missing, workers, 3).is_err());
+        // Hybrid topologies (e.g. Intel LP E-cores without L3) still size from detected L3 instances,
+        // while missing the cache level across all selected workers fails cleanly.
+        let mut partial_l3 = topology.clone();
+        partial_l3.cache_targets.pop();
+        assert_eq!(
+            cache_dataset(&partial_l3, workers, 3).unwrap(),
+            aligned(3 * MIB) * 4
+        );
+        let mut no_l3 = topology.clone();
+        no_l3.cache_targets.clear();
+        assert_eq!(
+            cache_dataset(&no_l3, workers, 3).unwrap_err().code,
+            "cache_unavailable"
+        );
     }
 
     #[test]
@@ -1977,5 +2000,20 @@ mod access_regressions {
         {
             false
         }
+    }
+
+    #[test]
+    fn matrix_metadata_helpers_omit_shape_warning_for_scalar_or_vector_and_cap_realizations() {
+        let config = BenchmarkConfig {
+            options: BTreeMap::from([("access_realizations".into(), "3".into())]),
+            ..Default::default()
+        };
+        assert_eq!(profile_realization_count(&config, true).unwrap(), 1);
+        assert_eq!(profile_realization_count(&config, false).unwrap(), 3);
+        let non_matrix = efficiency_guidance_note("4,2", 8, false);
+        assert!(!non_matrix.contains("Matrix dimensions"));
+        assert!(non_matrix.contains("Validate application completion time."));
+        let matrix = efficiency_guidance_note("4,2", 8, true);
+        assert!(matrix.contains("Matrix dimensions"));
     }
 }

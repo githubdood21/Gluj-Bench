@@ -2,25 +2,29 @@
 
 All notable changes to Gluj-Bench are documented here. The project follows semantic versioning.
 
-## [1.0.0] - 2026-11-08
+## [1.0.0] - 2026-11-20
 
 ### Added
 
-- Fifteen workload families with Curated plans and configurable Custom tests, including CPU core allocation, GPU precision, dataset sweeps, and seeded access patterns.
+- Fifteen synthetic workload families with read-only curated sets and saved user-created test sets, including CPU core allocation, GPU precision, dataset sweeps, and seeded access patterns.
 - Interactive TOPS charts with click-to-copy values and a compact reference-gap percentage for the largest tested dataset.
 - Saved run timestamps, New badges, raw observation charts, named baselines, and native JSON import and export. PNG snapshots embed selected comparison summaries by default.
 - System memory data bus width across populated channels when firmware exposes reliable topology.
+- Short contextual hover hints, hardware-specific unsupported-format lists, and shared dropdown styling and keyboard controls.
 
 ### Changed
 
 - Default to six observations per condition, with three in Shorter run. Curated uses standard access and a single realization. Custom supports opt-in randomness and multiple seeds.
-- Keep the test checklist visible, show the queue only during execution, and group history actions by the selected run.
+- Keep included tests visible in the selected set, show the queue only during execution, and group history actions by the selected run.
 - Use a brass-and-iris palette and compact Settings, hardware, and result layouts. Keep raw identifiers in technical views and native records.
+- Use a measurement-console layout with grouped test-set rows and a fixed side panel for inspecting sets and adding or editing individual tests.
+- Refresh the README screenshots and distinguish current synthetic benchmarks from planned real application, multi-device, and storage workloads.
 
 ### Fixed
 
 - Match visible test names in Run History, synchronize the component picker when opening a saved run, and keep existing measurements in their original result groups.
 - Show clear import failures near the Files menu and keep parser details available on demand.
+- Keep long dataset-comparison labels and expanded test settings visible by wrapping text at the available width and sizing rows to fit.
 
 ## [0.5.0-rc.1] - 2026-11-03
 

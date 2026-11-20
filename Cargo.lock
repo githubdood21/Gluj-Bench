@@ -1719,6 +1719,7 @@ dependencies = [
  "half",
  "serde_json",
  "sysinfo",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

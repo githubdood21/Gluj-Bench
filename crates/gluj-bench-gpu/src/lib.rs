@@ -2,6 +2,7 @@ mod analysis;
 mod compute;
 mod cooperative_matrix;
 mod memory_conditions;
+mod pcie_info;
 mod scaling;
 mod timing;
 mod traffic;
@@ -206,6 +207,35 @@ impl GpuBandwidthProvider {
                 "min_storage_buffer_offset_alignment".into(),
                 vulkan.min_storage_buffer_offset_alignment.to_string(),
             );
+            if let Some(bus_info) = vulkan.pci_bus_info {
+                properties.insert("pcie_bus_id".into(), bus_info.format_bdf());
+            }
+            if let Some(link) = vulkan.pcie_link {
+                if link.is_integrated_endpoint {
+                    properties.insert("pcie_integrated_endpoint".into(), "true".into());
+                }
+                if let Some(generation) = link.generation {
+                    properties.insert("pcie_link_generation".into(), generation.to_string());
+                }
+                if let Some(width) = link.width {
+                    properties.insert("pcie_link_width".into(), width.to_string());
+                }
+                if let Some(generation) = link.current_generation {
+                    properties.insert(
+                        "pcie_current_link_generation".into(),
+                        generation.to_string(),
+                    );
+                }
+                if let Some(width) = link.current_width {
+                    properties.insert("pcie_current_link_width".into(), width.to_string());
+                }
+                if let Some(generation) = link.max_generation {
+                    properties.insert("pcie_max_link_generation".into(), generation.to_string());
+                }
+                if let Some(width) = link.max_width {
+                    properties.insert("pcie_max_link_width".into(), width.to_string());
+                }
+            }
             devices.push(DeviceDescriptor {
                 id: id.clone(),
                 name: vulkan.name.clone(),
@@ -368,7 +398,7 @@ impl GpuBandwidthProvider {
                 &context,
                 DispatchMeasurement {
                     size,
-                    dispatch_bytes: size.max(64 * MIB),
+                    dispatch_bytes: size,
                     operation: KernelOperation::Read,
                     flavor: KernelFlavor::Cache,
                     precondition: true,
@@ -478,7 +508,7 @@ impl GpuBandwidthProvider {
                 continue;
             };
             let label = tier_label(tier_index);
-            allocated_peak = allocated_peak.max(2 * working_set + working_set.max(64 * MIB) / 16);
+            allocated_peak = allocated_peak.max(2 * working_set + working_set / 16);
             metadata.insert(
                 format!("estimated_effective_{label}_classification"),
                 "inferred".into(),
@@ -521,11 +551,7 @@ impl GpuBandwidthProvider {
                     &context,
                     DispatchMeasurement {
                         size: working_set,
-                        dispatch_bytes: if matches!(operation, KernelOperation::Read) {
-                            working_set.max(64 * MIB)
-                        } else {
-                            working_set
-                        },
+                        dispatch_bytes: working_set,
                         operation,
                         flavor: KernelFlavor::Cache,
                         precondition: true,
@@ -863,7 +889,6 @@ impl BenchmarkProvider for GpuBandwidthProvider {
     }
 
     fn conditions(&self) -> Vec<gluj_bench_core::ConditionDescriptor> {
-        let matrix = cooperative_matrix::descriptors(&self.adapters);
         self.benchmark_descriptors()
             .iter()
             .map(|descriptor| {
@@ -939,37 +964,42 @@ impl BenchmarkProvider for GpuBandwidthProvider {
                         });
                     }
                 }
-                let (register_id, preset_key) = match descriptor.id.as_str() {
-                    "gpu.performance.matrix.fp16.scaling" => {
-                        ("gpu.performance.matrix.fp16", "gpu_matrix_preset")
-                    }
-                    "gpu.performance.matrix.int8.scaling" => {
-                        ("gpu.performance.matrix.int8", "gpu_int8_matrix_preset")
-                    }
+                let preset_key = match descriptor.id.as_str() {
+                    "gpu.performance.matrix.fp16.scaling" => "gpu_matrix_preset",
+                    "gpu.performance.matrix.int8.scaling" => "gpu_int8_matrix_preset",
                     _ => return condition,
                 };
-                if let Some(register) = matrix.iter().find(|d| d.id == register_id) {
+                if let Some(matrix_caps) =
+                    cooperative_matrix::preset_capabilities(&self.adapters, &descriptor.id)
+                {
                     if let Some(option) = condition.options.iter().find(|o| o.key == preset_key)
                         && let gluj_bench_core::OptionDomain::Choice { values } = &option.domain
                     {
                         for value in values {
-                            let capability = if value == "register" {
-                                register
+                            let (supported_device_ids, unavailable_reason) = if value == "register"
+                            {
+                                (
+                                    matrix_caps.register_device_ids.clone(),
+                                    matrix_caps.register_unavailable_reason.clone(),
+                                )
                             } else {
-                                descriptor
+                                (
+                                    matrix_caps.buffered_device_ids.clone(),
+                                    matrix_caps.buffered_unavailable_reason.clone(),
+                                )
                             };
                             condition
                                 .capabilities
                                 .push(gluj_bench_core::ModeCapability {
                                     when: BTreeMap::from([(preset_key.into(), value.clone())]),
-                                    supported_device_ids: capability.supported_device_ids.clone(),
-                                    unavailable_reason: capability.unavailable_reason.clone(),
+                                    supported_device_ids,
+                                    unavailable_reason,
                                 });
                         }
                     }
                     condition
                         .supported_device_ids
-                        .extend(register.supported_device_ids.clone());
+                        .extend(matrix_caps.register_device_ids);
                     condition.supported_device_ids.sort();
                     condition.supported_device_ids.dedup();
                     condition.available = !condition.supported_device_ids.is_empty();

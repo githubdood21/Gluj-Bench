@@ -297,7 +297,7 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
     .collect::<Vec<_>>();
     let supported_device_ids = adapters
         .iter()
-        .filter(|record| matrix_available(record, FP16_MATRIX_ID))
+        .filter(|record| matrix_available(record, FP16_MATRIX_SCALING_ID))
         .map(|record| record.id.clone())
         .collect::<Vec<_>>();
     let available = !supported_device_ids.is_empty();
@@ -316,15 +316,8 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
             available,
             unavailable_reason: if available {
                 String::new()
-            } else if adapters.is_empty() {
-                "adapter_not_found".into()
-            } else if adapters
-                .iter()
-                .any(|record| record.cooperative.fp16.is_some())
-            {
-                "storage_buffer_16bit_access_unsupported".into()
             } else {
-                "fp16_cooperative_matrix_unsupported".into()
+                matrix_unavailable_reason(adapters, FP16_MATRIX_SCALING_ID)
             },
             suite_id: "gpu.performance".into(),
             display_order: 121,
@@ -355,21 +348,109 @@ pub(super) fn descriptors(adapters: &[AdapterRecord]) -> Vec<BenchmarkDescriptor
     int8.display_order = 122;
     int8.supported_device_ids = adapters
         .iter()
-        .filter(|r| matrix_available(r, INT8_MATRIX_ID))
+        .filter(|r| matrix_available(r, INT8_MATRIX_SCALING_ID))
         .map(|r| r.id.clone())
         .collect();
     int8.available = !int8.supported_device_ids.is_empty();
     int8.unavailable_reason = if int8.available {
         String::new()
-    } else if adapters.is_empty() {
-        "adapter_not_found".into()
     } else {
-        "int8_cooperative_matrix_unsupported".into()
+        matrix_unavailable_reason(adapters, INT8_MATRIX_SCALING_ID)
     };
     descriptors.insert(2, int8);
     descriptors
         .retain(|descriptor| !matches!(descriptor.id.as_str(), FP16_MATRIX_ID | INT8_MATRIX_ID));
     descriptors
+}
+
+pub(super) struct MatrixPresetCapability {
+    pub register_device_ids: Vec<String>,
+    pub register_unavailable_reason: String,
+    pub buffered_device_ids: Vec<String>,
+    pub buffered_unavailable_reason: String,
+}
+
+pub(super) fn preset_capabilities(
+    adapters: &[AdapterRecord],
+    id: &str,
+) -> Option<MatrixPresetCapability> {
+    let (register_id, scaling_id) = match id {
+        FP16_MATRIX_SCALING_ID => (FP16_MATRIX_ID, FP16_MATRIX_SCALING_ID),
+        INT8_MATRIX_SCALING_ID => (INT8_MATRIX_ID, INT8_MATRIX_SCALING_ID),
+        _ => return None,
+    };
+    let register_device_ids = adapters
+        .iter()
+        .filter(|record| matrix_available(record, register_id))
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let buffered_device_ids = adapters
+        .iter()
+        .filter(|record| matrix_available(record, scaling_id))
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    Some(MatrixPresetCapability {
+        register_unavailable_reason: if register_device_ids.is_empty() {
+            matrix_unavailable_reason(adapters, register_id)
+        } else {
+            String::new()
+        },
+        register_device_ids,
+        buffered_unavailable_reason: if buffered_device_ids.is_empty() {
+            matrix_unavailable_reason(adapters, scaling_id)
+        } else {
+            String::new()
+        },
+        buffered_device_ids,
+    })
+}
+
+fn matrix_unavailable_reason(adapters: &[AdapterRecord], id: &str) -> String {
+    if adapters.is_empty() {
+        return "adapter_not_found".into();
+    }
+    let is_fp16 = matches!(id, FP16_MATRIX_ID | FP16_MATRIX_SCALING_ID);
+    let has_matrix = adapters
+        .iter()
+        .any(|r| MatrixKind::for_benchmark(r, id).is_ok());
+    if !has_matrix {
+        if !is_fp16 && adapters.iter().any(|r| r.cooperative.int8.is_some()) {
+            return "int8_cooperative_matrix_type_pair_unsupported".into();
+        }
+        return if is_fp16 {
+            "fp16_cooperative_matrix_unsupported"
+        } else {
+            "int8_cooperative_matrix_unsupported"
+        }
+        .into();
+    }
+    if !adapters
+        .iter()
+        .any(|r| MatrixKind::for_benchmark(r, id).is_ok() && r.supports_vulkan_timestamps())
+    {
+        return "timestamp_query_unsupported".into();
+    }
+    if !adapters.iter().any(|r| {
+        MatrixKind::for_benchmark(r, id).is_ok()
+            && r.supports_vulkan_timestamps()
+            && subgroup_size_supported(r)
+    }) {
+        return "subgroup_size_unsupported".into();
+    }
+    if id == FP16_MATRIX_SCALING_ID {
+        "storage_buffer_16bit_access_unsupported".into()
+    } else if id == INT8_MATRIX_SCALING_ID {
+        "storage_buffer_8bit_access_unsupported".into()
+    } else if is_fp16 {
+        "fp16_cooperative_matrix_unsupported".into()
+    } else {
+        "int8_cooperative_matrix_unsupported".into()
+    }
+}
+
+fn subgroup_size_supported(record: &AdapterRecord) -> bool {
+    record.vulkan.subgroup_size != 0
+        && MATRIX_WORKGROUP_SIZE.is_multiple_of(record.vulkan.subgroup_size as u64)
 }
 
 fn hardware_support(record: &AdapterRecord, id: &str) -> bool {
@@ -382,6 +463,7 @@ fn hardware_support(record: &AdapterRecord, id: &str) -> bool {
 
 fn matrix_available(record: &AdapterRecord, id: &str) -> bool {
     record.supports_vulkan_timestamps()
+        && subgroup_size_supported(record)
         && MatrixKind::for_benchmark(record, id).is_ok()
         && (id != FP16_MATRIX_SCALING_ID || record.vulkan.storage_buffer_16bit_access)
         && (id != INT8_MATRIX_SCALING_ID || record.vulkan.storage_buffer_8bit_access)
@@ -453,7 +535,7 @@ pub(super) fn run(
         ),
     });
     let context = VulkanMatrixContext::new(record, kind)?;
-    let workgroups = autotune_workgroups(&context, kind, shape, cancellation)?;
+    let (workgroups, _) = autotune_workgroups(&context, kind, shape, cancellation)?;
     let harness = MatrixHarness::new(&context, kind, shape, workgroups)?;
 
     progress(ProgressUpdate {
@@ -519,6 +601,7 @@ pub(super) fn run(
         i64::from(shape.k) * 256,
     )?;
     let mut metadata = matrix_metadata(record, kind, shape);
+    metadata.insert("subgroup_size".into(), harness.subgroup_size.to_string());
     metadata.insert("result_validation".into(), "boundary and interior register tile outputs compared with exact scalar tile arithmetic outside timing".into());
     insert_clock_policy(&mut metadata);
     metadata.insert("selected_workgroups".into(), workgroups.to_string());
@@ -641,7 +724,8 @@ fn run_matrix_scaling(
             kind.label()
         ),
     });
-    let workgroups = autotune_workgroups(&context, kind, shape, cancellation)?;
+    let (workgroups, actual_subgroup_size) =
+        autotune_workgroups(&context, kind, shape, cancellation)?;
     let bytes_per_tile = matrix_profile_bytes_per_tile(shape, kind);
     let max_tiles_per_binding = (record.vulkan.max_storage_buffer_range
         / (shape.m as u64 * shape.k as u64 * kind.operand_bytes()))
@@ -653,7 +737,7 @@ fn run_matrix_scaling(
     let budget_percent = gluj_bench_core::vram_budget_percent(config)?;
     let allocation_budget =
         gluj_bench_core::vram_budget_bytes(record.vulkan.device_local_memory_bytes, budget_percent);
-    let active_subgroups = workgroups as u64 * MATRIX_WORKGROUP_SIZE / context.subgroup_size as u64;
+    let active_subgroups = workgroups as u64 * MATRIX_WORKGROUP_SIZE / actual_subgroup_size as u64;
     let output_bytes = active_subgroups * shape.m as u64 * shape.n as u64 * 4;
     let mut memory_limit = allocation_budget
         .saturating_sub(output_bytes)
@@ -673,7 +757,7 @@ fn run_matrix_scaling(
             record.vulkan.device_local_memory_bytes,
             record.vulkan.max_storage_buffer_range,
             [u64::from(shape.m), u64::from(shape.n), u64::from(shape.k)],
-            u64::from(context.subgroup_size),
+            u64::from(actual_subgroup_size),
             budget_percent,
             (record.vulkan.device_type != vk::PhysicalDeviceType::DISCRETE_GPU)
                 .then_some(memory.available_memory()),
@@ -917,7 +1001,11 @@ fn run_matrix_scaling(
         .map(
             |(working_set_bytes, compute, bandwidth)| MatrixProfilePoint {
                 working_set_bytes,
-                retained_ratio: (compute.median / baseline).clamp(0.0, 2.0),
+                retained_ratio: if baseline > 0.0 {
+                    (compute.median / baseline).clamp(0.0, 2.0)
+                } else {
+                    0.0
+                },
                 compute,
                 bandwidth,
             },
@@ -958,6 +1046,7 @@ fn run_matrix_scaling(
         });
     }
     let mut metadata = matrix_metadata(record, kind, shape);
+    metadata.insert("subgroup_size".into(), harness.subgroup_size.to_string());
     metadata.insert("matrix_tile_shape".into(), shape_name(shape));
     metadata.insert(
         "matrix_traversal".into(),
@@ -1199,7 +1288,7 @@ fn autotune_workgroups(
     kind: MatrixKind,
     shape: MatrixShape,
     cancellation: &CancellationToken,
-) -> Result<u32, BenchmarkError> {
+) -> Result<(u32, u32), BenchmarkError> {
     let mut best = None;
     for workgroups in WORKGROUP_CANDIDATES {
         ensure_not_cancelled(cancellation)?;
@@ -1209,16 +1298,17 @@ fn autotune_workgroups(
         let elapsed_ns = harness.measure(iterations)?;
         let rate =
             harness.operations_per_dispatch() as f64 * iterations as f64 / (elapsed_ns / 1e9);
-        if best.is_none_or(|(_, best_rate)| rate > best_rate) {
-            best = Some((workgroups, rate));
+        if best.is_none_or(|(_, _, best_rate)| rate > best_rate) {
+            best = Some((workgroups, harness.subgroup_size, rate));
         }
     }
-    best.map(|(workgroups, _)| workgroups).ok_or_else(|| {
-        BenchmarkError::new(
-            "compute_limits_unsupported",
-            "No cooperative-matrix saturation workload could be dispatched.",
-        )
-    })
+    best.map(|(workgroups, subgroup_size, _)| (workgroups, subgroup_size))
+        .ok_or_else(|| {
+            BenchmarkError::new(
+                "compute_limits_unsupported",
+                "No cooperative-matrix saturation workload could be dispatched.",
+            )
+        })
 }
 
 fn iterations_for_target(per_dispatch_ns: f64, target_seconds: f64) -> u32 {
@@ -1244,6 +1334,9 @@ struct VulkanMatrixContext {
     timestamp_period_ns: f64,
     timestamp_valid_bits: u32,
     subgroup_size: u32,
+    subgroup_size_control: bool,
+    min_subgroup_size: u32,
+    max_subgroup_size: u32,
     queue_family: u32,
 }
 
@@ -1265,7 +1358,10 @@ impl VulkanMatrixContext {
             size,
         )? {
             let valid = if kind == MatrixKind::Fp16 {
-                f32::from_bits(word) == expected as f32
+                let actual = f32::from_bits(word);
+                let expected = expected as f32;
+                let tolerance = (expected.abs() * 1e-4).max(1e-3);
+                actual.is_finite() && (actual - expected).abs() <= tolerance
             } else {
                 word == expected as u32
             };
@@ -1312,7 +1408,37 @@ impl VulkanMatrixContext {
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(record.vulkan.compute_queue_family)
             .queue_priorities(&priorities)];
-        let extension_names = [ash::khr::cooperative_matrix::NAME.as_ptr()];
+        let mut extension_names = vec![ash::khr::cooperative_matrix::NAME.as_ptr()];
+        if record.vulkan.subgroup_size_control
+            && record.vulkan.api_version < vk::API_VERSION_1_3
+            && record
+                .vulkan
+                .extensions
+                .contains("VK_EXT_subgroup_size_control")
+        {
+            extension_names.push(c"VK_EXT_subgroup_size_control".as_ptr());
+        }
+        if record.vulkan.api_version < vk::API_VERSION_1_2 {
+            if record
+                .vulkan
+                .extensions
+                .contains("VK_KHR_shader_float16_int8")
+            {
+                extension_names.push(c"VK_KHR_shader_float16_int8".as_ptr());
+            }
+            if kind == MatrixKind::Fp16
+                && record.vulkan.storage_buffer_16bit_access
+                && record.vulkan.extensions.contains("VK_KHR_16bit_storage")
+            {
+                extension_names.push(c"VK_KHR_16bit_storage".as_ptr());
+            }
+            if kind != MatrixKind::Fp16
+                && record.vulkan.storage_buffer_8bit_access
+                && record.vulkan.extensions.contains("VK_KHR_8bit_storage")
+            {
+                extension_names.push(c"VK_KHR_8bit_storage".as_ptr());
+            }
+        }
         let mut cooperative =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut numeric = vk::PhysicalDeviceShaderFloat16Int8Features::default()
@@ -1326,13 +1452,18 @@ impl VulkanMatrixContext {
             .storage_buffer8_bit_access(
                 kind != MatrixKind::Fp16 && record.vulkan.storage_buffer_8bit_access,
             );
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut subgroup_control = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+            .subgroup_size_control(record.vulkan.subgroup_size_control);
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extension_names)
             .push_next(&mut cooperative)
             .push_next(&mut numeric)
             .push_next(&mut storage_16bit)
             .push_next(&mut storage_8bit);
+        if record.vulkan.subgroup_size_control {
+            device_info = device_info.push_next(&mut subgroup_control);
+        }
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) } {
             Ok(device) => device,
             Err(problem) => {
@@ -1382,8 +1513,19 @@ impl VulkanMatrixContext {
             timestamp_period_ns: record.vulkan.timestamp_period_ns as f64,
             timestamp_valid_bits: record.vulkan.timestamp_valid_bits,
             subgroup_size: record.vulkan.subgroup_size,
+            subgroup_size_control: record.vulkan.subgroup_size_control,
+            min_subgroup_size: record.vulkan.min_subgroup_size,
+            max_subgroup_size: record.vulkan.max_subgroup_size,
             queue_family: record.vulkan.compute_queue_family,
         })
+    }
+
+    fn subgroup_size_candidates(&self) -> Vec<u32> {
+        subgroup_size_candidates(
+            self.subgroup_size,
+            self.min_subgroup_size,
+            self.max_subgroup_size,
+        )
     }
 
     fn create_output(&self, size: u64) -> Result<Buffer, BenchmarkError> {
@@ -1523,9 +1665,141 @@ impl Drop for VulkanMatrixContext {
     }
 }
 
+fn subgroup_size_candidates(
+    reported: u32,
+    min_subgroup_size: u32,
+    max_subgroup_size: u32,
+) -> Vec<u32> {
+    let min = min_subgroup_size.max(1);
+    let max = max_subgroup_size.max(min);
+    let mut candidates = Vec::new();
+    for size in [reported, 32, 16, 8, 64] {
+        if size != 0
+            && MATRIX_WORKGROUP_SIZE.is_multiple_of(u64::from(size))
+            && (min..=max).contains(&size)
+            && !candidates.contains(&size)
+        {
+            candidates.push(size);
+        }
+    }
+    candidates
+}
+
+fn create_matrix_pipeline(
+    context: &VulkanMatrixContext,
+    pipeline_layout: vk::PipelineLayout,
+    shader_bytes: &[u8],
+    shape: MatrixShape,
+) -> Result<(vk::Pipeline, u32), BenchmarkError> {
+    let words = shader_words(shader_bytes)?;
+    // SAFETY: module and specialization structs live until after pipeline creation.
+    unsafe {
+        let module = context
+            .device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            .map_err(|problem| error("vulkan_shader_module_failed", problem))?;
+        let specialization_values = [shape.m, shape.n, shape.k];
+        let specialization_entries = [
+            vk::SpecializationMapEntry {
+                constant_id: 0,
+                offset: 0,
+                size: 4,
+            },
+            vk::SpecializationMapEntry {
+                constant_id: 1,
+                offset: 4,
+                size: 4,
+            },
+            vk::SpecializationMapEntry {
+                constant_id: 2,
+                offset: 8,
+                size: 4,
+            },
+        ];
+        let specialization = vk::SpecializationInfo::default()
+            .map_entries(&specialization_entries)
+            .data(words_as_bytes(&specialization_values));
+
+        let result = if context.subgroup_size_control {
+            let candidates = context.subgroup_size_candidates();
+            let mut last_error = None;
+            let mut created = None;
+            for candidate in candidates {
+                let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                    .required_subgroup_size(candidate);
+                let stage = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(module)
+                    .name(c"main")
+                    .specialization_info(&specialization)
+                    .push_next(&mut required);
+                match context.device.create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(pipeline_layout)],
+                    None,
+                ) {
+                    Ok(pipelines) => {
+                        created = Some((pipelines[0], candidate));
+                        break;
+                    }
+                    Err((_, problem)) => last_error = Some(problem),
+                }
+            }
+            match created {
+                Some(pair) => Ok(pair),
+                None => {
+                    let stage = vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(module)
+                        .name(c"main")
+                        .specialization_info(&specialization);
+                    context
+                        .device
+                        .create_compute_pipelines(
+                            vk::PipelineCache::null(),
+                            &[vk::ComputePipelineCreateInfo::default()
+                                .stage(stage)
+                                .layout(pipeline_layout)],
+                            None,
+                        )
+                        .map(|pipelines| (pipelines[0], context.subgroup_size))
+                        .map_err(|(_, problem)| {
+                            error(
+                                "vulkan_matrix_pipeline_failed",
+                                last_error.unwrap_or(problem),
+                            )
+                        })
+                }
+            }
+        } else {
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main")
+                .specialization_info(&specialization);
+            context
+                .device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(pipeline_layout)],
+                    None,
+                )
+                .map(|pipelines| (pipelines[0], context.subgroup_size))
+                .map_err(|(_, problem)| error("vulkan_matrix_pipeline_failed", problem))
+        };
+        context.device.destroy_shader_module(module, None);
+        result
+    }
+}
+
 struct MatrixHarness<'a> {
     context: &'a VulkanMatrixContext,
     workgroups: u32,
+    subgroup_size: u32,
     shape: MatrixShape,
     output_size: u64,
     output: Buffer,
@@ -1544,9 +1818,6 @@ impl<'a> MatrixHarness<'a> {
         workgroups: u32,
     ) -> Result<Self, BenchmarkError> {
         let _phase_timer = gluj_bench_core::phase_timer("preparation");
-        let subgroups = MATRIX_WORKGROUP_SIZE / context.subgroup_size as u64;
-        let output_size = workgroups as u64 * subgroups * shape.m as u64 * shape.n as u64 * 4;
-        let output = context.create_output(output_size)?;
         // SAFETY: created objects are owned by the harness and destroyed by Drop.
         unsafe {
             let bindings = [vk::DescriptorSetLayoutBinding::default()
@@ -1562,33 +1833,91 @@ impl<'a> MatrixHarness<'a> {
                 )
                 .map_err(|problem| error("vulkan_descriptor_layout_failed", problem))?;
             let set_layouts = [descriptor_layout];
-            let pipeline_layout = context
-                .device
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
-                    None,
-                )
-                .map_err(|problem| error("vulkan_pipeline_layout_failed", problem))?;
+            let pipeline_layout = match context.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
+                None,
+            ) {
+                Ok(layout) => layout,
+                Err(problem) => {
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(error("vulkan_pipeline_layout_failed", problem));
+                }
+            };
+            let (pipeline, subgroup_size) =
+                match create_matrix_pipeline(context, pipeline_layout, kind.shader(), shape) {
+                    Ok(result) => result,
+                    Err(problem) => {
+                        context
+                            .device
+                            .destroy_pipeline_layout(pipeline_layout, None);
+                        context
+                            .device
+                            .destroy_descriptor_set_layout(descriptor_layout, None);
+                        return Err(problem);
+                    }
+                };
+            let subgroups = MATRIX_WORKGROUP_SIZE / subgroup_size as u64;
+            let output_size = workgroups as u64 * subgroups * shape.m as u64 * shape.n as u64 * 4;
+            let output = match context.create_output(output_size) {
+                Ok(buffer) => buffer,
+                Err(problem) => {
+                    context.device.destroy_pipeline(pipeline, None);
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(problem);
+                }
+            };
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)];
-            let descriptor_pool = context
-                .device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&pool_sizes),
-                    None,
-                )
-                .map_err(|problem| error("vulkan_descriptor_pool_failed", problem))?;
-            let descriptor_set = context
-                .device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(descriptor_pool)
-                        .set_layouts(&set_layouts),
-                )
-                .map_err(|problem| error("vulkan_descriptor_set_failed", problem))?[0];
+            let descriptor_pool = match context.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            ) {
+                Ok(pool) => pool,
+                Err(problem) => {
+                    context.device.destroy_buffer(output.handle, None);
+                    context.device.free_memory(output.memory, None);
+                    context.device.destroy_pipeline(pipeline, None);
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(error("vulkan_descriptor_pool_failed", problem));
+                }
+            };
+            let descriptor_set = match context.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&set_layouts),
+            ) {
+                Ok(sets) => sets[0],
+                Err(problem) => {
+                    context
+                        .device
+                        .destroy_descriptor_pool(descriptor_pool, None);
+                    context.device.destroy_buffer(output.handle, None);
+                    context.device.free_memory(output.memory, None);
+                    context.device.destroy_pipeline(pipeline, None);
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(error("vulkan_descriptor_set_failed", problem));
+                }
+            };
             let buffer_info = [vk::DescriptorBufferInfo::default()
                 .buffer(output.handle)
                 .range(output_size)];
@@ -1600,50 +1929,10 @@ impl<'a> MatrixHarness<'a> {
                     .buffer_info(&buffer_info)],
                 &[],
             );
-            let words = shader_words(kind.shader())?;
-            let module = context
-                .device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-                .map_err(|problem| error("vulkan_shader_module_failed", problem))?;
-            let specialization_values = [shape.m, shape.n, shape.k];
-            let specialization_entries = [
-                vk::SpecializationMapEntry {
-                    constant_id: 0,
-                    offset: 0,
-                    size: 4,
-                },
-                vk::SpecializationMapEntry {
-                    constant_id: 1,
-                    offset: 4,
-                    size: 4,
-                },
-                vk::SpecializationMapEntry {
-                    constant_id: 2,
-                    offset: 8,
-                    size: 4,
-                },
-            ];
-            let specialization = vk::SpecializationInfo::default()
-                .map_entries(&specialization_entries)
-                .data(words_as_bytes(&specialization_values));
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main")
-                .specialization_info(&specialization);
-            let pipeline_result = context.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            );
-            context.device.destroy_shader_module(module, None);
-            let pipeline = pipeline_result
-                .map_err(|(_, problem)| error("vulkan_matrix_pipeline_failed", problem))?[0];
             let harness = Self {
                 context,
                 workgroups,
+                subgroup_size,
                 shape,
                 output_size,
                 output,
@@ -1659,7 +1948,7 @@ impl<'a> MatrixHarness<'a> {
     }
 
     fn operations_per_dispatch(&self) -> u64 {
-        let subgroups = MATRIX_WORKGROUP_SIZE / self.context.subgroup_size as u64;
+        let subgroups = MATRIX_WORKGROUP_SIZE / self.subgroup_size as u64;
         self.workgroups as u64 * subgroups * MATRIX_LOOP_COUNT * self.shape.operations_per_mma()
     }
 
@@ -1678,19 +1967,21 @@ impl<'a> MatrixHarness<'a> {
                 &[self.descriptor_set],
                 &[],
             );
-            for _ in 0..iterations {
-                let writes = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
-                device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &writes,
-                    &[],
-                    &[],
-                );
+            for iteration in 0..iterations {
+                if iteration > 0 {
+                    let writes = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &writes,
+                        &[],
+                        &[],
+                    );
+                }
 
                 device.cmd_dispatch(command_buffer, self.workgroups, 1, 1);
             }
@@ -1722,6 +2013,7 @@ struct MatrixProfileHarness<'a> {
     context: &'a VulkanMatrixContext,
     shape: MatrixShape,
     workgroups: u32,
+    subgroup_size: u32,
     active_subgroups: u64,
     bytes_per_tile: u64,
     maximum_working_set_bytes: u64,
@@ -1759,14 +2051,6 @@ impl<'a> MatrixProfileHarness<'a> {
         let input_a_size = tile_count * bytes_a_per_tile;
         let input_b_size = tile_count * bytes_b_per_tile;
         let maximum_working_set_bytes = tile_count * bytes_per_tile;
-        let active_subgroups =
-            workgroups as u64 * MATRIX_WORKGROUP_SIZE / context.subgroup_size as u64;
-        let output_size = active_subgroups * shape.m as u64 * shape.n as u64 * 4;
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
-        let input_a = context.create_buffer(input_a_size, usage)?;
-        let input_b = context.create_buffer(input_b_size, usage)?;
-        let output =
-            context.create_buffer(output_size, usage | vk::BufferUsageFlags::TRANSFER_SRC)?;
         // SAFETY: all created Vulkan objects are owned by the returned harness.
         unsafe {
             let bindings = [0_u32, 1, 2].map(|binding| {
@@ -1796,7 +2080,79 @@ impl<'a> MatrixProfileHarness<'a> {
                         .push_constant_ranges(&push_ranges),
                     None,
                 )
-                .map_err(|problem| error("vulkan_pipeline_layout_failed", problem))?;
+                .map_err(|problem| {
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    error("vulkan_pipeline_layout_failed", problem)
+                })?;
+            let (pipeline, subgroup_size) = match create_matrix_pipeline(
+                context,
+                pipeline_layout,
+                kind.profile_shader(),
+                shape,
+            ) {
+                Ok(result) => result,
+                Err(problem) => {
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(problem);
+                }
+            };
+            let active_subgroups = workgroups as u64 * MATRIX_WORKGROUP_SIZE / subgroup_size as u64;
+            let output_size = active_subgroups * shape.m as u64 * shape.n as u64 * 4;
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+            let input_a = match context.create_buffer(input_a_size, usage) {
+                Ok(buffer) => buffer,
+                Err(problem) => {
+                    context.device.destroy_pipeline(pipeline, None);
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(problem);
+                }
+            };
+            let input_b = match context.create_buffer(input_b_size, usage) {
+                Ok(buffer) => buffer,
+                Err(problem) => {
+                    context.device.destroy_buffer(input_a.handle, None);
+                    context.device.free_memory(input_a.memory, None);
+                    context.device.destroy_pipeline(pipeline, None);
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(problem);
+                }
+            };
+            let output = match context
+                .create_buffer(output_size, usage | vk::BufferUsageFlags::TRANSFER_SRC)
+            {
+                Ok(buffer) => buffer,
+                Err(problem) => {
+                    context.device.destroy_buffer(input_b.handle, None);
+                    context.device.free_memory(input_b.memory, None);
+                    context.device.destroy_buffer(input_a.handle, None);
+                    context.device.free_memory(input_a.memory, None);
+                    context.device.destroy_pipeline(pipeline, None);
+                    context
+                        .device
+                        .destroy_pipeline_layout(pipeline_layout, None);
+                    context
+                        .device
+                        .destroy_descriptor_set_layout(descriptor_layout, None);
+                    return Err(problem);
+                }
+            };
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(3)];
@@ -1836,51 +2192,11 @@ impl<'a> MatrixProfileHarness<'a> {
                     .buffer_info(std::slice::from_ref(&buffer_infos[binding as usize]))
             });
             context.device.update_descriptor_sets(&writes, &[]);
-            let words = shader_words(kind.profile_shader())?;
-            let module = context
-                .device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-                .map_err(|problem| error("vulkan_shader_module_failed", problem))?;
-            let specialization_values = [shape.m, shape.n, shape.k];
-            let specialization_entries = [
-                vk::SpecializationMapEntry {
-                    constant_id: 0,
-                    offset: 0,
-                    size: 4,
-                },
-                vk::SpecializationMapEntry {
-                    constant_id: 1,
-                    offset: 4,
-                    size: 4,
-                },
-                vk::SpecializationMapEntry {
-                    constant_id: 2,
-                    offset: 8,
-                    size: 4,
-                },
-            ];
-            let specialization = vk::SpecializationInfo::default()
-                .map_entries(&specialization_entries)
-                .data(words_as_bytes(&specialization_values));
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main")
-                .specialization_info(&specialization);
-            let pipeline_result = context.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            );
-            context.device.destroy_shader_module(module, None);
-            let pipeline = pipeline_result
-                .map_err(|(_, problem)| error("vulkan_matrix_pipeline_failed", problem))?[0];
             let harness = Self {
                 context,
                 shape,
                 workgroups,
+                subgroup_size,
                 active_subgroups,
                 bytes_per_tile,
                 maximum_working_set_bytes,
@@ -2731,5 +3047,179 @@ mod tests {
             point(64, 0.53),
         ];
         assert_eq!(matrix_profile_transition(&points, 8), Some(5));
+    }
+
+    fn mock_adapter(
+        id: &str,
+        subgroup_size: u32,
+        storage_16bit: bool,
+        storage_8bit: bool,
+    ) -> AdapterRecord {
+        let fp16_shape = MatrixShape {
+            m: 16,
+            n: 16,
+            k: 16,
+            input: vk::ComponentTypeKHR::FLOAT16,
+            accumulator: vk::ComponentTypeKHR::FLOAT32,
+        };
+        let int8_shape = MatrixShape {
+            m: 16,
+            n: 16,
+            k: 32,
+            input: vk::ComponentTypeKHR::SINT8,
+            accumulator: vk::ComponentTypeKHR::SINT32,
+        };
+        let cooperative = CooperativeSupport {
+            fp16: Some(fp16_shape),
+            int8: Some(int8_shape),
+            reason: String::new(),
+            fp16_shapes: vec![fp16_shape],
+            int8_shapes: vec![int8_shape],
+        };
+        AdapterRecord {
+            id: id.into(),
+            vulkan: crate::vulkan::VulkanAdapterInfo {
+                id: id.into(),
+                name: "Mock GPU".into(),
+                vendor_id: 0,
+                device_id: 0,
+                device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
+                api_version: vk::API_VERSION_1_3,
+                driver_version: 1,
+                device_uuid: "00".repeat(16),
+                compute_queue_family: 0,
+                timestamp_valid_bits: 64,
+                timestamp_period_ns: 1.0,
+                subgroup_size,
+                subgroup_size_control: false,
+                min_subgroup_size: subgroup_size,
+                max_subgroup_size: subgroup_size,
+                shader_float16: true,
+                storage_buffer_16bit_access: storage_16bit,
+                storage_buffer_8bit_access: storage_8bit,
+                shader_int8: true,
+                shader_float64: true,
+                max_storage_buffer_range: 1 << 30,
+                min_storage_buffer_offset_alignment: 256,
+                device_local_memory_bytes: 8 << 30,
+                host_memory_heap_bytes: 8 << 30,
+                extensions: std::collections::BTreeSet::new(),
+                cooperative: cooperative.clone(),
+                pci_bus_info: None,
+                pcie_link: None,
+            },
+            cooperative,
+        }
+    }
+
+    #[test]
+    fn matrix_preset_capabilities_distinguish_register_storage_and_subgroup_requirements() {
+        use gluj_bench_core::BenchmarkProvider;
+        let register_id = "gpu:vulkan:register_only".to_string();
+        let full_id = "gpu:vulkan:full".to_string();
+
+        let fp16_caps = preset_capabilities(
+            &[
+                mock_adapter(&register_id, 32, false, false),
+                mock_adapter("gpu:vulkan:bad_subgroup", 48, true, true),
+            ],
+            FP16_MATRIX_SCALING_ID,
+        )
+        .unwrap();
+        assert_eq!(fp16_caps.register_device_ids, [register_id.as_str()]);
+        assert!(fp16_caps.buffered_device_ids.is_empty());
+        assert_eq!(
+            fp16_caps.buffered_unavailable_reason,
+            "storage_buffer_16bit_access_unsupported"
+        );
+
+        let subgroup_caps = preset_capabilities(
+            &[mock_adapter("gpu:vulkan:bad_subgroup", 48, true, true)],
+            INT8_MATRIX_SCALING_ID,
+        )
+        .unwrap();
+        assert!(subgroup_caps.register_device_ids.is_empty());
+        assert_eq!(
+            subgroup_caps.register_unavailable_reason,
+            "subgroup_size_unsupported"
+        );
+
+        let provider = crate::GpuBandwidthProvider {
+            adapters: vec![
+                mock_adapter(&register_id, 32, false, false),
+                mock_adapter(&full_id, 32, true, true),
+            ],
+            devices: vec![
+                gluj_bench_core::DeviceDescriptor {
+                    id: register_id.clone(),
+                    name: "Register GPU".into(),
+                    category: gluj_bench_core::DeviceCategory::Gpu,
+                    available: true,
+                    status: "available".into(),
+                    properties: BTreeMap::new(),
+                    caches: Vec::new(),
+                },
+                gluj_bench_core::DeviceDescriptor {
+                    id: full_id.clone(),
+                    name: "Full GPU".into(),
+                    category: gluj_bench_core::DeviceCategory::Gpu,
+                    available: true,
+                    status: "available".into(),
+                    properties: BTreeMap::new(),
+                    caches: Vec::new(),
+                },
+            ],
+            inferred_tiers: BTreeMap::new(),
+            sweep_points: BTreeMap::new(),
+        };
+        let conditions = provider.conditions();
+        let fp16_cond = conditions
+            .iter()
+            .find(|c| c.benchmark_id == FP16_MATRIX_SCALING_ID)
+            .unwrap();
+        let reg_ok = fp16_cond.resolve(
+            &BenchmarkConfig {
+                options: BTreeMap::from([
+                    ("device_id".into(), register_id.clone()),
+                    ("gpu_matrix_preset".into(), "register".into()),
+                    ("dataset_mode".into(), "register".into()),
+                ]),
+                ..Default::default()
+            },
+            &provider.devices(),
+        );
+        assert!(reg_ok.is_ok());
+        let buf_err = fp16_cond
+            .resolve(
+                &BenchmarkConfig {
+                    options: BTreeMap::from([
+                        ("device_id".into(), register_id),
+                        ("gpu_matrix_preset".into(), "legacy".into()),
+                    ]),
+                    ..Default::default()
+                },
+                &provider.devices(),
+            )
+            .unwrap_err();
+        assert_eq!(buf_err.code, "mode_unavailable");
+        let full_ok = fp16_cond.resolve(
+            &BenchmarkConfig {
+                options: BTreeMap::from([
+                    ("device_id".into(), full_id),
+                    ("gpu_matrix_preset".into(), "legacy".into()),
+                ]),
+                ..Default::default()
+            },
+            &provider.devices(),
+        );
+        assert!(full_ok.is_ok());
+    }
+
+    #[test]
+    fn subgroup_size_candidates_prioritize_reported_and_fall_back_within_bounds() {
+        assert_eq!(subgroup_size_candidates(32, 8, 32), vec![32, 16, 8]);
+        assert_eq!(subgroup_size_candidates(16, 16, 32), vec![16, 32]);
+        assert_eq!(subgroup_size_candidates(48, 8, 32), vec![32, 16, 8]);
+        assert_eq!(subgroup_size_candidates(64, 32, 64), vec![64, 32]);
     }
 }

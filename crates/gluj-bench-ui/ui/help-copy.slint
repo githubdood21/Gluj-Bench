@@ -1,0 +1,102 @@
+// Outcome-focused help; reviewed in docs/ui-tooltip-audit.md.
+export global HelpCopy {
+    public pure function button(label: string) -> string {
+        if label == "Add test" { return "Choose another test and its settings before adding it to this set."; }
+        if label == "Add to set" { return "Include this test in your set, ready to save with the others."; }
+        if label == "Apply changes" { return "Keep these changes in your set. Save the set to use them next time."; }
+        if label == "Save set" { return "Keep this collection of tests and settings so you can run it again later."; }
+        if label == "Remove" { return "Take this test out of the set. Save the set to keep the change."; }
+        if label == "Delete set" { return "Remove this saved set. Results from tests you already ran will stay available."; }
+        if label == "Reset" { return "Undo this test's custom settings and return to the settings it starts with."; }
+        if label == "Clear view" { return "Empty this results page. You can still find saved runs in history."; }
+        if label == "Confirm clear" { return "Remove all results from this view. Saved runs remain in history."; }
+        if label == "Run history" { return "Browse, search, compare, pin, or export saved test runs."; }
+        if label == "Comparison differences" { return "Check what changed between these runs before judging the difference in performance."; }
+        if label == "Partial samples" { return "See the readings collected before this run stopped."; }
+        if label == "Compare with this run" { return "Use this run as the starting point for comparing your current results."; }
+        if label == "Pin as baseline" { return "Mark this run as a reference for future comparisons."; }
+        if label == "Archive run" { return "Move this run out of the usual history list. You can bring it back later."; }
+        if label == "Import snapshot" { return "Load saved comparison results from an original Gluj-Bench image."; }
+        if label == "Share results" { return "Create an image of your chosen results that others can view and use for comparisons."; }
+        if label == "Select highlights" { return "Let the app pick which results to show in the image."; }
+        if label == "Stop all tests" { return "Stop the current test and cancel all tests still waiting to run."; }
+        if label == "Cancel test" { return "Stop this test and continue with the remaining tests."; }
+        if label == "Observations" { return "See the individual readings to check how performance changed during the test."; }
+        if label == "Technical" { return "See the exact settings and hardware information recorded with this result."; }
+        if label == "Import native JSON" { return "Load complete test records to inspect their readings and compare them with your results."; }
+        if label == "Export native JSON" { return "Save selected runs, including every recorded data point, so they can be loaded later."; }
+        if label == "Refresh hardware" { return "Check your hardware again and update which tests are available."; }
+        if label == "Technical properties" { return "Look up the extra hardware details reported by your system."; }
+        if label == "Advanced" { return "Shows how many extra settings have been changed from their starting values."; }
+        if label == "Memory: Latest" || label == "Memory: Typical" || label == "Memory: Change" { return "Switch between your newest speeds, the middle results across runs, and how much speeds changed."; }
+        if label == "Skip" { return "Leave this waiting test out and continue with the others."; }
+        if label == "New set" { return "Start an empty collection and choose your own tests and settings."; }
+        if label == "Settings" { return "See the settings recorded for this test."; }
+        if label == "Edit" { return "Change this test's settings before saving the set."; }
+        if label == "Copy image" { return "Copy the results image to your clipboard, ready to paste elsewhere."; }
+        if label == "Save PNG" { return "Save the results image with comparison data that can be loaded again later."; }
+        return "";
+    }
+    public pure function field(label: string) -> string {
+        if label == "Data placement" { return "Choose where the data lives to see how memory affects performance."; }
+        if label == "K block" { return "Break the calculation into smaller or larger chunks to see how that affects speed."; }
+        if label == "Matrix tile" { return "Change the size of the small number grids processed together by the GPU."; }
+        if label == "Copy implementation" { return "Compare copying with GPU code against the graphics driver's built-in copy operation."; }
+        if label == "Transfer submission" { return "Send several copies together, or wait for each copy to finish before continuing."; }
+        if label == "Sieve range" { return "Search for primes up to this number. Higher limits give each CPU worker more work."; }
+        if label == "Measurement duration" { return "Run each version of the test for longer to measure performance over more time."; }
+        if label == "Access pattern" { return "Change the order data is read to see how well your hardware handles less predictable access."; }
+        if label == "Workload seed" { return "Use the same number to recreate the same randomized data and access order."; }
+        if label == "Traffic rate" { return "Push the hardware as fast as possible, or see how it handles a chosen level of demand."; }
+        if label == "Compare with" { return "Pick an earlier run to see how your current results have changed."; }
+        if label == "Observed range" { return "See the lowest and highest readings recorded during this test."; }
+        if label == "Precision" { return "Changes how numbers are represented, which can affect speed and accuracy."; }
+        if label == "Data preset" { return "Choose a data size yourself, or let the app size it for your hardware."; }
+        if label == "Dataset sizing" { return "Choose a data size yourself, or let the app size it for your hardware."; }
+        if label == "Dataset mode" { return "Test one data size, or try increasingly larger sizes to see where performance changes."; }
+        if label == "Dataset size (MiB)" { return "Larger datasets can reveal slowdowns that small tests miss. The test may need extra memory too."; }
+        if label == "Physical CPU cores" { return "Choose how many CPU cores work on this test at the same time."; }
+        if label == "Physical cores" { return "Choose how many CPU cores work on this test at the same time."; }
+        if label == "Working set (empty for automatic)" { return "Choose how much memory the test reads through. Leave empty to let the app choose."; }
+        if label == "Access block target" { return "Choose how much nearby data is handled together before the test moves elsewhere."; }
+        if label == "Locality block (localized chains)" { return "Choose how much nearby data is handled together before the test moves elsewhere."; }
+        if label == "CPU activity" { return "Give the hardware brief pauses, or let it work continuously at 100%."; }
+        if label == "GPU activity" { return "Give the hardware brief pauses, or let it work continuously at 100%."; }
+        if label == "Activity target" { return "Give the hardware brief pauses, or let it work continuously at 100%."; }
+        if label == "RAM budget" { return "Limit how much memory the test may allocate. Your hardware may allow less."; }
+        if label == "System RAM budget" { return "Limit how much memory the test may allocate. Your hardware may allow less."; }
+        if label == "VRAM budget" { return "Limit how much memory the test may allocate. Your hardware may allow less."; }
+        if label == "DEFLATE corpus" { return "Choose data that is easier or harder to compress and see how that changes speed."; }
+        if label == "Compression block" { return "Split the input into smaller or larger pieces that are compressed separately."; }
+        if label == "Matrix shape (M × N × K)" { return "Change the dimensions of the number grids to compare different calculation shapes."; }
+        if label == "Matrix reuse" { return "Repeat the full calculation more times before moving on to the next pass."; }
+        if label == "Matrix reuse and traversal" { return "Change which small grid the GPU visits next to test less predictable memory access."; }
+        if label == "Input and output in system RAM" { return "Put more of the test's input and output in system memory instead of graphics memory."; }
+        if label == "RAM offload" { return "Put more of the test's input and output in system memory instead of graphics memory."; }
+        if label == "Observations" { return "See the individual readings to check how performance changed during the test."; }
+        if label == "Standard deviation" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "Observed spread" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "Sample variation" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "Throughput by dataset" { return "Shows the speed measured with a small dataset, so you can compare larger ones against it."; }
+        if label == "Performance by dataset" { return "See how far readings spread at each data size, from the lowest to the highest."; }
+        if label == "TOPS" { return "Shows how much calculation work finishes each second. Higher means more work done in this test."; }
+        if label == "GB/s" { return "Shows how much data moves each second. Higher means faster transfer for this operation."; }
+        if label == "ns per access" { return "Shows how long the hardware waits for each memory read. Lower means a shorter wait."; }
+        if label == "Latest" { return "Shows the newest result recorded with these settings."; }
+        if label == "Typical" { return "Shows the middle result from runs with the same settings."; }
+        if label == "Best" { return "Shows the fastest result recorded with these settings."; }
+        if label == "Change" { return "See how much the result changed from the run you are comparing against."; }
+        if label == "Runs" { return "Shows how many runs are grouped under these test settings."; }
+        if label == "OBSERVED SPREAD" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "POOLED SPREAD" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "SAMPLE VARIATION" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "SAMPLE RANGE" { return "See the lowest and highest readings recorded during this test."; }
+        if label == "Measured sample spread" { return "Shows how much the readings varied. A smaller percentage means steadier results."; }
+        if label == "Median" { return "Shows the middle reading from this test."; }
+        if label == "Memory data bus" { return "A wider memory channel can carry more data at once. This width is per channel."; }
+        if label == "DATA TYPE" { return "Shows which number format was used for these calculations."; }
+        if label == "MEASUREMENTS" { return "Shows which results this test recorded, such as read, write, and copy speeds."; }
+        if label == "EXECUTION" { return "Shows how these calculations were carried out on your hardware."; }
+        return "";
+    }
+}

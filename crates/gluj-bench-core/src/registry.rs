@@ -188,13 +188,22 @@ impl BenchmarkRegistry {
                             .into(),
                     );
                 }
-                if benchmark_id.starts_with("gpu.") && benchmark_id.ends_with(".scaling") {
+                let has_dataset_controls = benchmark_id.ends_with(".scaling")
+                    || crate::gpu_buffered_vector(benchmark_id)
+                    || crate::gpu_memory(benchmark_id)
+                    || crate::gpu_transfer(benchmark_id)
+                    || crate::cpu_data_mode(benchmark_id)
+                    || matches!(
+                        benchmark_id,
+                        "cpu.performance.integer.i64" | "cpu.performance.string.ascii"
+                    );
+                if benchmark_id.starts_with("gpu.") && has_dataset_controls {
                     result.workload_metadata.insert(
                         "vram_budget_percent".into(),
                         crate::vram_budget_percent(config)?.to_string(),
                     );
                 }
-                if benchmark_id.ends_with(".scaling") {
+                if has_dataset_controls {
                     result
                         .workload_metadata
                         .entry("dataset_mode".into())
@@ -272,6 +281,141 @@ mod tests {
             )
             .expect_err("unknown benchmark must fail");
         assert_eq!(problem.code, "unsupported_benchmark");
+    }
+
+    #[test]
+    fn vram_budget_and_dataset_metadata_cover_non_scaling_gpu_conditions() {
+        use crate::{
+            BenchmarkCategory, DeviceCategory, Metric, ProgressCallback, SampleStatistics,
+        };
+        use std::collections::BTreeMap;
+
+        struct StubGpuProvider;
+        impl BenchmarkProvider for StubGpuProvider {
+            fn devices(&self) -> Vec<DeviceDescriptor> {
+                vec![DeviceDescriptor {
+                    id: "gpu-0".into(),
+                    name: "Stub GPU".into(),
+                    category: DeviceCategory::Gpu,
+                    available: true,
+                    status: "ready".into(),
+                    properties: BTreeMap::new(),
+                    caches: Vec::new(),
+                }]
+            }
+            fn benchmarks(&self) -> Vec<BenchmarkDescriptor> {
+                [
+                    "gpu.bandwidth.vram",
+                    "gpu.performance.fp16",
+                    "gpu.performance.fp32",
+                ]
+                .into_iter()
+                .map(|id| BenchmarkDescriptor {
+                    id: id.into(),
+                    name: id.into(),
+                    category: BenchmarkCategory::Gpu,
+                    workload: "stub".into(),
+                    data_type: "fp32".into(),
+                    unit: "GB/s".into(),
+                    supported_device_ids: vec!["gpu-0".into()],
+                    available: true,
+                    unavailable_reason: String::new(),
+                    suite_id: "gpu".into(),
+                    display_order: 0,
+                    metadata: BTreeMap::new(),
+                })
+                .collect()
+            }
+            fn run(
+                &mut self,
+                benchmark_id: &str,
+                config: &BenchmarkConfig,
+                _cancellation: &CancellationToken,
+                _progress: &mut ProgressCallback<'_>,
+            ) -> Result<BenchmarkResult, BenchmarkError> {
+                let sample_ns = (config.target_duration_ms.saturating_mul(1_000_000)
+                    / u64::from(config.samples.max(1)))
+                .max(250_000_000);
+                for _ in 0..config.samples.max(6) {
+                    crate::record_observation(
+                        "stub",
+                        "throughput",
+                        10.0,
+                        "GB/s",
+                        10,
+                        "bytes",
+                        sample_ns,
+                        sample_ns,
+                    );
+                }
+                Ok(BenchmarkResult {
+                    benchmark_id: benchmark_id.into(),
+                    device_id: "gpu-0".into(),
+                    elapsed_ns: 1,
+                    metrics: vec![Metric {
+                        name: "throughput".into(),
+                        value: 10.0,
+                        unit: "GB/s".into(),
+                        statistics: SampleStatistics {
+                            sample_count: config.samples.max(6),
+                            minimum: 10.0,
+                            median: 10.0,
+                            maximum: 10.0,
+                            standard_deviation: 0.0,
+                        },
+                    }],
+                    workload_metadata: BTreeMap::new(),
+                    device_metadata: BTreeMap::new(),
+                })
+            }
+        }
+
+        let mut registry = BenchmarkRegistry::default();
+        registry.add(Box::new(StubGpuProvider));
+        let token = CancellationToken::default();
+        let mut progress = |_u: ProgressUpdate| {};
+
+        let vram_bw = registry
+            .run(
+                "gpu.bandwidth.vram",
+                &BenchmarkConfig {
+                    options: BTreeMap::from([
+                        ("vram_budget_percent".into(), "40".into()),
+                        ("dataset_mode".into(), "single".into()),
+                        ("dataset_bytes".into(), "1048576".into()),
+                    ]),
+                    ..Default::default()
+                },
+                &token,
+                &mut progress,
+            )
+            .unwrap();
+        assert_eq!(vram_bw.workload_metadata["vram_budget_percent"], "40");
+        assert_eq!(vram_bw.workload_metadata["dataset_mode"], "single");
+        assert_eq!(
+            vram_bw.workload_metadata["requested_dataset_bytes"],
+            "1048576"
+        );
+
+        let fp16 = registry
+            .run(
+                "gpu.performance.fp16",
+                &BenchmarkConfig::default(),
+                &token,
+                &mut progress,
+            )
+            .unwrap();
+        assert_eq!(fp16.workload_metadata["vram_budget_percent"], "25");
+
+        let fp32 = registry
+            .run(
+                "gpu.performance.fp32",
+                &BenchmarkConfig::default(),
+                &token,
+                &mut progress,
+            )
+            .unwrap();
+        assert!(!fp32.workload_metadata.contains_key("vram_budget_percent"));
     }
 }
 

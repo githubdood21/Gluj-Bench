@@ -35,7 +35,10 @@ mod phase_eight;
 mod presentation;
 mod render_pacing;
 mod result_visuals;
+mod saved_tests;
 mod snapshot;
+#[cfg(test)]
+mod tooltip_tests;
 mod tuning_visuals;
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -63,19 +66,14 @@ fn main() -> Result<(), slint::PlatformError> {
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let (Some(window), Some(app)) = (weak_window.upgrade(), weak_app.upgrade()) {
-            let should_refresh = {
+            {
                 let mut app = app.borrow_mut();
                 app.receive_worker_events();
                 app.receive_snapshot_events();
                 app.receive_history_events();
                 app.result_observations.receive(&window);
-                std::mem::take(&mut app.ui_dirty)
-            };
-            if should_refresh {
-                App::refresh(&window, &app.borrow());
-            } else if app.borrow().snapshot.ui_dirty.get() {
-                App::refresh_snapshot(&window, &app.borrow());
             }
+            App::flush_dirty(&window, &app);
         }
     });
     window.run()
@@ -187,6 +185,16 @@ impl Drop for WorkerClient {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct RefreshSections {
+    devices: bool,
+    results: bool,
+    result_technical: bool,
+    history: bool,
+    presentation: bool,
+    setup: bool,
+}
+
 struct App {
     page: i32,
     history: phase_eight::HistoryState,
@@ -239,6 +247,7 @@ struct App {
     metadata_devices_received: bool,
     metadata_benchmarks_received: bool,
     ui_dirty: bool,
+    dirty: RefreshSections,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -376,6 +385,8 @@ struct BenchmarkPreferences {
     tests: BTreeMap<String, SavedBenchmarkPreference>,
     #[serde(default)]
     family_modes: BTreeMap<String, String>,
+    #[serde(default)]
+    saved_tests: Vec<saved_tests::SavedTest>,
 }
 impl Default for BenchmarkPreferences {
     fn default() -> Self {
@@ -383,11 +394,12 @@ impl Default for BenchmarkPreferences {
             version: 1,
             tests: BTreeMap::new(),
             family_modes: BTreeMap::new(),
+            saved_tests: Vec::new(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct QueuedRun {
     benchmark_id: String,
     settings: AppSettings,
@@ -1368,6 +1380,7 @@ impl App {
             metadata_devices_received: false,
             metadata_benchmarks_received: false,
             ui_dirty: true,
+            dirty: RefreshSections::default(),
         };
         if let Some(cache) = load_metadata_cache() {
             app.devices = cache.devices;
@@ -1498,13 +1511,17 @@ impl App {
                     app.snapshot.include_all = !app.snapshot.include_all;
                     app.refresh_snapshot_choices();
                 }
-                "open" => app.open_snapshot(),
+                "open" => {
+                    app.close_history_panel();
+                    app.open_snapshot();
+                }
                 "highlights" => app.reset_snapshot_highlights(),
                 "close" => app.close_snapshot(),
                 "copy" => app.copy_snapshot_in_background(),
                 _ => {}
             }
             if let Some(window) = snapshot_window.upgrade() {
+                App::refresh_phase_eight(&window, &app);
                 App::refresh_snapshot(&window, &app);
             }
         });
@@ -1642,8 +1659,17 @@ impl App {
             if let Some(app) = app_weak.upgrade() {
                 let mut app = app.borrow_mut();
                 app.select_suite(suite.as_str());
+                app.presentation.set_selected = false;
+                app.presentation.curated_set = None;
+                app.presentation.test_editor = false;
+                app.presentation.editing_test = None;
+                app.presentation.inspecting_test = None;
+                app.custom_plan.clear();
                 app.presentation.scope = 1;
                 app.presentation.single_test = true;
+                app.presentation.editing_saved_test = None;
+                app.presentation.editor_test_name = None;
+                app.presentation.editor_shorter_run = None;
                 app.presentation.clear_test_selection();
                 if let Some(window) = navigation_window.upgrade() {
                     App::refresh_benchmark_panel(&window, &app);
@@ -1993,6 +2019,7 @@ impl App {
     fn snapshot_benchmark_preferences(&self) -> BenchmarkPreferences {
         let mut preferences = BenchmarkPreferences {
             family_modes: self.family_modes.clone(),
+            saved_tests: self.benchmark_preferences.saved_tests.clone(),
             ..Default::default()
         };
         let ids = self
@@ -2180,7 +2207,7 @@ impl App {
             && matches!(settings.vector_preset, 2 | 5 | 6)
             && !self.compute_slider_range(id, &settings).available()
         {
-            return Err("Matrix operand datasets require matching storage-buffer support and a usable GPU memory budget. Choose Customized test and the Register compute data preset to use registers.".into());
+            return Err("Matrix operand datasets require matching storage-buffer support and a usable GPU memory budget. Choose register compute to use registers.".into());
         }
 
         if configurable_compute(id) && settings.vector_preset == 6 {
@@ -2420,6 +2447,13 @@ impl App {
         if self.active_request.is_some() || index < 0 {
             return;
         }
+        if !local && field == "measurement" && index < 2 {
+            self.presentation.editor_shorter_run = Some(index == 1);
+            if self.presentation.test_editor {
+                self.ui_dirty = true;
+                return;
+            }
+        }
         if local {
             self.begin_custom_edit();
         }
@@ -2549,7 +2583,7 @@ impl App {
     }
     fn queued_run(&self, id: &str) -> Result<QueuedRun, String> {
         let mut settings = self.effective_settings(id)?;
-        settings.shorter_run = self.settings.shorter_run;
+        settings.shorter_run = self.builder_shorter_run();
         if configurable_gpu_compute(id) && settings.vector_preset == 6 {
             if vector_size_bytes(&settings.vector_size)?
                 < self.compute_slider_range(id, &settings).minimum
@@ -2991,6 +3025,41 @@ impl App {
         Self::refresh_benchmark_details(window, app);
         Self::refresh_benchmark_setup(window, app);
     }
+    fn flush_dirty(window: &MainWindow, app: &Rc<RefCell<Self>>) {
+        let (should_refresh, sections) = {
+            let mut app = app.borrow_mut();
+            (
+                std::mem::take(&mut app.ui_dirty),
+                std::mem::take(&mut app.dirty),
+            )
+        };
+        if should_refresh {
+            Self::refresh(window, &app.borrow());
+        } else {
+            let app = app.borrow();
+            if sections.devices {
+                Self::refresh_devices(window, &app);
+            }
+            if sections.result_technical {
+                Self::refresh_selected_result_technical(window, &app);
+            }
+            if sections.results {
+                Self::refresh_results(window, &app);
+            }
+            if sections.history {
+                Self::refresh_phase_eight(window, &app);
+            }
+            if sections.presentation {
+                Self::refresh_presentation(window, &app);
+            }
+            if sections.setup {
+                Self::refresh_benchmark_setup(window, &app);
+            }
+            if app.snapshot.ui_dirty.get() {
+                Self::refresh_snapshot(window, &app);
+            }
+        }
+    }
     fn cached_result_row(&self, result: &BenchmarkResult) -> ResultRow {
         let index = self
             .results
@@ -3064,7 +3133,7 @@ impl App {
             settings.cpu_core_limit.min(core_count)
         } as f32);
         window.set_test_cpu_index(settings.cpu_intensity as i32);
-        window.set_shorter_run(app.settings.shorter_run);
+        window.set_shorter_run(app.builder_shorter_run());
         window.set_test_gpu_index(settings.gpu_intensity as i32);
         window.set_test_ram_index(
             VRAM_BUDGET_OPTIONS
@@ -3494,11 +3563,13 @@ impl App {
     }
     fn refresh_status(window: &MainWindow, app: &Self) {
         window.set_page(app.page);
-        window.set_status(app.status.clone().into());
+        window.set_status(presentation::clamp_display_text(&app.status, 1200, 12).into());
         window.set_worker_online(app.worker.online());
         window.set_running(app.active_request.is_some());
         window.set_progress(app.progress);
-        window.set_progress_message(app.progress_message.clone().into());
+        window.set_progress_message(
+            presentation::clamp_display_text(&app.progress_message, 600, 6).into(),
+        );
         window.set_queued_count(app.queue.len() as i32);
         window.set_suite_description(suite_description(&app.selected_suite).into());
         window.set_show_gpu_selector(app.selected_suite.starts_with("gpu."));
@@ -3543,6 +3614,7 @@ impl App {
         );
     }
     fn refresh_devices(window: &MainWindow, app: &Self) {
+        let query = app.presentation.hardware_query.trim();
         let devices: Vec<DeviceRow> = app
             .devices
             .iter()
@@ -3564,9 +3636,12 @@ impl App {
                         d.properties
                             .iter()
                             .filter(|(k, v)| {
-                                format!("{k} {v}")
-                                    .to_lowercase()
-                                    .contains(&app.presentation.hardware_query.to_lowercase())
+                                presentation::matches_pair_query(k, v, query)
+                                    || presentation::matches_pair_query(
+                                        &presentation::friendly(k),
+                                        v,
+                                        query,
+                                    )
                             })
                             .map(|(k, v)| {
                                 presentation::technical_fact(&presentation::friendly(k), v)
@@ -3599,7 +3674,7 @@ impl App {
                                     || k.as_str() == "device_type"
                             })
                             .map(|(k, v)| {
-                                presentation::fact(
+                                presentation::bounded_fact(
                                     &presentation::friendly(k),
                                     match v.as_str() {
                                         "true" => "Supported",
@@ -3775,14 +3850,41 @@ impl App {
             .into(),
         );
     }
-    fn refresh_results(window: &MainWindow, app: &Self) {
+    fn result_component_keys(&self) -> Vec<String> {
         let mut components: Vec<String> = Vec::new();
-        for result in &app.results {
+        for result in &self.results {
             let component = result_component_key(result);
             if !components.contains(&component) {
                 components.push(component);
             }
         }
+        components
+    }
+    pub(crate) fn selected_result_entry(&self) -> Option<&BenchmarkResult> {
+        let components = self.result_component_keys();
+        let component_index = self
+            .result_component
+            .min(components.len().saturating_sub(1));
+        let groups = component_results(
+            &self.results,
+            components
+                .get(component_index)
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
+        let selection = self.result_selection.min(groups.len().saturating_sub(1));
+        let group = groups.get(selection);
+        let viewed_result = group.and_then(|group| {
+            let id = self.history.viewed_run.as_ref()?;
+            group
+                .iter()
+                .copied()
+                .find(|result| result.device_metadata.get("native_run_id") == Some(id))
+        });
+        viewed_result.or_else(|| group.map(|group| group[0]))
+    }
+    fn refresh_results(window: &MainWindow, app: &Self) {
+        let components = app.result_component_keys();
         let component_index = app.result_component.min(components.len().saturating_sub(1));
         let names: Vec<SharedString> = components
             .iter()
@@ -3816,7 +3918,9 @@ impl App {
         window.set_result_count(app.results.len() as i32);
         Self::refresh_snapshot(window, app);
 
-        window.set_results_file_status(app.results_file_status.clone().into());
+        window.set_results_file_status(
+            presentation::clamp_display_text(&app.results_file_status, 1200, 12).into(),
+        );
         let groups = component_results(
             &app.results,
             components
@@ -4197,6 +4301,14 @@ fn stamp_result(
                         "available_bytes_at_discovery"
                             | "memory_channel_count"
                             | "memory_channel_data_width_bits"
+                            | "pcie_bus_id"
+                            | "pcie_integrated_endpoint"
+                            | "pcie_link_generation"
+                            | "pcie_link_width"
+                            | "pcie_current_link_generation"
+                            | "pcie_current_link_width"
+                            | "pcie_max_link_generation"
+                            | "pcie_max_link_width"
                     )
                 })
                 .collect();
@@ -4940,6 +5052,19 @@ fn preferred_gpu_id(devices: &[DeviceDescriptor], current: Option<&str>) -> Opti
         .or_else(|| {
             devices
                 .iter()
+                .find(|device| {
+                    device.category == DeviceCategory::Gpu
+                        && device.available
+                        && device
+                            .properties
+                            .get("device_type")
+                            .is_some_and(|kind| kind == "DiscreteGpu")
+                })
+                .map(|device| device.id.clone())
+        })
+        .or_else(|| {
+            devices
+                .iter()
                 .find(|device| device.category == DeviceCategory::Gpu && device.available)
                 .map(|device| device.id.clone())
         })
@@ -5055,7 +5180,44 @@ fn overview_device(device: &DeviceDescriptor) -> (String, Vec<DeviceFact>, Vec<S
                 badges.push("See capability details".into());
             }
             ("Parallel compute and memory throughput for graphics and AI workloads. Badges show detected hardware support; individual tests check runner availability.".into(),
-                vec![fact(if device.properties.get("device_type").is_some_and(|s| s == "IntegratedGpu") { "Shared GPU memory" } else { "Graphics memory" }, bytes("device_local_memory_bytes")), fact("Device type", kind), fact("Compute API", property("backend"))], badges)
+                vec![
+                    fact(if device.properties.get("device_type").is_some_and(|s| s == "IntegratedGpu") { "Shared GPU memory" } else { "Graphics memory" }, bytes("device_local_memory_bytes")),
+                    fact("Device type", kind),
+                    fact("PCIe link", gpu_pcie_connection_label(device)),
+                ],
+                badges)
+        }
+    }
+}
+
+fn gpu_pcie_connection_label(device: &DeviceDescriptor) -> String {
+    let parse_nonzero = |key: &str| {
+        device
+            .properties
+            .get(key)
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+    };
+    let generation = parse_nonzero("pcie_link_generation");
+    let width = parse_nonzero("pcie_link_width");
+    match (generation, width) {
+        (Some(generation), Some(width)) => format!("PCIe Gen {generation} x{width}"),
+        (Some(generation), None) => format!("PCIe Gen {generation}"),
+        (None, Some(width)) => format!("PCIe x{width}"),
+        (None, None) => {
+            if device
+                .properties
+                .get("pcie_integrated_endpoint")
+                .is_some_and(|flag| flag == "true")
+                || device
+                    .properties
+                    .get("device_type")
+                    .is_some_and(|kind| matches!(kind.as_str(), "IntegratedGpu" | "integrated"))
+            {
+                "Integrated bus".into()
+            } else {
+                "Not reported".into()
+            }
         }
     }
 }
@@ -5242,7 +5404,9 @@ fn result_row(
         .into(),
         gpu_timing_height: 280.0,
         gpu_timing_available: !gpu_timing_svg.is_empty(),
-        gpu_timing_visible: result.benchmark_id.starts_with("gpu.") && scaling_result(result),
+        gpu_timing_visible: !gpu_timing_svg.is_empty()
+            && result.benchmark_id.starts_with("gpu.")
+            && scaling_result(result),
         gpu_timing_chart: slint::Image::load_from_svg_data(gpu_timing_svg.as_bytes())
             .ok()
             .unwrap_or_default(),
@@ -5758,7 +5922,7 @@ fn gpu_gap_advice(result: &BenchmarkResult) -> Option<EfficiencyAdvice> {
     let gap = (1.0 - largest.value / reference.value) * 100.0;
     let size = format_binary_size(bytes as f64);
     let context = if tiers.len() == 1 {
-        "Only one dataset was measured. Choose Curated test, or enable a sweep in Customized test, to compare smaller and larger inputs using the same kernel."
+        "Only one dataset was measured. Run a dataset-scaling set, or enable Sweep to target in your own test, to compare smaller and larger inputs using the same kernel."
     } else {
         "Compare smaller and larger inputs using the same kernel to check whether throughput changes with dataset size."
     };
@@ -6158,10 +6322,10 @@ fn test_description(id: &str) -> &'static str {
             "First measures FP32 calculation speed with most work kept in GPU registers, creating a measured compute ceiling rather than a theoretical peak. It then repeats calculations with increasingly large data sets up to your VRAM budget, showing the performance gap as memory traffic grows."
         }
         "gpu.performance.matrix.fp16.scaling" => {
-            "Curated test measures a reference and an automatic operand-size sweep. Customized test offers register-resident FP16 matrix multiply-accumulate with FP32 accumulation and the full data presets and size slider. Size covers the two FP16 operand buffers; FP32 output and overhead are reserved separately. Memory-backed runs keep the same tile and reuse count, reporting TOPS, effective operand traffic in GB/s and measured GPU timings. They compare against a separately measured register reference."
+            "Curated scaling sets measure a reference and an operand-size sweep. Your own tests support register-resident FP16 matrix multiply-accumulate with FP32 accumulation and the full data presets and size slider. Size covers the two FP16 operand buffers; FP32 output and overhead are reserved separately. Memory-backed runs keep the same tile and reuse count, reporting TOPS, effective operand traffic in GB/s and measured GPU timings. They compare against a separately measured register reference."
         }
         "gpu.performance.matrix.int8.scaling" => {
-            "Curated test measures a reference and an automatic operand-size sweep. Customized test offers register-resident INT8 matrix multiply-accumulate with 32-bit accumulation and the full data presets and size slider. Size covers the two INT8 operand buffers; 32-bit output and overhead are reserved separately. Memory-backed runs keep the same tile and reuse count, reporting TOPS, effective operand traffic in GB/s and measured GPU timings. They compare against a separately measured register reference."
+            "Curated scaling sets measure a reference and an operand-size sweep. Your own tests support register-resident INT8 matrix multiply-accumulate with 32-bit accumulation and the full data presets and size slider. Size covers the two INT8 operand buffers; 32-bit output and overhead are reserved separately. Memory-backed runs keep the same tile and reuse count, reporting TOPS, effective operand traffic in GB/s and measured GPU timings. They compare against a separately measured register reference."
         }
         _ if id.starts_with("gpu.performance.matrix.sparse.") => {
             "Tests matrix calculations designed to skip selected zero values. This requires a supported sparse calculation path and specially structured input data; its speed applies to workloads with the matching structure."
@@ -8142,6 +8306,110 @@ mod tests {
             preferred_gpu_id(&devices, Some("missing")).as_deref(),
             Some("gpu:one")
         );
+    }
+
+    #[test]
+    fn gpu_device_facts_display_per_adapter_pcie_generation_and_lanes_instead_of_compute_api() {
+        let mut primary = DeviceDescriptor {
+            id: "gpu:primary".into(),
+            name: "Primary GPU".into(),
+            category: DeviceCategory::Gpu,
+            available: true,
+            status: "Ready".into(),
+            properties: BTreeMap::from([
+                ("backend".into(), "Vulkan".into()),
+                ("device_type".into(), "DiscreteGpu".into()),
+                (
+                    "device_local_memory_bytes".into(),
+                    (24_u64 << 30).to_string(),
+                ),
+                ("pcie_link_generation".into(), "5".into()),
+                ("pcie_link_width".into(), "16".into()),
+            ]),
+            caches: vec![],
+        };
+        let secondary = DeviceDescriptor {
+            id: "gpu:secondary".into(),
+            name: "Secondary GPU".into(),
+            category: DeviceCategory::Gpu,
+            available: true,
+            status: "Ready".into(),
+            properties: BTreeMap::from([
+                ("backend".into(), "Vulkan".into()),
+                ("device_type".into(), "DiscreteGpu".into()),
+                (
+                    "device_local_memory_bytes".into(),
+                    (8_u64 << 30).to_string(),
+                ),
+                ("pcie_link_generation".into(), "3".into()),
+                ("pcie_link_width".into(), "4".into()),
+            ]),
+            caches: vec![],
+        };
+        let integrated = DeviceDescriptor {
+            id: "gpu:igpu".into(),
+            name: "Integrated GPU".into(),
+            category: DeviceCategory::Gpu,
+            available: true,
+            status: "Ready".into(),
+            properties: BTreeMap::from([
+                ("backend".into(), "Vulkan".into()),
+                ("device_type".into(), "IntegratedGpu".into()),
+                (
+                    "device_local_memory_bytes".into(),
+                    (4_u64 << 30).to_string(),
+                ),
+                ("pcie_integrated_endpoint".into(), "true".into()),
+            ]),
+            caches: vec![],
+        };
+
+        let (_, primary_facts, _) = super::overview_device(&primary);
+        assert_eq!(primary_facts[2].label.as_str(), "PCIe link");
+        assert_eq!(primary_facts[2].value.as_str(), "PCIe Gen 5 x16");
+        assert!(
+            primary_facts
+                .iter()
+                .all(|fact| fact.label.as_str() != "Compute API")
+        );
+
+        let (_, secondary_facts, _) = super::overview_device(&secondary);
+        assert_eq!(secondary_facts[2].label.as_str(), "PCIe link");
+        assert_eq!(secondary_facts[2].value.as_str(), "PCIe Gen 3 x4");
+
+        let (_, integrated_facts, _) = super::overview_device(&integrated);
+        assert_eq!(integrated_facts[2].label.as_str(), "PCIe link");
+        assert_eq!(integrated_facts[2].value.as_str(), "Integrated bus");
+
+        primary.properties.remove("pcie_link_width");
+        let (_, gen_only_facts, _) = super::overview_device(&primary);
+        assert_eq!(gen_only_facts[2].value.as_str(), "PCIe Gen 5");
+    }
+
+    #[test]
+    fn gpu_timing_tab_stays_hidden_when_no_timing_chart_exists() {
+        let result = BenchmarkResult {
+            benchmark_id: "gpu.performance.fp16".into(),
+            device_id: "gpu:one".into(),
+            elapsed_ns: 2_000_000,
+            metrics: vec![Metric {
+                name: "working_set_262144.compute".into(),
+                value: 20e12,
+                unit: "operations/s".into(),
+                statistics: SampleStatistics {
+                    sample_count: 5,
+                    minimum: 19e12,
+                    median: 20e12,
+                    maximum: 21e12,
+                    standard_deviation: 1e11,
+                },
+            }],
+            workload_metadata: BTreeMap::from([("compute_profile_revision".into(), "1".into())]),
+            device_metadata: BTreeMap::new(),
+        };
+        let row = super::result_row(&result, &[], &[]);
+        assert!(!row.gpu_timing_available);
+        assert!(!row.gpu_timing_visible);
     }
 
     #[test]

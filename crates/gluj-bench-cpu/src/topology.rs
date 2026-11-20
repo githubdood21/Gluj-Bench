@@ -82,6 +82,49 @@ pub fn explicit_core_limit(config: &gluj_bench_core::BenchmarkConfig) -> bool {
         .is_some_and(|n| n > 0)
 }
 
+fn order_cores_and_select_representative(
+    physical_cores: &mut Vec<ProcessorLocation>,
+    efficiency_classes: &BTreeMap<ProcessorLocation, u8>,
+    targets: &[CacheTarget],
+) -> ProcessorLocation {
+    physical_cores.sort_unstable();
+    physical_cores.dedup();
+    // Order higher-EfficiencyClass cores (P-cores) before E-cores so
+    // cpu_core_limit=1 and partial-core sweeps run on performance cores.
+    physical_cores.sort_by_key(|location| {
+        std::cmp::Reverse(efficiency_classes.get(location).copied().unwrap_or(0))
+    });
+    physical_cores
+        .iter()
+        .copied()
+        .max_by_key(|location| {
+            let mask = 1usize << location.index;
+            let matching: Vec<_> = targets
+                .iter()
+                .filter(|cache| {
+                    cache.group == location.group
+                        && cache.mask & mask != 0
+                        && cache.descriptor.level <= 3
+                })
+                .collect();
+            (
+                efficiency_classes.get(location).copied().unwrap_or(0),
+                matching
+                    .iter()
+                    .map(|cache| cache.descriptor.level)
+                    .max()
+                    .unwrap_or(0),
+                matching.len(),
+                matching
+                    .iter()
+                    .map(|cache| cache.descriptor.size_bytes)
+                    .sum::<u64>(),
+                std::cmp::Reverse(*location),
+            )
+        })
+        .unwrap()
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -154,6 +197,7 @@ mod platform {
         let core_data = records(RelationProcessorCore)?;
         let mut physical_cores = Vec::new();
         let mut core_threads = BTreeMap::new();
+        let mut efficiency_classes = BTreeMap::new();
         unsafe {
             for_each_record(&core_data, |pointer, size| {
                 if size
@@ -175,6 +219,12 @@ mod platform {
                     if let Some(location) = first_location(affinity.Group, affinity.Mask) {
                         physical_cores.push(location);
                         core_threads.insert(location, locations(affinity.Group, affinity.Mask));
+                        efficiency_classes
+                            .entry(location)
+                            .and_modify(|class: &mut u8| {
+                                *class = (*class).max(relation.EfficiencyClass);
+                            })
+                            .or_insert(relation.EfficiencyClass);
                     }
                 }
             });
@@ -226,34 +276,11 @@ mod platform {
             });
         }
 
-        let representative = physical_cores
-            .iter()
-            .copied()
-            .max_by_key(|location| {
-                let mask = 1usize << location.index;
-                let matching: Vec<_> = targets
-                    .iter()
-                    .filter(|cache| {
-                        cache.group == location.group
-                            && cache.mask & mask != 0
-                            && cache.descriptor.level <= 3
-                    })
-                    .collect();
-                (
-                    matching
-                        .iter()
-                        .map(|cache| cache.descriptor.level)
-                        .max()
-                        .unwrap_or(0),
-                    matching.len(),
-                    matching
-                        .iter()
-                        .map(|cache| cache.descriptor.size_bytes)
-                        .sum::<u64>(),
-                    std::cmp::Reverse(*location),
-                )
-            })
-            .unwrap();
+        let representative = order_cores_and_select_representative(
+            &mut physical_cores,
+            &efficiency_classes,
+            &targets,
+        );
 
         let mut representative_caches = BTreeMap::new();
         let representative_mask = 1usize << representative.index;
@@ -261,6 +288,7 @@ mod platform {
             if target.group == representative.group
                 && target.mask & representative_mask != 0
                 && target.descriptor.level <= 3
+                && matches!(target.descriptor.kind, CacheKind::Data | CacheKind::Unified)
             {
                 representative_caches
                     .entry(target.descriptor.level)
@@ -414,5 +442,48 @@ mod tests {
         assert!(
             ProcessorLocation { group: 0, index: 2 } < ProcessorLocation { group: 1, index: 0 }
         );
+    }
+
+    #[test]
+    fn hybrid_efficiency_class_prioritizes_p_cores_over_shared_e_core_l2() {
+        let e_core = ProcessorLocation { group: 0, index: 0 };
+        let p_core = ProcessorLocation { group: 0, index: 4 };
+        let mut physical_cores = vec![e_core, p_core];
+        let efficiency_classes = BTreeMap::from([(e_core, 0), (p_core, 1)]);
+        // Give the E-core cluster a larger L2 cache than the P-core's private L2.
+        let targets = vec![
+            CacheTarget {
+                descriptor: CacheDescriptor {
+                    level: 2,
+                    kind: CacheKind::Unified,
+                    size_bytes: 4 * 1024 * 1024,
+                    line_size_bytes: 64,
+                    sharing_logical_processors: 4,
+                    instances: 1,
+                },
+                group: 0,
+                mask: 0b1111,
+            },
+            CacheTarget {
+                descriptor: CacheDescriptor {
+                    level: 2,
+                    kind: CacheKind::Unified,
+                    size_bytes: 2 * 1024 * 1024,
+                    line_size_bytes: 64,
+                    sharing_logical_processors: 2,
+                    instances: 1,
+                },
+                group: 0,
+                mask: 0b11_0000,
+            },
+        ];
+
+        let representative = order_cores_and_select_representative(
+            &mut physical_cores,
+            &efficiency_classes,
+            &targets,
+        );
+        assert_eq!(representative, p_core);
+        assert_eq!(physical_cores, vec![p_core, e_core]);
     }
 }

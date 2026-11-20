@@ -198,6 +198,7 @@ pub(super) fn fixture() -> App {
         metadata_devices_received: false,
         metadata_benchmarks_received: false,
         ui_dirty: true,
+        dirty: RefreshSections::default(),
     }
 }
 
@@ -3047,6 +3048,7 @@ fn legacy_automatic_choices_migrate_to_curated_without_erasing_custom_configurat
             dataset_text: "32".into(),
         };
         let preferences = BenchmarkPreferences {
+            saved_tests: Vec::new(),
             version: 1,
             family_modes: BTreeMap::new(),
             tests: BTreeMap::from([(

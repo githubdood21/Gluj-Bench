@@ -25,6 +25,16 @@ fn main() {
             .manifest_required()
             .expect("Windows application icon resource must compile");
     }
-    let style = slint_build::CompilerConfiguration::new().with_style("fluent-dark".into());
-    slint_build::compile_with_config("ui/app-window.slint", style).expect("Slint UI must compile");
+    // Slint recursively lowers nested controls; Windows gives the main thread a small stack.
+    std::thread::Builder::new()
+        .name("compile-ui".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let style = slint_build::CompilerConfiguration::new().with_style("fluent-dark".into());
+            slint_build::compile_with_config("ui/app-window.slint", style)
+                .expect("Slint UI must compile");
+        })
+        .expect("UI compiler thread must start")
+        .join()
+        .expect("UI compiler thread must finish");
 }

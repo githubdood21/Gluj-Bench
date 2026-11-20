@@ -146,6 +146,17 @@ impl App {
     }
 
     pub(super) fn template_action(&mut self, action: &str, id: &str) {
+        if id.starts_with("user:") {
+            self.saved_test_action(
+                if action == "customize" {
+                    "select"
+                } else {
+                    action
+                },
+                id,
+            );
+            return;
+        }
         if self.active_request.is_some() {
             return;
         }
@@ -159,37 +170,164 @@ impl App {
         let plan = self.setup_template_plan(&template);
         if action == "run" {
             self.begin_plan(plan);
-        } else if action == "customize" {
+        } else if action == "select" || action == "customize" {
+            // Older callback names also select read-only; they never create an editable copy.
             match plan {
-                Ok(plan) => {
-                    let runs: Vec<_> = plan.runs.into();
-                    let first = runs.first().unwrap();
-                    self.selected = Some(first.benchmark_id.clone());
-                    self.family_modes
-                        .insert(template.family, first.benchmark_id.clone());
-                    self.run_overrides.insert(
-                        first.benchmark_id.clone(),
-                        TestOverride {
-                            settings: first.settings.clone(),
-                            dataset_text: first.settings.dataset_mib.to_string(),
-                        },
-                    );
-                    if configurable_compute(&first.benchmark_id) {
-                        self.vector_choices.insert(first.benchmark_id.clone(), 1);
-                    }
-                    self.presentation.scope = 1;
-                    self.presentation.single_test = runs.len() == 1;
-                    self.presentation.clear_test_selection();
-                    if runs.len() > 1 {
-                        self.custom_plan = runs;
-                    }
-                    self.persist_benchmark_preferences();
-                    self.status.clear();
+                Ok(_) => {
+                    self.presentation.curated_set = Some(template.id);
+                    self.presentation.set_selected = true;
+                    self.presentation.test_editor = false;
+                    self.presentation.editing_test = None;
+                    self.presentation.inspecting_test = None;
+                    self.presentation.editing_saved_test = None;
+                    self.presentation.editor_test_name = Some(template.title);
+                    self.presentation.saved_test_status.clear();
                 }
                 Err(error) => self.status = error,
             }
         }
         self.ui_dirty = true;
+    }
+
+    pub(super) fn selected_curated_plan(&self) -> Result<PreparedPlan, String> {
+        let template = self
+            .setup_templates()
+            .into_iter()
+            .find(|template| Some(&template.id) == self.presentation.curated_set.as_ref())
+            .ok_or("Select a set")?;
+        self.setup_template_plan(&template)
+    }
+
+    fn missing_mode_label(mode: &BenchmarkDescriptor) -> String {
+        let id = mode.id.as_str();
+        if id.contains(".avx2.") {
+            return "AVX2/FMA".into();
+        }
+        if id.contains(".avx512.") {
+            return "AVX-512".into();
+        }
+        if id.ends_with(".aes") {
+            return "AES".into();
+        }
+        if id.ends_with(".popcnt") {
+            return "POPCNT".into();
+        }
+        if mode.category == BenchmarkCategory::Gpu {
+            let format = if id.ends_with(".fp8") {
+                "FP8".into()
+            } else if id.contains(".fp16") {
+                "FP16".into()
+            } else if id.contains(".fp64") {
+                "FP64".into()
+            } else if id.contains(".int8") {
+                "INT8".into()
+            } else {
+                mode.data_type.to_uppercase()
+            };
+            return if id.contains(".sparse.") {
+                format!("Sparse {format}")
+            } else {
+                format
+            };
+        }
+        families::mode_name(mode)
+            .split(" | ")
+            .next()
+            .unwrap_or(&mode.name)
+            .into()
+    }
+
+    fn gpu_format_unsupported(&self, mode: &BenchmarkDescriptor) -> bool {
+        // App placeholders do not describe GPU capabilities. These formats are not probed yet.
+        if mode.id.contains(".sparse.") || mode.id.ends_with(".fp8") {
+            return false;
+        }
+        let matrix = self.family_of(mode) == "gpu.matrix";
+        let key = match (matrix, Self::missing_mode_label(mode).as_str()) {
+            (true, "FP16") => "cooperative_matrix_fp16",
+            (true, "INT8") => "cooperative_matrix_int8",
+            (false, "FP16") => "shader_f16",
+            (false, "FP64") => "shader_f64",
+            _ => return false,
+        };
+        self.devices
+            .iter()
+            .find(|gpu| Some(&gpu.id) == self.selected_gpu_id.as_ref())
+            .and_then(|gpu| gpu.properties.get(key))
+            .is_some_and(|value| value == "false")
+    }
+
+    fn cpu_mode_unsupported(&self, mode: &BenchmarkDescriptor) -> bool {
+        !self.benchmark_available(mode)
+            && matches!(
+                mode.unavailable_reason.as_str(),
+                "avx2_fma_not_supported"
+                    | "avx512_not_supported"
+                    | "aes_not_supported"
+                    | "popcnt_not_supported"
+                    | "x86_64_instruction_set_required"
+            )
+    }
+
+    fn unsupported_list<'a>(
+        &self,
+        modes: impl IntoIterator<Item = &'a BenchmarkDescriptor>,
+    ) -> String {
+        let mut labels = Vec::new();
+        for mode in modes {
+            let label = Self::missing_mode_label(mode);
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        if labels.is_empty() {
+            String::new()
+        } else {
+            format!("Unsupported:\n{}", labels.join("\n"))
+        }
+    }
+
+    fn precision_support_hint(&self) -> String {
+        let Some(family) = self.selected_family().filter(|f| f.starts_with("gpu.")) else {
+            return String::new();
+        };
+        let hint = self.unsupported_list(self.benchmarks.iter().filter(|mode| {
+            self.family_of(mode) == family
+                && !gpu_offload(&mode.id)
+                && self.gpu_format_unsupported(mode)
+        }));
+        if hint.is_empty() {
+            "Unsupported:\nNone reported".into()
+        } else {
+            hint
+        }
+    }
+
+    fn variant_support_hint(&self) -> String {
+        let Some(family) = self.selected_family().filter(|f| f.starts_with("cpu.")) else {
+            return String::new();
+        };
+        self.unsupported_list(
+            self.family_members(family)
+                .into_iter()
+                .filter(|mode| self.cpu_mode_unsupported(mode)),
+        )
+    }
+
+    fn workload_support_hint(&self) -> String {
+        self.unsupported_list(
+            self.visible_families()
+                .iter()
+                .filter(|family| self.runnable_modes(family).is_empty())
+                .flat_map(|family| self.family_members(family))
+                .filter(|mode| {
+                    if mode.category == BenchmarkCategory::Gpu {
+                        self.gpu_format_unsupported(mode)
+                    } else {
+                        self.cpu_mode_unsupported(mode)
+                    }
+                }),
+        )
     }
 
     fn builder_gpu_precisions(&self) -> Vec<&BenchmarkDescriptor> {
@@ -256,7 +394,11 @@ impl App {
     }
 
     pub(super) fn builder_choice(&mut self, field: &str, index: i32) {
-        if self.active_request.is_some() || index < 0 {
+        if self.active_request.is_some()
+            || index < 0
+            || !self.presentation.test_editor
+            || self.presentation.curated_set.is_some()
+        {
             return;
         }
         let index = index as usize;
@@ -319,6 +461,13 @@ impl App {
 
     pub(super) fn wire_benchmark_setup(window: &MainWindow, app: &Rc<RefCell<Self>>) {
         let weak = Rc::downgrade(app);
+        window.on_saved_test_action(move |action, argument| {
+            if let Some(app) = weak.upgrade() {
+                app.borrow_mut()
+                    .saved_test_action(action.as_str(), argument.as_str());
+            }
+        });
+        let weak = Rc::downgrade(app);
         let win = window.as_weak();
         window.on_builder_choice(move |field, index| {
             if let (Some(app), Some(window)) = (weak.upgrade(), win.upgrade()) {
@@ -347,31 +496,32 @@ impl App {
     }
 
     pub(super) fn refresh_benchmark_setup(window: &MainWindow, app: &Self) {
-        let rows = app
+        window.set_builder_test_name(app.editor_test_name().into());
+        window.set_precision_support_hint(app.precision_support_hint().into());
+        window.set_variant_support_hint(app.variant_support_hint().into());
+        window.set_workload_support_hint(app.workload_support_hint().into());
+        window.set_selected_template_id(
+            app.presentation
+                .curated_set
+                .as_ref()
+                .or(app.presentation.editing_saved_test.as_ref())
+                .cloned()
+                .unwrap_or_default()
+                .into(),
+        );
+        window.set_set_selected(app.presentation.set_selected);
+        window.set_set_read_only(app.presentation.curated_set.is_some());
+        window.set_test_editor(app.presentation.test_editor);
+        window.set_editing_set_test(app.presentation.editing_test.is_some());
+        window.set_set_test_rows(ModelRc::new(VecModel::from(app.set_test_rows())));
+        window.set_editing_saved_test(app.presentation.editing_saved_test.is_some());
+        window.set_saved_test_status(app.presentation.saved_test_status.as_str().into());
+        let mut rows = app
             .setup_templates()
             .into_iter()
             .filter_map(|template| {
                 let plan = app.setup_template_plan(&template).ok()?;
-                let seconds = plan
-                    .suite
-                    .conditions
-                    .iter()
-                    .filter_map(|condition| condition.estimated_duration_ms)
-                    .sum::<u64>() as f64
-                    / 1000.;
-                let mut precisions = Vec::new();
-                for run in &plan.runs {
-                    if let Some(mode) = app
-                        .benchmarks
-                        .iter()
-                        .find(|mode| mode.id == run.benchmark_id)
-                    {
-                        let precision = mode.data_type.to_uppercase();
-                        if !precisions.contains(&precision) {
-                            precisions.push(precision);
-                        }
-                    }
-                }
+                let coverage = app.test_set_coverage(&plan.runs);
                 let group = match template.coverage {
                     Coverage::Offload => "System RAM",
                     _ if template.family == "gpu.vector" => "Vector",
@@ -388,25 +538,17 @@ impl App {
                     .strip_prefix(&prefix)
                     .unwrap_or(&template.title);
                 Some(TemplateRow {
+                    curated: true,
+                    available: true,
                     id: template.id.into(),
                     title: title.into(),
                     detail: template.detail.into(),
                     group: group.into(),
-                    duration: format!("≥ {seconds} s").into(),
-                    coverage: format!(
-                        "{} · {} {}",
-                        precisions.join(", "),
-                        plan.runs.len(),
-                        if plan.runs.len() == 1 {
-                            "test"
-                        } else {
-                            "tests"
-                        }
-                    )
-                    .into(),
+                    coverage: coverage.into(),
                 })
             })
             .collect::<Vec<_>>();
+        rows.extend(app.saved_test_rows());
         window.set_setup_templates(ModelRc::new(VecModel::from(rows)));
         let families = app.builder_workload_families();
         window.set_builder_workloads(ModelRc::new(VecModel::from(
@@ -534,8 +676,20 @@ mod tests {
                 .vector_preset
                 == 1
         );
+        window.invoke_template_action("select".into(), "gpu.vector.scaling@1".into());
+        App::refresh(&window, &app.borrow());
         window.show().unwrap();
         for (width, height, panel) in [(1280, 850, 0), (980, 680, 0), (980, 680, 1)] {
+            if width == 980 {
+                window.invoke_saved_test_action("new".into(), "".into());
+                window.invoke_saved_test_action("add".into(), "".into());
+                if panel == 0 {
+                    window.invoke_saved_test_action("apply".into(), "".into());
+                    // Exercise wrapped settings inside the fixed-width sidebar.
+                    window.invoke_saved_test_action("inspect".into(), "0".into());
+                }
+                App::refresh(&window, &app.borrow());
+            }
             adapter.set_size(slint::PhysicalSize::new(width, height));
             window.set_custom_panel(panel);
             window.window().request_redraw();
@@ -563,18 +717,47 @@ mod tests {
                     .collect();
                 writer.write_image_data(&bytes).unwrap();
             }
+            if width == 1280 && panel == 0 {
+                // The disabled Run button must not fall through to customization.
+                for (x, y) in [(850., 240.), (278., 203.), (320., 240.), (900., 274.)] {
+                    window.set_selected_template_id("".into());
+                    let position = slint::LogicalPosition::new(x, y);
+                    window
+                        .window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                            position,
+                            button: slint::platform::PointerEventButton::Left,
+                        });
+                    window
+                        .window()
+                        .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                            position,
+                            button: slint::platform::PointerEventButton::Left,
+                        });
+                    if x == 850. {
+                        assert!(window.get_selected_template_id().is_empty());
+                    } else {
+                        assert_eq!(
+                            window.get_selected_template_id(),
+                            window.get_setup_templates().row_data(0).unwrap().id,
+                            "row click at ({x}, {y})"
+                        );
+                        assert!(app.borrow().custom_plan.is_empty());
+                        assert!(app.borrow().presentation.curated_set.is_some());
+                        App::refresh(&window, &app.borrow());
+                        assert!(window.get_set_read_only());
+                        assert!(!window.get_test_editor());
+                        assert!(window.get_set_test_rows().row_count() > 0);
+                    }
+                }
+            }
         }
-        window.invoke_template_action("customize".into(), "gpu.vector.scaling@1".into());
+        window.invoke_saved_test_action("cancel".into(), "".into());
         App::refresh(&window, &app.borrow());
-        assert_eq!(
-            window.get_batch_builder(),
-            app.borrow().custom_plan.len() > 1
-        );
-        window.invoke_batch_builder_changed(false);
-        App::refresh(&window, &app.borrow());
-        assert!(!window.get_batch_builder());
+        assert!(!window.get_test_editor());
         window.invoke_select_suite("cpu.performance".into());
         assert!(!window.get_builder_gpu_compute());
+        assert!(!window.get_set_selected());
         assert!(window.get_builder_workloads().row_count() > 2);
         window.hide().unwrap();
     }
@@ -611,31 +794,30 @@ mod tests {
     }
 
     #[test]
-    fn template_customization_copies_a_frozen_batch_and_preserves_global_defaults() {
+    fn curated_selection_is_read_only_and_never_copies_into_the_builder() {
         let mut app = catalogue();
         app.selected_suite = "gpu.performance".into();
         let defaults = app.settings.clone();
-        let template = app
-            .setup_templates()
-            .into_iter()
-            .find(|template| template.id == "gpu.vector.scaling@1")
-            .unwrap();
-        let before = app.setup_template_plan(&template).unwrap();
-        app.template_action("customize", &template.id);
+        let before = app.custom_plan.clone();
+        app.template_action("select", "gpu.vector.scaling@1");
         assert_eq!(app.settings, defaults);
-        assert_eq!(app.presentation.single_test, before.runs.len() == 1);
-        if before.runs.len() > 1 {
-            assert_eq!(app.custom_plan, Vec::from(before.runs));
-            let saved = app.custom_plan.clone();
-            app.edit_configuration(true, "gpu", 0);
-            assert_eq!(app.custom_plan, saved);
+        assert_eq!(app.custom_plan, before);
+        assert!(app.presentation.curated_set.is_some());
+        assert!(!app.presentation.test_editor);
+        assert!(!app.set_test_rows().is_empty());
+        for action in ["add", "edit", "remove", "rename", "save", "delete", "apply"] {
+            app.saved_test_action(action, "0");
         }
-        assert_eq!(app.presentation.scope, 1);
+        app.builder_choice("workload", 1);
+        assert_eq!(app.custom_plan, before);
+        assert_eq!(app.settings, defaults);
+        assert!(app.benchmark_preferences.saved_tests.is_empty());
     }
 
     #[test]
     fn gpu_builder_paths_and_precisions_follow_the_selected_workload() {
         let mut app = catalogue();
+        app.presentation.test_editor = true;
         app.selected_suite = "gpu.performance".into();
         app.select_family("gpu.vector");
         app.selected = Some(GPU_VECTOR_ID.into());
@@ -653,6 +835,147 @@ mod tests {
         assert!(!app.builder_gpu_paths().iter().any(|(path, _)| *path == 2));
         app.select_family("gpu.matrix");
         assert!(!app.builder_gpu_paths().iter().any(|(path, _)| *path == 2));
+    }
+
+    fn support_catalogue() -> App {
+        let mut app = catalogue();
+        for mode in &mut app.benchmarks {
+            if mode.category == BenchmarkCategory::Gpu {
+                mode.data_type = if mode.id.contains(".fp16") {
+                    "fp16"
+                } else if mode.id.contains(".fp64") {
+                    "fp64"
+                } else if mode.id.contains(".fp8") {
+                    "fp8"
+                } else if mode.id.contains(".int8") {
+                    "int8"
+                } else {
+                    "fp32"
+                }
+                .into();
+            }
+        }
+        app.selected_suite = "gpu.performance".into();
+        app.select_family("gpu.vector");
+        app
+    }
+
+    #[test]
+    fn precision_hint_lists_missing_formats_for_the_selected_adapter_only() {
+        let mut app = support_catalogue();
+        let fp64 = app
+            .benchmarks
+            .iter_mut()
+            .find(|b| b.id == "gpu.performance.fp64")
+            .unwrap();
+        fp64.supported_device_ids = vec!["gpu:other".into()];
+        fp64.available = true; // Available elsewhere must not imply support on this GPU.
+        fp64.unavailable_reason.clear();
+        let gpu = app
+            .devices
+            .iter_mut()
+            .find(|d| Some(&d.id) == app.selected_gpu_id.as_ref())
+            .unwrap();
+        gpu.properties.insert("shader_f64".into(), "false".into());
+        let mut other = gpu.clone();
+        let hint = app.precision_support_hint();
+        assert_eq!(hint, "Unsupported:\nFP64");
+        assert!(!hint.contains("FP16"));
+        assert!(!hint.contains("Sparse"));
+        assert!(!hint.contains("FP8"));
+        assert!(
+            !app.builder_gpu_precisions()
+                .iter()
+                .any(|b| b.id == "gpu.performance.fp64")
+        );
+        other.id = "gpu:other".into();
+        other.properties.insert("shader_f64".into(), "true".into());
+        app.devices.push(other);
+        for mode in &mut app.benchmarks {
+            if mode.category == BenchmarkCategory::Gpu && mode.available {
+                mode.supported_device_ids.push("gpu:other".into());
+            }
+        }
+        app.selected_gpu_id = Some("gpu:other".into());
+        assert_eq!(app.precision_support_hint(), "Unsupported:\nNone reported");
+    }
+
+    #[test]
+    fn matrix_hint_reports_only_probed_gpu_formats_on_separate_lines() {
+        let mut app = support_catalogue();
+        let mode = app
+            .benchmarks
+            .iter_mut()
+            .find(|b| b.id == GPU_MATRIX_ID)
+            .unwrap();
+        mode.available = true;
+        mode.supported_device_ids = vec!["gpu:other".into()];
+        let gpu = app
+            .devices
+            .iter_mut()
+            .find(|d| Some(&d.id) == app.selected_gpu_id.as_ref())
+            .unwrap();
+        gpu.properties
+            .insert("cooperative_matrix_fp16".into(), "true".into());
+        gpu.properties
+            .insert("storage_buffer_16bit_access".into(), "false".into());
+        app.select_family("gpu.matrix");
+        // Missing app paths and storage access must not be labelled as unsupported number formats.
+        assert_eq!(app.precision_support_hint(), "Unsupported:\nNone reported");
+        let gpu = app
+            .devices
+            .iter_mut()
+            .find(|d| Some(&d.id) == app.selected_gpu_id.as_ref())
+            .unwrap();
+        gpu.properties
+            .insert("cooperative_matrix_fp16".into(), "false".into());
+        gpu.properties
+            .insert("cooperative_matrix_int8".into(), "false".into());
+        assert_eq!(app.precision_support_hint(), "Unsupported:\nFP16\nINT8");
+        gpu_support_unknown_is_not_unsupported(&mut app);
+    }
+
+    fn gpu_support_unknown_is_not_unsupported(app: &mut App) {
+        let gpu = app
+            .devices
+            .iter_mut()
+            .find(|d| Some(&d.id) == app.selected_gpu_id.as_ref())
+            .unwrap();
+        gpu.properties.remove("cooperative_matrix_fp16");
+        gpu.properties.remove("cooperative_matrix_int8");
+        assert_eq!(app.precision_support_hint(), "Unsupported:\nNone reported");
+    }
+
+    #[test]
+    fn missing_avx_is_explained_even_when_only_the_scalar_variant_remains() {
+        let mut app = support_catalogue();
+        app.selected_suite = "cpu.performance".into();
+        for mode in &mut app.benchmarks {
+            if mode.id.contains(".avx2.") {
+                mode.available = false;
+                mode.unavailable_reason = "avx2_fma_not_supported".into();
+            }
+        }
+        app.select_family("cpu.fp32");
+        assert_eq!(app.runnable_modes("cpu.fp32").len(), 1);
+        assert_eq!(app.variant_support_hint(), "Unsupported:\nAVX2/FMA");
+        assert!(!app.variant_support_hint().contains("AVX-512")); // No invented tests.
+        let aes = app
+            .benchmarks
+            .iter_mut()
+            .find(|b| b.id.ends_with(".aes"))
+            .unwrap();
+        aes.available = false;
+        aes.unavailable_reason = "aes_not_supported".into();
+        assert_eq!(app.workload_support_hint(), "Unsupported:\nAES");
+        assert!(!app.workload_support_hint().contains("AVX2")); // Scalar FP32/64 workloads remain available.
+        let mode = app
+            .benchmarks
+            .iter_mut()
+            .find(|b| b.id == CPU_VECTOR_ID)
+            .unwrap();
+        mode.unavailable_reason = "cpu_topology_unavailable".into();
+        assert!(app.variant_support_hint().is_empty());
     }
 
     #[test]

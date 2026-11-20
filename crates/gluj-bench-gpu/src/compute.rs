@@ -821,6 +821,11 @@ fn run_fp32_scaling(
                     || harness.measure(working_set, loop_count, warm_iterations),
                 )?;
             }
+            if pass_rate.is_none() && warm_iterations != iterations {
+                // Re-prepare the measured iteration count so sample 0 does not
+                // absorb command-buffer re-recording overhead after warmup.
+                let _ = harness.measure(working_set, loop_count, iterations)?;
+            }
             let mut offered_queue = if pass_rate.is_some() {
                 Some(harness.offered_queue(working_set, loop_count)?)
             } else {

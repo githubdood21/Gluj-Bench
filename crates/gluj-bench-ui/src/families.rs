@@ -330,22 +330,21 @@ impl App {
         }
     }
     pub(super) fn capability_details(&self) -> String {
-        self.benchmarks
+        let joined = self
+            .benchmarks
             .iter()
             .filter(|b| b.suite_id == self.selected_suite && !self.benchmark_available(b))
             .map(|b| {
-                format!(
-                    "{}: {}",
-                    b.name,
-                    if b.unavailable_reason.is_empty() {
-                        "unsupported on selected device"
-                    } else {
-                        &b.unavailable_reason
-                    }
-                )
+                let reason = if b.unavailable_reason.is_empty() {
+                    "unsupported on selected device".into()
+                } else {
+                    presentation::clamp_display_text(&b.unavailable_reason, 240, 2)
+                };
+                format!("{}: {reason}", b.name)
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        presentation::clamp_display_text(&joined, 2400, 32)
     }
     pub(super) fn core_experiment_plan(&self) -> Result<PreparedPlan, String> {
         let id = self.selected.as_deref().ok_or("Select a CPU mode.")?;
@@ -417,7 +416,7 @@ impl App {
         candidates: Vec<QueuedRun>,
         label: &str,
     ) -> Result<PreparedPlan, String> {
-        self.prepare_plan_with_measurement(candidates, label, self.settings.shorter_run)
+        self.prepare_plan_with_measurement(candidates, label, self.builder_shorter_run())
     }
     pub(super) fn prepare_plan_with_measurement(
         &self,
@@ -425,10 +424,26 @@ impl App {
         label: &str,
         shorter_run: bool,
     ) -> Result<PreparedPlan, String> {
+        let candidates = candidates
+            .into_iter()
+            .map(|mut run| {
+                run.settings.shorter_run = shorter_run;
+                run
+            })
+            .collect();
+        self.prepare_set_plan(candidates, label)
+    }
+    pub(super) fn prepare_set_plan(
+        &self,
+        candidates: Vec<QueuedRun>,
+        label: &str,
+    ) -> Result<PreparedPlan, String> {
         let mut runs = VecDeque::new();
         let mut conditions: Vec<SuiteCondition> = Vec::new();
-        for mut run in candidates {
-            run.settings.shorter_run = shorter_run;
+        for run in candidates {
+            if !settings_valid(&run.settings) {
+                return Err("Invalid test settings. Remove or replace this test.".into());
+            }
             let b = self
                 .benchmarks
                 .iter()

@@ -1,21 +1,51 @@
 //! Explicit GPU memory/transfer conditions. Every curve keeps one kernel/path.
 use super::*;
 use crate::vulkan_bandwidth::{self, TransferOptions, VulkanBandwidthContext};
-fn number(c: &BenchmarkConfig, key: &str, default: u64) -> u64 {
+fn parse_u64(c: &BenchmarkConfig, key: &str, default: u64) -> Result<u64, BenchmarkError> {
     c.options
         .get(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+        .map(|v| {
+            v.parse::<u64>().map_err(|_| {
+                BenchmarkError::new(
+                    "invalid_config",
+                    format!("Invalid integer value for '{key}'."),
+                )
+            })
+        })
+        .transpose()
+        .map(|parsed| parsed.unwrap_or(default))
+}
+fn parse_u64_range(
+    c: &BenchmarkConfig,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, BenchmarkError> {
+    let value = parse_u64(c, key, default)?;
+    if !(min..=max).contains(&value) {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            format!("Value for '{key}' must be between {min} and {max}."),
+        ));
+    }
+    Ok(value)
 }
 fn choice<'a>(c: &'a BenchmarkConfig, key: &str, default: &'a str) -> &'a str {
     c.options.get(key).map(String::as_str).unwrap_or(default)
 }
 fn sizes(c: &BenchmarkConfig, limit: u64) -> Result<Vec<u64>, BenchmarkError> {
     let mode = choice(c, "dataset_mode", "automatic");
+    if !matches!(mode, "automatic" | "single" | "sweep") {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Unsupported dataset_mode; expected automatic, single, or sweep.",
+        ));
+    }
     let requested = if mode == "automatic" {
         limit.min(64 * MIB)
     } else {
-        number(c, "dataset_bytes", 0)
+        parse_u64(c, "dataset_bytes", 0)?
     };
     if requested < 65536 || requested > limit {
         return Err(BenchmarkError::new(
@@ -52,11 +82,11 @@ pub(super) fn run(
         gluj_bench_core::vram_budget_percent(c)?,
     )
     .saturating_sub(16 * MIB);
-    let ring = number(c, "staging_buffers", 3) as usize;
+    let ring = parse_u64_range(c, "staging_buffers", 3, 1, usize::MAX as u64)? as usize;
     let host = gluj_bench_core::ram_allocation_budget(
         system.total_memory(),
         system.available_memory(),
-        number(c, "ram_budget_percent", 20) as u32,
+        parse_u64_range(c, "ram_budget_percent", 20, 20, 80)? as u32,
     );
     let host = if record.vulkan.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
         host.min(
@@ -112,12 +142,27 @@ pub(super) fn run(
             ));
         }
     };
-    let native = choice(
+    let native = match choice(
         c,
         "memory_copy_path",
         if id == VRAM_ID { "native" } else { "shader" },
-    ) == "native";
+    ) {
+        "native" => true,
+        "shader" => false,
+        _ => {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unsupported memory_copy_path; expected native or shader.",
+            ));
+        }
+    };
     let operation = choice(c, "memory_operation", "all");
+    if !matches!(operation, "all" | "read" | "write" | "copy") {
+        return Err(BenchmarkError::new(
+            "invalid_config",
+            "Unsupported memory_operation; expected all, read, write, or copy.",
+        ));
+    }
     if !transfer && native && mode != 0 && matches!(operation, "all" | "copy") {
         return Err(BenchmarkError::new(
             "invalid_config",
@@ -127,9 +172,40 @@ pub(super) fn run(
     let reals = if transfer {
         1
     } else {
-        number(c, "access_realizations", 1) as u32
+        parse_u64_range(c, "access_realizations", 1, 1, u32::MAX as u64)? as u32
     };
-    let root = number(c, "access_seed", gluj_bench_core::DEFAULT_ACCESS_SEED);
+    let root = parse_u64(c, "access_seed", gluj_bench_core::DEFAULT_ACCESS_SEED)?;
+    let transfer_batch = if transfer {
+        parse_u64_range(c, "transfer_batch", 8, 1, u32::MAX as u64)? as u32
+    } else {
+        8
+    };
+    let transfer_serial = if transfer {
+        match choice(c, "transfer_submission", "batched") {
+            "serial" => true,
+            "batched" => false,
+            _ => {
+                return Err(BenchmarkError::new(
+                    "invalid_config",
+                    "Unsupported transfer_submission; expected serial or batched.",
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    let transfer_direction = if transfer {
+        let dir = choice(c, "transfer_direction", "both");
+        if !matches!(dir, "both" | "host_to_device" | "device_to_host") {
+            return Err(BenchmarkError::new(
+                "invalid_config",
+                "Unsupported transfer_direction; expected both, host_to_device, or device_to_host.",
+            ));
+        }
+        dir
+    } else {
+        "both"
+    };
     let flavor = if id == CACHE_ID {
         KernelFlavor::Cache
     } else {
@@ -145,10 +221,10 @@ pub(super) fn run(
         if transfer {
             let opts = TransferOptions {
                 ring,
-                batch: number(c, "transfer_batch", 8) as u32,
-                serial: choice(c, "transfer_submission", "batched") == "serial",
+                batch: transfer_batch,
+                serial: transfer_serial,
             };
-            let direction = choice(c, "transfer_direction", "both");
+            let direction = transfer_direction;
             for (name, to_device) in [("host_to_device", true), ("device_to_host", false)] {
                 if direction != "both" && direction != name {
                     continue;
@@ -198,11 +274,7 @@ pub(super) fn run(
                     continue;
                 }
                 let mut values = Vec::new();
-                let dispatch = if flavor == KernelFlavor::Cache && op == KernelOperation::Read {
-                    size.max(64 * MIB)
-                } else {
-                    size
-                };
+                let dispatch = size;
                 peak = peak.max(
                     size * 2
                         + if op == KernelOperation::Copy && native {
@@ -251,7 +323,38 @@ pub(super) fn run(
             }
         }
     }
-    metadata.extend(BTreeMap::from([("kernel_revision".into(),if transfer {"host-transfer-configurable-2"}else{"local-memory-access-2"}.into()),("dataset_mode".into(),choice(c,"dataset_mode","automatic").into()),("working_set_bytes".into(),points.last().unwrap().to_string()),("resolved_dataset_bytes".into(),points.last().unwrap().to_string()),("allocated_test_buffer_bytes".into(),peak.to_string()),("allocation_budget_bytes".into(),(vram+if transfer {host}else{0}).to_string()),("result_validation".into(),"boundary/interior known source/write/checksum patterns outside timing; all used staging slots checked".into())]));
+    metadata.extend(BTreeMap::from([
+        (
+            "kernel_revision".into(),
+            if transfer {
+                "host-transfer-configurable-2"
+            } else {
+                "local-memory-access-2"
+            }
+            .into(),
+        ),
+        (
+            "dataset_mode".into(),
+            choice(c, "dataset_mode", "automatic").into(),
+        ),
+        (
+            "working_set_bytes".into(),
+            points.last().unwrap().to_string(),
+        ),
+        (
+            "resolved_dataset_bytes".into(),
+            points.last().unwrap().to_string(),
+        ),
+        ("allocated_test_buffer_bytes".into(), peak.to_string()),
+        (
+            "allocation_budget_bytes".into(),
+            (vram + if transfer { host } else { 0 }).to_string(),
+        ),
+        (
+            "result_validation".into(),
+            result_validation_note(transfer).into(),
+        ),
+    ]));
     if transfer {
         for key in [
             "transfer_direction",
@@ -390,6 +493,14 @@ pub(super) fn local_memory_limit(
     Ok(limit / 1024 * 1024)
 }
 
+fn result_validation_note(transfer: bool) -> &'static str {
+    if transfer {
+        "boundary/interior known source/write/checksum patterns outside timing; all used staging slots checked"
+    } else {
+        "boundary/interior known source, write, checksum and copy destination patterns checked outside measured execution"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +523,42 @@ mod tests {
         assert!(sizes(&c, 65536).is_err());
         c.options.insert("dataset_bytes".into(), "1".into());
         assert!(sizes(&c, 1048576).is_err());
+        c.options.insert("dataset_mode".into(), "bogus".into());
+        assert_eq!(sizes(&c, 1048576).unwrap_err().code, "invalid_config");
+    }
+
+    #[test]
+    fn numeric_option_helpers_reject_malformed_or_zero_ring_values() {
+        let malformed = BenchmarkConfig {
+            options: BTreeMap::from([("staging_buffers".into(), "abc".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_u64_range(&malformed, "staging_buffers", 3, 1, usize::MAX as u64)
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
+        let zero_ring = BenchmarkConfig {
+            options: BTreeMap::from([("staging_buffers".into(), "0".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_u64_range(&zero_ring, "staging_buffers", 3, 1, usize::MAX as u64)
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
+        let bad_ram = BenchmarkConfig {
+            options: BTreeMap::from([("ram_budget_percent".into(), "95".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_u64_range(&bad_ram, "ram_budget_percent", 20, 20, 80)
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
     }
     #[test]
     fn shuffled_blocks_preserve_single_writer_ownership_for_non_power_of_two_sizes() {
@@ -433,6 +580,12 @@ mod tests {
         let (mul, offset) = permutation(u32::MAX, u64::MAX);
         assert_eq!(mul, 1);
         assert!(u64::from(u32::MAX - 1) * u64::from(mul) + u64::from(offset) <= u32::MAX as u64);
+    }
+
+    #[test]
+    fn result_validation_note_distinguishes_local_from_staging_transfers() {
+        assert!(!result_validation_note(false).contains("staging"));
+        assert!(result_validation_note(true).contains("staging slots"));
     }
     #[test]
     fn shader_modular_addition_matches_wide_arithmetic_at_the_index_limits() {

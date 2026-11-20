@@ -54,7 +54,11 @@ struct Buffer {
     memory: vk::DeviceMemory,
 }
 
-pub(super) struct VulkanComputeProfileHarness {
+pub(super) fn access_invalidation_key(mode: u32, seed: u64, epoch: u32) -> (u32, u64, u32) {
+    (mode, seed, if mode == 2 { epoch } else { 0 })
+}
+
+pub(crate) struct VulkanComputeProfileHarness {
     precision: Precision,
     access: std::cell::Cell<(u32, u64, u32)>,
     _entry: Entry,
@@ -159,8 +163,13 @@ impl VulkanComputeProfileHarness {
         unsafe { Self::new_inner(record, bytes, offload, WORKGROUP_SIZE, 7, precision) }
     }
     pub fn configure_access(&self, mode: u32, seed: u64, epoch: u32) {
+        let prev = self.access.get();
         self.access.set((mode, seed, epoch));
-        self.prepared_measurement.set(None);
+        if access_invalidation_key(prev.0, prev.1, prev.2)
+            != access_invalidation_key(mode, seed, epoch)
+        {
+            self.prepared_measurement.set(None);
+        }
     }
 
     unsafe fn new_inner(
@@ -905,27 +914,29 @@ impl VulkanComputeProfileHarness {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline,
             );
-            for iteration in 0..iterations {
-                // WAW hazards need a memory dependency, not only execution ordering.
-                // https://docs.vulkan.org/spec/latest/chapters/synchronization.html
-                let writes = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
-                self.device.cmd_pipeline_barrier(
+            if queued && iterations > 0 {
+                self.device.cmd_write_timestamp(
                     command_buffer,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &writes,
-                    &[],
-                    &[],
+                    query_pool,
+                    0,
                 );
-                if queued && iteration == 0 {
-                    self.device.cmd_write_timestamp(
+            }
+            for iteration in 0..iterations {
+                if iteration > 0 {
+                    // WAW hazards need a memory dependency, not only execution ordering.
+                    // https://docs.vulkan.org/spec/latest/chapters/synchronization.html
+                    let writes = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
+                    self.device.cmd_pipeline_barrier(
                         command_buffer,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
-                        query_pool,
-                        0,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &writes,
+                        &[],
+                        &[],
                     );
                 }
                 for &(index, count) in &chunks {
@@ -1709,5 +1720,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn access_invalidation_key_ignores_epoch_except_rotating_regions() {
+        for mode in [0, 1, 3] {
+            assert_eq!(
+                access_invalidation_key(mode, 42, 0),
+                access_invalidation_key(mode, 42, 7)
+            );
+            assert_ne!(
+                access_invalidation_key(mode, 42, 0),
+                access_invalidation_key(mode, 43, 0)
+            );
+        }
+        assert_ne!(
+            access_invalidation_key(2, 42, 0),
+            access_invalidation_key(2, 42, 1)
+        );
     }
 }
